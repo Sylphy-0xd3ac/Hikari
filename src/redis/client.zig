@@ -15,6 +15,19 @@ pub const Error = error{
 /// 传输层失败：连接本身不可信了（socket 断了，或者读缓冲里可能卡着半条回复）。
 /// 跟服务端正常回的 -ERR（RedisError）、以及分配失败（OutOfMemory）严格区分开：
 /// 只有这一类才触发拆连接重拨。
+///
+/// `error.ReadFailed` 已经覆盖了 SO_RCVTIMEO 触发的接收超时，不需要再加一支
+/// 专门的 `error.Timeout` 分支：SO_RCVTIMEO 到期时内核对阻塞 socket 的 read()
+/// 系统调用报的是 EAGAIN（Linux 与 macOS 上一致），`std.posix.read` 把它译成
+/// `error.WouldBlock`；而 `std.net.Stream.Reader`（走 `std.fs.File.Reader`，
+/// socket 是 `.streaming` 模式）在 `readVecStreaming` 里对`posix.readv` 返回的
+/// 任何错误都是同一句 `catch |err| { r.err = err; return error.ReadFailed; }`
+/// ——不管底层是 WouldBlock、ConnectionResetByPeer 还是别的，统一抹平成
+/// `std.Io.Reader.Error.ReadFailed`。`resp.readValue`/`readLine` 又原样把
+/// `Io.Reader` 的 `error.ReadFailed` 转成这里的 `Error.ReadFailed`。所以一次
+/// 超时的 read() 走到这里，类型就是 `error.ReadFailed`，跟已经在下面判 true
+/// 的那一支完全是同一个错误——下面"服务器只 accept 不回复"那条测试验证的
+/// 正是这一点。
 fn isTransportFailure(e: Error) bool {
     return switch (e) {
         error.WriteFailed,
@@ -47,6 +60,14 @@ pub const Client = struct {
     port: u16,
     password: ?[]u8,
     db: u32,
+    /// 接收超时（秒），每次 dial() 建立新连接时通过 SO_RCVTIMEO 施加到 socket
+    /// 上。没有它，一个接受了 TCP 连接但从不回复的 Valkey 会让 read() 永久
+    /// 阻塞扫描线程——现有的传输层重拨逻辑帮不上忙，它只在内核报错时才触发，
+    /// 而卡住的连接内核什么错都不会报。默认 30s：本地 Redis 操作是亚毫秒级
+    /// 的，只有真正卡死的服务端才会撞到它。测试里调成 1-2s 让这类场景快速
+    /// 失败而不是拖住整个 `zig build test`（Zig 把所有测试跑在同一个进程里，
+    /// 一处永久阻塞会卡住整个测试跑）。
+    recv_timeout_s: u32 = 30,
 
     pub fn connect(
         gpa: std.mem.Allocator,
@@ -107,6 +128,8 @@ pub const Client = struct {
         self.connected = true;
         errdefer self.connected = false;
 
+        self.applyRecvTimeout();
+
         if (self.password) |p| {
             try self.roundTripOk(&.{ "AUTH", p });
         }
@@ -115,6 +138,25 @@ pub const Client = struct {
             const dbs = std.fmt.bufPrint(&nb, "{d}", .{self.db}) catch unreachable;
             try self.roundTripOk(&.{ "SELECT", dbs });
         }
+    }
+
+    /// 给当前这条 socket 设置 SO_RCVTIMEO，镜像 http/server.zig 对已 accept
+    /// 连接的做法。只在 dial() 里、连接刚建立时调用一次——recv_timeout_s 是
+    /// 靠 connect() 之外没有别的入口能在建立连接前改的字段，所以"下一次
+    /// dial() 生效"是它唯一、也足够的生效时机；测试要用短超时的话，改完
+    /// 字段后自己 teardown()+dial() 一次即可（两者都是本文件内可见的私有
+    /// 方法）。设置失败不致命：拿不到超时保护也比直接放弃这次拨号强，只记
+    /// 一行警告继续走完握手。
+    fn applyRecvTimeout(self: *Client) void {
+        const tv: std.posix.timeval = .{ .sec = @intCast(self.recv_timeout_s), .usec = 0 };
+        std.posix.setsockopt(
+            self.stream.handle,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch |e| {
+            std.log.warn("redis: could not set SO_RCVTIMEO: {s}", .{@errorName(e)});
+        };
     }
 
     /// 关掉当前连接但保留对象本身（缓冲区、连接参数都还在），下一条命令会重拨。
@@ -513,4 +555,37 @@ test "服务端彻底消失时重拨失败，错误如实返回且不会无限�
     // 关掉监听：连接断了，重拨也会被拒绝
     srv.stop();
     try std.testing.expectError(error.ConnectionFailed, c.commandOk(&.{"PING"}));
+}
+
+test "服务器只 accept 不回复，命令超时失败而不是永久阻塞" {
+    const gpa = std.testing.allocator;
+    // 只要有一个活着的监听 socket，客户端的 TCP 连接就能建立成功——三次握手
+    // 由内核完成，不需要任何一方调用 accept()。所以这里连接的握手线程都不用
+    // 起：不 accept、不写任何字节，正是"接了连接但从不回复"的 Valkey。
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var listener = try addr.listen(.{ .reuse_address = true });
+    defer listener.deinit();
+
+    var c = try Client.connect(gpa, "127.0.0.1", listener.listen_address.getPort(), null, 0);
+    defer c.deinit();
+
+    // 默认 30s 超时套在这里会让测试跑到半分钟才失败，等同于把"卡住"复现成
+    // "很慢地卡住"。调短之后必须重新拨号：SO_RCVTIMEO 只在 dial() 建立新
+    // 连接时设置一次，改字段不会追溯生效到已经建立的那条 socket 上（这两个
+    // 都是本文件内可见的私有方法，测试可以直接调用）。
+    c.recv_timeout_s = 1;
+    c.teardown();
+    try c.dial();
+
+    const start = std.time.milliTimestamp();
+    // 第一次 roundTrip 读超时 → ReadFailed → isTransportFailure 判 true →
+    // teardown + 重拨 + 重试一次 → 第二次同样超时 → 最终把 ReadFailed 如实
+    // 交给调用方（这正是 isTransportFailure 已经覆盖 ReadFailed 的证据：
+    // 覆盖了才会走重拨这条路，没覆盖的话第一次超时就会直接把错误弹出来，
+    // 总耗时也会明显更短）。
+    try std.testing.expectError(error.ReadFailed, c.commandOk(&.{"PING"}));
+    const elapsed = std.time.milliTimestamp() - start;
+    // 两次 1s 超时 + 两次本地重拨，留足余量但远小于默认 30s 超时会需要的时间——
+    // 这条断言就是"fail fast 而不是永久卡住"的证据。
+    try std.testing.expect(elapsed < 10_000);
 }
