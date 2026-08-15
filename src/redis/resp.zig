@@ -57,9 +57,16 @@ pub fn readValue(gpa: std.mem.Allocator, r: *std.Io.Reader) Error!Value {
             const n = std.fmt.parseInt(i64, body, 10) catch return error.ProtocolError;
             if (n < 0) return .{ .bulk = null };
             const len: usize = @intCast(n);
-            const buf = r.readAlloc(gpa, len) catch return error.ReadFailed;
+            const buf = r.readAlloc(gpa, len) catch |e| switch (e) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => return error.ReadFailed,
+            };
             errdefer gpa.free(buf);
-            r.discardAll(2) catch return error.ReadFailed; // 尾部 CRLF
+            r.discardAll(2) catch |e| switch (e) { // 尾部 CRLF
+                error.EndOfStream => return error.EndOfStream,
+                error.ReadFailed => return error.ReadFailed,
+            };
             return .{ .bulk = buf };
         },
         '*' => {
@@ -176,4 +183,28 @@ test "readValue 遇到未知类型前缀报错" {
     const gpa = std.testing.allocator;
     var r: std.Io.Reader = .fixed("%1\r\n");
     try std.testing.expectError(error.ProtocolError, readValue(gpa, &r));
+}
+
+/// checkAllAllocationFailures 用的辅助函数：每次调用都在给定字节上
+/// 新建一个独立的 fixed reader，避免跨调用复用已消费的流。
+fn checkReadValueAlloc(gpa: std.mem.Allocator, bytes: []const u8) !void {
+    var r: std.Io.Reader = .fixed(bytes);
+    const v = try readValue(gpa, &r);
+    v.deinit(gpa);
+}
+
+test "readValue 在分配失败时把 OutOfMemory 原样传出（bulk）" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkReadValueAlloc,
+        .{"$5\r\nhello\r\n"},
+    );
+}
+
+test "readValue 在分配失败时把 OutOfMemory 原样传出（嵌套数组）" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkReadValueAlloc,
+        .{"*2\r\n$1\r\na\r\n*2\r\n:1\r\n$1\r\nb\r\n"},
+    );
 }
