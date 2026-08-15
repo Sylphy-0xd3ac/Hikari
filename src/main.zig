@@ -8,4 +8,5 @@ test {
     _ = @import("config.zig");
     _ = @import("onebot.zig");
     _ = @import("scan/rules.zig");
+    _ = @import("redis/resp.zig");
 }
