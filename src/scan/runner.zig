@@ -478,7 +478,7 @@ fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
 ///
 /// 重试前的等待只发生在第一次失败之后——成功路径（生产里 431 次探针的绝大
 /// 多数）不付一分钱延迟：`deps.get_msg_retry_delay_ns` 默认 300ms，
-/// 431 次都睡这么久会平白给每天的扫描加 86 秒，这里的分支结构保证了
+/// 431 次都睡这么久会平白给每天的扫描加 129.3 秒（≈2.15 分钟），这里的分支结构保证了
 /// sleep 只在真的要重试时才执行。
 ///
 /// arena 归属：两次尝试（包括请求体的 Stringify 与 callData 内部的 HTTP 响应/
