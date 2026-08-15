@@ -13,4 +13,5 @@ test {
     _ = @import("uuid.zig");
     _ = @import("store.zig");
     _ = @import("http/hitokoto.zig");
+    _ = @import("http/server.zig");
 }
