@@ -10,4 +10,6 @@ test {
     _ = @import("scan/rules.zig");
     _ = @import("redis/resp.zig");
     _ = @import("redis/client.zig");
+    _ = @import("uuid.zig");
+    _ = @import("store.zig");
 }
