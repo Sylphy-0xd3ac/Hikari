@@ -140,20 +140,48 @@ pub fn classify(
 
     // 剔除已作废的候选
     var kept: std.ArrayList(Candidate) = .empty;
-    errdefer kept.deinit(gpa);
-    for (cands.items) |c| {
+    errdefer {
+        // 存活候选的 text_override 所有权在下面的循环里从 cands 转移到了 kept
+        // （cands 随后被 clearAndFree，不再持有它们）；若这里只 kept.deinit 而不
+        // 遍历释放，一旦后面任何一次 toOwnedSlice 触发 OOM，这些字符串就会泄漏
+        // ——本文件加的 checkAllAllocationFailures 回归测试正是靠这条路径抓到的。
+        for (kept.items) |c| if (c.text_override) |t| gpa.free(t);
+        kept.deinit(gpa);
+    }
+    for (cands.items) |*c| {
         if (contains(revoked.items, c.message_id)) {
             if (c.text_override) |t| gpa.free(t);
+            c.text_override = null; // 防止上方 errdefer 在后续 OOM 时对同一指针重复 free
             continue;
         }
-        try kept.append(gpa, c);
+        try kept.append(gpa, c.*);
     }
-    cands.deinit(gpa);
+    // 用 clearAndFree 而非 deinit：deinit 会把 cands 设为 undefined，
+    // 若下面 toOwnedSlice 触发 OOM，函数作用域的 errdefer 会遍历 cands.items
+    // 读到 undefined 内存并段错误。clearAndFree 让 cands 保持合法的空列表，
+    // errdefer 此时只是安全的空操作。
+    cands.clearAndFree(gpa);
+
+    // 分三步而不是直接塞进返回结构体字面量：若三次 toOwnedSlice 中某一次
+    // 先成功、后一次才因 OOM 失败，成功那次拿到的切片必须有名字才能被
+    // errdefer 追上并释放；直接写进 `.field = try ...toOwnedSlice(gpa)` 的话，
+    // 先成功的那份内存不会绑定到任何变量，一旦后续字段失败就直接泄漏——
+    // 这也是本文件加的 checkAllAllocationFailures 回归测试实际抓到的第三条泄漏路径。
+    const revoked_owned = try revoked.toOwnedSlice(gpa);
+    errdefer gpa.free(revoked_owned);
+
+    const candidates_owned = try kept.toOwnedSlice(gpa);
+    errdefer {
+        for (candidates_owned) |c| if (c.text_override) |t| gpa.free(t);
+        gpa.free(candidates_owned);
+    }
+
+    const unresolved_owned = try unresolved.toOwnedSlice(gpa);
 
     return .{
-        .revoked = try revoked.toOwnedSlice(gpa),
-        .candidates = try kept.toOwnedSlice(gpa),
-        .unresolved = try unresolved.toOwnedSlice(gpa),
+        .revoked = revoked_owned,
+        .candidates = candidates_owned,
+        .unresolved = unresolved_owned,
     };
 }
 
@@ -180,13 +208,17 @@ fn params() Params {
     return .{ .observed_qq = OBSERVED, .admin_qqs = &.{ADMIN} };
 }
 
-// 注意：这两个 helper 必须是 inline fn。它们的 .segments 指向一个匿名数组字面量
-// （`&.{...}`），其内容含运行期参数，存储归属于「构造该字面量的那次函数调用」的栈帧；
-// 若 textMsg/replyMsg 是普通函数，该栈帧在函数返回时失效，返回的 Message.segments
-// 就成了悬垂指针——某些测试凑巧在栈内存被复用前完成读取而“测试通过”，另一些（比如
-// 更深的调用链）会读到被复写的垃圾数据。inline 让字面量直接在调用方（测试函数）的
-// 栈帧里构造，其生命周期与外层 `const msgs = [_]onebot.Message{...}` 一致，从根上消除悬垂。
-inline fn textMsg(id: i64, uid: u64, txt: []const u8) onebot.Message {
+// 注意：这两个 helper 的形参必须是 comptime。它们的 .segments 指向一个匿名数组
+// 字面量（`&.{...}`）。当实参是 comptime-known 时，Zig 会把该字面量常量提升
+// （const-promote）为静态只读数据——它进了二进制镜像，不属于任何栈帧，天然与
+// 程序同寿命，因此 `const msgs = [_]onebot.Message{ textMsg(...), ... }` 之后
+// 无论怎么读都安全。参数一旦被声明为 comptime，调用方传入运行期值（比如循环变量
+// 或 var）会直接编译失败，把这条生命周期不变量交给编译器强制执行，而不是依赖注释。
+// （题外话：若形参是运行期参数，`&.{...}` 的存储归属于「构造该字面量的那次函数
+// 调用」的栈帧，函数返回后即失效——这正是本文件原先出现过的悬垂指针 bug；单独
+// 加 inline 在今天的 codegen 下恰好把它落在调用方栈帧里而“凑巧能用”，但不是编译器
+// 保证的语义，故改为 comptime 形参从根上让编译器保证正确性。)
+fn textMsg(comptime id: i64, comptime uid: u64, comptime txt: []const u8) onebot.Message {
     return .{
         .message_id = id,
         .user_id = uid,
@@ -195,7 +227,7 @@ inline fn textMsg(id: i64, uid: u64, txt: []const u8) onebot.Message {
     };
 }
 
-inline fn replyMsg(id: i64, uid: u64, target: i64, txt: []const u8) onebot.Message {
+fn replyMsg(comptime id: i64, comptime uid: u64, comptime target: i64, comptime txt: []const u8) onebot.Message {
     return .{
         .message_id = id,
         .user_id = uid,
@@ -403,4 +435,29 @@ test "manualBody 单独可用" {
     try std.testing.expectEqualStrings("abc", ok);
     try std.testing.expectEqual(@as(?[]u8, null), try manualBody(gpa, textMsg(1, OUTSIDER, "✨ abc"), params()));
     try std.testing.expectEqual(@as(?[]u8, null), try manualBody(gpa, textMsg(1, ADMIN, "abc"), params()));
+}
+
+fn classifyUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    // id=1：路径3候选，随后被 id=2 的 💦 作废 → 命中 :146/:151 附近的
+    // free-then-maybe-double-free 路径；id=3：路径3候选且存活 → 让
+    // 「剔除已作废候选」循环里 kept.append 之后还有后续工作（toOwnedSlice 等），
+    // 从而在更多分配点上练到 :151 的 errdefer 复用问题。
+    const msgs = [_]onebot.Message{
+        textMsg(1, ADMIN, "✨ aaa"),
+        replyMsg(2, ADMIN, 1, "💦"),
+        textMsg(3, ADMIN, "✨ bbb"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：作废与存活的路径3候选混在一起时，任意分配点失败都不能段错误或重复释放" {
+    // 覆盖 review 发现的两个缺陷：
+    // 1) cands.deinit 把 cands 设为 undefined 后，若后续 toOwnedSlice 触发 OOM，
+    //    errdefer 会遍历 undefined 内存并段错误（修复：改用 clearAndFree）。
+    // 2) 剔除已作废候选时 free 了 text_override 却没有把它设为 null，若循环里
+    //    后续的 append 触发 OOM，errdefer 会对同一指针 free 第二次（修复：free 后置 null）。
+    // std.testing.allocator 单独跑无法触及这两条路径——只有在每个分配点都真实失败一次
+    // 的穷举下才会暴露，所以用 checkAllAllocationFailures。
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyUnderFailingAllocator, .{});
 }
