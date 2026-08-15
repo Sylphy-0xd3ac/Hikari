@@ -155,6 +155,7 @@ pub fn classify(
             continue;
         }
         try kept.append(gpa, c.*);
+        c.text_override = null; // 所有权转移给 kept 了；同理防止 cands 的 errdefer 在后续 OOM 时重复 free
     }
     // 用 clearAndFree 而非 deinit：deinit 会把 cands 设为 undefined，
     // 若下面 toOwnedSlice 触发 OOM，函数作用域的 errdefer 会遍历 cands.items
@@ -460,4 +461,35 @@ test "OOM 回归：作废与存活的路径3候选混在一起时，任意分配
     // std.testing.allocator 单独跑无法触及这两条路径——只有在每个分配点都真实失败一次
     // 的穷举下才会暴露，所以用 checkAllAllocationFailures。
     try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyUnderFailingAllocator, .{});
+}
+
+fn classifyManySurvivorsUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    // 8 条互不作废的路径3候选，全部存活进 kept。第一次 kept.append 由
+    // ArrayList 的初始容量吃掉，之后每次 append 都可能触发一次真正的分配
+    // （扩容）。只有存活候选数够多、逼出至少一次「append 之后还有更多 append」
+    // 的场景，才能覆盖到「c.* 被拷进 kept 后，cands 里原件的 text_override
+    // 必须同步置 null，否则 append 失败时 kept 与 cands 的两个 errdefer
+    // 会对同一指针各 free 一次」这条路径——单个存活候选的场景到不了这里。
+    const msgs = [_]onebot.Message{
+        textMsg(1, ADMIN, "✨ one"),
+        textMsg(2, ADMIN, "✨ two"),
+        textMsg(3, ADMIN, "✨ three"),
+        textMsg(4, ADMIN, "✨ four"),
+        textMsg(5, ADMIN, "✨ five"),
+        textMsg(6, ADMIN, "✨ six"),
+        textMsg(7, ADMIN, "✨ seven"),
+        textMsg(8, ADMIN, "✨ eight"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：≥3 个存活的路径3候选（无作废）时，kept.append 扩容失败不能重复释放" {
+    // 覆盖上一轮修复引入的新缺陷：给 kept 的 errdefer 加上按元素遍历释放
+    // text_override 后，"剔除已作废候选" 循环里 try kept.append(gpa, c.*)
+    // 成功之后，如果不把 cands 里那份原件的 text_override 同步置 null，
+    // cands 的原件与 kept 里的拷贝会短暂共享同一个指针；只要循环里后面
+    // 还有一次 kept.append 触发 OOM，两个 errdefer 就会各 free 一次，
+    // 造成 double free。修复：append 成功后立刻把源指针置 null。
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyManySurvivorsUnderFailingAllocator, .{});
 }
