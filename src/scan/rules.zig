@@ -102,7 +102,16 @@ fn distinctWindow(gpa: std.mem.Allocator, window: []const onebot.Message) ![]one
 }
 
 /// 把 members（时间升序）拼成一条 Chain 并追加到 chains。
-fn finalizeChain(gpa: std.mem.Allocator, chains: *std.ArrayList(Chain), members: []const onebot.Message) !void {
+///
+/// 拼接每个成员时优先走 manualBody（路径3判定）：若这个成员自己就是合法的
+/// "✨ 内容" 管理员手动收录格式（这要求被观察者同时在 ADMIN_QQS 里），拼进
+/// joined 正文的是剥掉 ✨ 前缀后的内容，而不是带着 ✨ 的原始渲染文本。✨ 在这个
+/// 系统里到处都是控制符不是正文——路径3自己会剥掉它，路径4的联动如果不剥，
+/// 会拼出"你们有钱 ✨ 你们潇洒"这种带着控制符残留的语录。manualBody 内部已经
+/// 处理了"不含 reply 段"这个前提，链成员本来就不含 reply 段（reply 段是路径2的
+/// 语法，和链成员资格互斥的场景在实践中不会出现，即便出现 manualBody 也会
+/// 正确返回 null 退回原始渲染文本）。
+fn finalizeChain(gpa: std.mem.Allocator, chains: *std.ArrayList(Chain), members: []const onebot.Message, p: Params) !void {
     var ids: std.ArrayList(i64) = .empty;
     errdefer ids.deinit(gpa);
     for (members) |m| try ids.append(gpa, m.message_id);
@@ -112,10 +121,10 @@ fn finalizeChain(gpa: std.mem.Allocator, chains: *std.ArrayList(Chain), members:
     var text: std.ArrayList(u8) = .empty;
     errdefer text.deinit(gpa);
     for (members, 0..) |m, i| {
-        const rendered = try m.renderText(gpa);
-        defer gpa.free(rendered);
+        const piece: []const u8 = if (try manualBody(gpa, m, p)) |body| body else try m.renderText(gpa);
+        defer gpa.free(piece);
         if (i > 0) try text.append(gpa, ' ');
-        try text.appendSlice(gpa, rendered);
+        try text.appendSlice(gpa, piece);
     }
     const text_owned = try text.toOwnedSlice(gpa);
     errdefer gpa.free(text_owned);
@@ -131,7 +140,7 @@ fn buildChains(
     window: []const onebot.Message,
     star_ids: []const i64,
     fire_ids: []const i64,
-    observed_qq: u64,
+    p: Params,
 ) ![]Chain {
     const distinct = try distinctWindow(gpa, window);
     defer gpa.free(distinct);
@@ -147,17 +156,17 @@ fn buildChains(
     var last_pos: usize = 0;
 
     for (distinct, 0..) |m, pos| {
-        if (!isChainMember(m, star_ids, fire_ids, observed_qq)) continue;
+        if (!isChainMember(m, star_ids, fire_ids, p.observed_qq)) continue;
         if (run.items.len > 0 and pos - last_pos <= chain_max_gap) {
             try run.append(gpa, m);
         } else {
-            if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items);
+            if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
             run.clearRetainingCapacity();
             try run.append(gpa, m);
         }
         last_pos = pos;
     }
-    if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items);
+    if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
 
     return chains.toOwnedSlice(gpa);
 }
@@ -183,7 +192,7 @@ pub fn classify(
     // 就必须已经知道成员→链的映射。构建放在函数最前面，而不是让 Pass A 现算，
     // 是因为 Pass B 插入 fire_chain 候选、排除路径1里的链成员，同样需要这份
     // 映射——算一次，Pass A/Pass B 共用，也避免两处判定逻辑各写一份、悄悄分叉。
-    const chains = try buildChains(gpa, window, star_ids, fire_ids, p.observed_qq);
+    const chains = try buildChains(gpa, window, star_ids, fire_ids, p);
     defer {
         for (chains) |*c| c.deinit(gpa);
         gpa.free(chains);
@@ -233,11 +242,12 @@ pub fn classify(
     }
 
     // Pass B：先并入 🔥 链候选——每条链一个，正文是拼接好的 joined 文本，主键
-    // 是第一个成员的 message_id。放在路径1/2/3 之前插入，这样若某条链的主键
-    // 恰好还被路径2/3命中（同一 message_id），下面 appendCandidate 的去重规则
-    // （非 admin_manual 的新候选一律让路给已存在的候选）会让这条已经插入的
-    // fire_chain 候选留下，除非新来的是 admin_manual（那条规则本来就是"路径3
-    // 优先于一切"，不是本次改动新增的）。
+    // 是第一个成员的 message_id。放在路径1/2/3 之前插入：下面的主循环会显式
+    // 检查每条消息是否是某条链的成员（is_chain_member / chainOf），链成员一律
+    // 不再生成路径1/2/3 的候选（见下方主循环里的说明），所以这里插入的顺序
+    // 本身不再依赖 appendCandidate 的去重规则来"赢"——不会有路径1/2/3的候选
+    // 冲着同一个链成员的 message_id 跑来跟它抢；先插入只是让 chains 的所有权
+    // 转移（c.text = null）尽早发生，逻辑上更直接。
     for (chains) |*c| {
         if (c.text) |t| {
             try appendCandidate(gpa, &cands, .{
@@ -251,21 +261,36 @@ pub fn classify(
 
     // Pass B：收集候选
     for (window) |m| {
-        // 路径3 优先于路径1
-        if (try manualBody(gpa, m, p)) |body| {
-            errdefer gpa.free(body);
-            try appendCandidate(gpa, &cands, .{
-                .message_id = m.message_id,
-                .path = .admin_manual,
-                .text_override = body,
-            });
-            continue;
+        // 链成员的个体收录资格对全部路径一律让路给路径4：链是更具体的信号
+        // （群里明确把这几条标记成一句话），路径1/2/3 只是"这条消息本身也值得
+        // 收录"的独立信号，两者同时生效会让语录库里同时存在碎句和整句
+        // （"你们潇洒" 与 "你们有钱 你们潇洒"），GET / 随机吐出来的观感比只留
+        // 其中一条更差。这条规则对链的第一个成员（主键）也成立，不只是非主键
+        // 成员——即便主键那条自己长得也像路径3格式，也不再单独生成路径3候选，
+        // 由链的 fire_chain 候选（已经在上面的循环里插入，且已经用 manualBody
+        // 剥过它自己的 ✨ 前缀了，见 finalizeChain）代表它。这一条使路径4的
+        // 优先级压过路径3，是本次改动特意翻转的：路径3优先于路径1是因为它是
+        // 更具体的"作者本人手动指定"信号；路径4优先于路径3/路径1是因为它是
+        // 更具体的"分组"信号，而分组这件事没有别的路径能表达。
+        const is_chain_member = chainOf(chains, m.message_id) != null;
+
+        // 路径3 优先于路径1（但链成员整体让路给路径4，见上）
+        if (!is_chain_member) {
+            if (try manualBody(gpa, m, p)) |body| {
+                errdefer gpa.free(body);
+                try appendCandidate(gpa, &cands, .{
+                    .message_id = m.message_id,
+                    .path = .admin_manual,
+                    .text_override = body,
+                });
+                continue;
+            }
         }
 
         // 路径1：被观察者本人的消息带 ✨ 表情回应，且不是已并入某条 🔥 链的成员
         // （链已经把它的内容拼进 joined 语录了；不排除的话 "你们有钱"、
         // "你们潇洒"、"你们有钱 你们潇洒" 会同时入库）
-        if (m.user_id == p.observed_qq and contains(star_ids, m.message_id) and chainOf(chains, m.message_id) == null) {
+        if (m.user_id == p.observed_qq and contains(star_ids, m.message_id) and !is_chain_member) {
             try appendCandidate(gpa, &cands, .{
                 .message_id = m.message_id,
                 .path = .emoji_reaction,
@@ -284,6 +309,9 @@ pub fn classify(
             continue;
         };
         if (target.user_id != p.observed_qq) continue;
+        // 引用目标是链成员时同样让路给路径4：这条 ✨ 回复只是在说"这句话说得好"，
+        // 链已经替它把这句话（连同它的邻居）收进 joined 语录了。
+        if (chainOf(chains, rid) != null) continue;
         try appendCandidate(gpa, &cands, .{
             .message_id = rid,
             .path = .quoted_star,
@@ -817,6 +845,59 @@ test "🔥链撤稿：💦 引用链上第一个成员（主键），同样作�
 
     try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
     try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, out.revoked);
+}
+
+test "🔥链：路径2引用链上成员被抑制——只留 fire_chain 一条候选，不重复收录被引用的碎句" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "你们有钱"),
+        textMsg(2, OBSERVED, "你们潇洒"),
+        replyMsg(3, OUTSIDER, 2, "✨"), // 有人单独对链上第二个成员回 ✨
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("你们有钱 你们潇洒", out.candidates[0].text_override.?);
+}
+
+test "🔥链：非主键成员自身是路径3格式时被抑制为个体候选，joined正文剥掉它的✨前缀" {
+    const gpa = std.testing.allocator;
+    // 被观察者同时在 ADMIN_QQS 里，这样第二个成员的 "✨ 你们潇洒" 才满足路径3格式。
+    const p: Params = .{ .observed_qq = OBSERVED, .admin_qqs = &.{OBSERVED} };
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "你们有钱"),
+        textMsg(2, OBSERVED, "✨ 你们潇洒"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, p);
+    defer out.deinit(gpa);
+
+    // 只有一条：fire_chain。若没有抑制，会多出一条路径3候选（message_id=2，
+    // 正文"你们潇洒"）；若没有剥 ✨，joined 正文会是"你们有钱 ✨ 你们潇洒"。
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("你们有钱 你们潇洒", out.candidates[0].text_override.?);
+}
+
+test "🔥链：主键自身是路径3格式时同样被抑制，链仍然赢（路径4压过路径3）" {
+    const gpa = std.testing.allocator;
+    const p: Params = .{ .observed_qq = OBSERVED, .admin_qqs = &.{OBSERVED} };
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "✨ 你们有钱"),
+        textMsg(2, OBSERVED, "你们潇洒"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, p);
+    defer out.deinit(gpa);
+
+    // 若路径3仍然优先（旧规则），这里会得到 message_id=1、path=admin_manual、
+    // 正文"你们有钱"（丢了"你们潇洒"）。新规则下链赢，两段都在，✨ 也被剥掉了。
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("你们有钱 你们潇洒", out.candidates[0].text_override.?);
 }
 
 fn classifyChainUnderFailingAllocator(gpa: std.mem.Allocator) !void {
