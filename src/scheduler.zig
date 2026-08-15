@@ -25,9 +25,35 @@ pub fn nextRunAt(now: i64, hour: u8, minute: u8, offset: i64) i64 {
     return target - offset;
 }
 
-/// 扫描窗口 = [触发时刻 - 24h, 触发时刻)
-pub fn windowStart(run_at: i64) i64 {
-    return run_at - seconds_per_day;
+/// windowStart 的返回值：起点本身，加上"是否被 7 天回看上限截断过"。
+/// `clamped` 让调用方（runner.runOnce）能在截断发生时打一条警告——截断
+/// 意味着 [run_at - max_lookback_seconds, last_run) 这一段被放弃，
+/// 其中的 💦 撤稿指令永久不可恢复（它们只会被看到一次）。
+pub const Window = struct { start: i64, clamped: bool };
+
+/// 回看上限：停机超过这个时长，更早的那段放弃并警告。
+/// 7 天 ≈ 35 页（200 条/页），远在 runner 的 200 次迭代护栏内。
+pub const max_lookback_seconds: i64 = 7 * 86400;
+
+/// 扫描窗口起点，逐群独立：按这个群自己的 `last_run`（`hikari:lastrun:{group_id}`）
+/// 算，而不是固定回看 24 小时——固定 24h 的话，停机超过一天的那段永远不会被
+/// 任何一次扫描覆盖到，丢的不只是语录（明天的窗口还能兜住新贴的 ✨），
+/// 还有 💦 撤稿指令（只会被看到一次，漏了就永久漏了）。
+///
+/// - `last_run == null`（这个群从未跑过）→ 退化成原来的固定 24h 窗口。
+/// - `last_run >= run_at`（这个群这一时刻已经跟上了，比如同一轮 runOnce 里
+///   补跑逻辑用最早的漏跑时刻重扫了全部群，其中有的群本来就没漏）→ 空窗口
+///   `[run_at, run_at)`。`inWindow` 对 `start == end` 已经返回 false（有
+///   专门的测试钉住），这里不需要、也不应该再加一层特判。
+/// - 停机跨度超过 `max_lookback_seconds` → 截断到上限，`clamped = true`。
+/// - 否则 → `[last_run, run_at)`，把 last_run 之后错过的整段都补上。
+pub fn windowStart(run_at: i64, last_run: ?i64) Window {
+    const last = last_run orelse return .{ .start = run_at - seconds_per_day, .clamped = false };
+    if (last >= run_at) return .{ .start = run_at, .clamped = false };
+    if (run_at - last > max_lookback_seconds) {
+        return .{ .start = run_at - max_lookback_seconds, .clamped = true };
+    }
+    return .{ .start = last, .clamped = false };
 }
 
 /// 进程重启后判断今天的那次是否漏跑。漏了返回今天的触发时刻，否则 null。
@@ -77,8 +103,41 @@ test "nextRunAt 在负偏移时区下也正确" {
     try std.testing.expectEqual(base_utc + 4 * 3600, nextRunAt(base_utc, 23, 0, -5 * 3600));
 }
 
-test "windowStart 恒为触发时刻前 24 小时" {
-    try std.testing.expectEqual(base_utc - day, windowStart(base_utc));
+test "windowStart：last_run 为 null（首次运行）→ 退化成固定 24h 窗口" {
+    const got = windowStart(base_utc, null);
+    try std.testing.expectEqual(base_utc - day, got.start);
+    try std.testing.expect(!got.clamped);
+}
+
+test "windowStart：last_run >= run_at（这个群已经跟上了）→ 空窗口" {
+    const got_equal = windowStart(base_utc, base_utc);
+    try std.testing.expectEqual(base_utc, got_equal.start);
+    try std.testing.expect(!got_equal.clamped);
+
+    const got_ahead = windowStart(base_utc, base_utc + 3600);
+    try std.testing.expectEqual(base_utc, got_ahead.start);
+    try std.testing.expect(!got_ahead.clamped);
+}
+
+test "windowStart：正常回补 → 窗口起点就是 last_run，不截断" {
+    const last = base_utc - 3 * day;
+    const got = windowStart(base_utc, last);
+    try std.testing.expectEqual(last, got.start);
+    try std.testing.expect(!got.clamped);
+}
+
+test "windowStart：停机跨度恰为 7 天上限 → 不截断" {
+    const last = base_utc - max_lookback_seconds;
+    const got = windowStart(base_utc, last);
+    try std.testing.expectEqual(last, got.start);
+    try std.testing.expect(!got.clamped);
+}
+
+test "windowStart：停机跨度比 7 天上限多 1 秒 → 截断且标记 clamped" {
+    const last = base_utc - max_lookback_seconds - 1;
+    const got = windowStart(base_utc, last);
+    try std.testing.expectEqual(base_utc - max_lookback_seconds, got.start);
+    try std.testing.expect(got.clamped);
 }
 
 test "missedRun：从未跑过则不补跑" {

@@ -32,8 +32,11 @@ pub fn failedLine(gpa: std.mem.Allocator, reason: []const u8) ![]u8 {
 
 /// 一个群这一轮里出的岔子。三类分开计数，因为它们的后果不一样，运营方需要
 /// 从群里那一行 `Failed:` 直接看出是哪一类：
-///   - revoke_failed：撤稿没落盘。**最严重的一类**——那条 💦 明天就滑出窗口，
-///     永远不会被重新看到，而语录还在公网上可以被随机到。
+///   - revoke_failed：撤稿没落盘。**最严重的一类**——它跟其他两类一样会让
+///     这个群这一轮判失败、不写 setLastRun，所以下一次扫描（受 7 天回看
+///     上限约束）还会覆盖到这条消息、有机会重放撤稿；但那个上限一过，
+///     这条 💦 就永久丢了，而语录还在公网上可以被随机到，所以仍然要单独
+///     计数、单独在 Failed 行里报出来。
 ///   - add_failed：语录没写进库。下一次扫描窗口还包含它的话会重试。
 ///   - unattributed：群名/群名片没问出来，这一批候选整批没写（见 scanGroup）。
 pub const Trouble = struct {
@@ -347,21 +350,53 @@ fn applyLastRun(st: *store.Store, group_id: u64, ok: bool, run_at: i64) void {
     };
 }
 
+/// 单个群这一轮扫描窗口的起点：读它自己的 `hikari:lastrun:{group_id}`交给
+/// `scheduler.windowStart` 算。抽成独立函数的理由跟 applyLastRun 一样——
+/// 绕开 scanGroup 依赖的真实 NapCat HTTP，只用一个 *Store 就能单测。
+///
+/// Redis 读失败时退化成 `null`（等价于"这个群从未跑过"，回退到固定 24h
+/// 窗口）而不是让这个群直接判失败——一次读抖动不该白白跳过整个群。但这个
+/// 退化必须留痕：不打警告的话，"该扫 5 天却只扫了 24h" 跟 "这个群真的
+/// 从未跑过" 在日志里长得一模一样，没人会去怀疑扫描范围不对。
+///
+/// `clamped`（停机跨度超过 7 天回看上限）也在这里报警：那一段里的 💦
+/// 撤稿指令永久不可恢复，运营方需要知道是哪个群、丢了哪一段时间。
+fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64) i64 {
+    const last_run = st.getLastRun(group_id) catch |e| blk: {
+        std.log.warn(
+            "group {d}: getLastRun failed ({s}); falling back to a fixed 24h window instead of the real catch-up span since last run",
+            .{ group_id, @errorName(e) },
+        );
+        break :blk null;
+    };
+    const win = scheduler.windowStart(run_at, last_run);
+    if (win.clamped) {
+        std.log.warn(
+            "group {d}: downtime since last run ({d}s) exceeds the {d}s lookback cap — window clamped to start at {d}; the dropped span [{d}, {d}) will never be rescanned and any 💦 revocations in it are unrecoverable",
+            .{ group_id, run_at - last_run.?, scheduler.max_lookback_seconds, win.start, last_run.?, win.start },
+        );
+    }
+    return win.start;
+}
+
 /// 跑一次完整扫描。失败不抛出，改为在日志里发 Failed 行。
 ///
 /// `hikari:lastrun:{group_id}` 是逐群独立的键（见 store.zig lastRunKey）：
 /// 每个群只在它自己这一轮成功时才写自己的键，失败的群完全不写，不受同一轮
 /// 里其他群成不成功影响。这样一个群的失败不会被兄弟群的成功掩盖——重启补跑
 /// （main.zig）逐群读这个键，只有失败的那个群会被判定为"漏跑"而重新扫描。
+///
+/// 扫描窗口的起点逐群计算（`resolveWindowStart`），不在循环外算一次共用：
+/// `last_run` 本身就是逐群独立的状态，固定在循环外算等于假装所有群这一轮
+/// 该回看的跨度都一样——它们并不一样。
 pub fn runOnce(deps: Deps, run_at: i64) void {
-    const win_start = scheduler.windowStart(run_at);
-
     for (deps.group_ids) |gid| {
         for (banner) |line| sendLine(deps, gid, line);
         sendLine(deps, gid, processing_line);
     }
 
     for (deps.group_ids) |gid| {
+        const win_start = resolveWindowStart(deps.st, gid, run_at);
         const ok = scanGroup(deps, gid, win_start, run_at) catch |e| catch_blk: {
             const msg = failedLine(deps.gpa, @errorName(e)) catch {
                 // 格式化 Failed 行本身失败（理论上只会是 gpa OOM）：不能因此
@@ -514,9 +549,12 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     for (outcome.revoked) |rid| {
         deps.st.revoke(rid) catch |e| {
             // 作废失败必须跟入库失败一样压掉 Successfully. 与 setLastRun。
-            // 它其实更严重：这条 💦 明天就滑出 24h 窗口，之后任何一次扫描都
-            // 不会再看到它，撤稿请求就此永久丢失，而那条语录仍然公开可查。
-            // 只打一条 warn 然后照常报 Successfully. 是这个产品里最坏的失败模式。
+            // 压掉 setLastRun 现在还带一个好处：resolveWindowStart 按 last_run
+            // 算窗口起点，这个群的 last_run 不动，下一次扫描（无论是重启补跑
+            // 还是正常触发）的窗口会从旧起点重新覆盖到这条消息（受 7 天回看
+            // 上限约束），撤稿请求还有机会重放，不是"这条 💦 明天就永久丢失"
+            // 了——那是固定 24h 窗口时代的行为。只打一条 warn 然后照常报
+            // Successfully. 才是这个产品里最坏的失败模式，所以必须压掉。
             std.log.warn("group {d}: revoke {d} failed: {s}", .{ gid, rid, @errorName(e) });
             trouble.revoke_failed += 1;
             trouble.last_err = @errorName(e);
@@ -529,11 +567,11 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     // 归属信息没问出来就一条都不写：buildQuote 把 from/from_who 原样烧进每一条
     // 语录，而设计里没有任何事后编辑的路径——一次 get_group_info 抖动会让这一批
     // 语录永远带着空的 from/from_who 对外服务。宁可整批不写、这个群算失败、
-    // 不写这个群自己的 setLastRun，等下一次进程重启时的补跑（main.zig）重来：
-    // scheduler.windowStart 是固定的 run_at - 24h，下一次正常触发时刻的窗口
-    // 已经往前挪了一天，看不到这批候选——只有重启补跑会拿同一个 run_at 重新
-    // 扫这个群，所以这条路是唯一能补上的，不是"下一次扫描"顺带就补上了。
-    // 候选仍在窗口里，isTombstoned/exists 保证重扫是幂等的。
+    // 不写这个群自己的 setLastRun：resolveWindowStart 按 last_run 算窗口起点，
+    // 这个群的 last_run 就停在上一次成功的时刻不动，所以不管是重启补跑还是
+    // 下一次正常触发，窗口都会从那个旧起点重新覆盖到这一批候选（受 7 天回看
+    // 上限约束），不需要靠"固定 run_at - 24h"时代那种只有重启补跑才补得上
+    // 的特殊路径。候选仍在窗口里，isTombstoned/exists 保证重扫是幂等的。
     const attributed = from != null and from_who != null;
 
     var added: usize = 0;
@@ -972,4 +1010,81 @@ test "applyLastRun：失败的群不写 setLastRun，成功的兄弟群照写—
 
     // 失败的群（200）完全没有对应的键出现在发出去的字节里。
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:lastrun:200") == null);
+}
+
+// ---------------------------------------------------------------------------
+// resolveWindowStart：同样只需要一个 *Store。四条分支对应 scheduler.windowStart
+// 的四条分支（首次运行 / 已跟上 / 正常回补 / 截断），外加它自己特有的一条——
+// getLastRun 读失败时退化成 24h 窗口而不是让整个群失败。
+
+test "resolveWindowStart：正常回补——窗口起点就是 Redis 里的 last_run" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const last_run: i64 = run_at - 3 * 86400; // 3 天前，没有超过 7 天上限
+    const srv = try FakeServer.start(gpa, "$10\r\n1699840800\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    try std.testing.expectEqual(last_run, resolveWindowStart(&st, 100, run_at));
+}
+
+test "resolveWindowStart：Redis 里没有这个群的键（nil）→ 退化成固定 24h 窗口" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const srv = try FakeServer.start(gpa, "$-1\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at));
+}
+
+test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口，不让这个群直接崩" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const srv = try FakeServer.start(gpa, "$10\r\n1699840800\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    // 立刻 deinit：之后任何命令都直接返回 error.ConnectionFailed（client.zig
+    // 的 dead 标志），不需要真的模拟一次网络层错误。
+    c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at));
+}
+
+test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clamped 的 warn 只影响日志，不影响返回值）" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const last_run: i64 = run_at - scheduler.max_lookback_seconds - 100; // 超过上限 100 秒
+    var buf: [16]u8 = undefined;
+    const s = std.fmt.bufPrint(&buf, "{d}", .{last_run}) catch unreachable;
+    const script = try std.fmt.allocPrint(gpa, "${d}\r\n{s}\r\n", .{ s.len, s });
+    defer gpa.free(script);
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    try std.testing.expectEqual(run_at - scheduler.max_lookback_seconds, resolveWindowStart(&st, 100, run_at));
 }

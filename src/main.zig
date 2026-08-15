@@ -83,12 +83,16 @@ pub fn main() !void {
             // 的 lastrun 时不该直接崩掉整个进程，代价记在这里。
             const last = scan_store.getLastRun(gid) catch null;
             if (scheduler.missedRun(now, last, cfg.scan_hour, cfg.scan_minute, off)) |missed| {
-                // 各群漏跑的时刻可能不一样（比如上一轮里一个群成功、一个群
-                // 失败，且它们各自最近一次成功的时间点本来就不同）；取最早的
-                // 那个当 run_at：它离"覆盖到位"最远。runOnce 会用这一个 run_at
-                // 重新扫全部群——已经追上这个时刻的群只是把已经处理过的窗口
-                // 幂等地重扫一遍（exists/isTombstoned 挡重复入库），无害，
-                // 所以这里不需要、也不做逐群跳过。
+                // scheduler.missedRun 的非 null 返回值只由 now/hour/minute/offset
+                // 算出，跟传进去的 last_run 完全无关——同一次调用里所有非 null 的
+                // missed 眼下必然彼此相等，只有"漏没漏跑"（null 还是非 null）
+                // 逐群不同。取最小值目前只是在给一堆相等的数取 min，不是因为它们
+                // 会不一样；这里留着 min 选择是防御性的、面向将来的写法——万一
+                // missedRun 以后改成也参考 last_run（比如允许每群独立判定该补哪
+                // 一天），各群的 missed 就可能真的分叉，到时候不用改这段代码。
+                // runOnce 会用选中的 run_at 重新扫全部群——已经追上这个时刻的群
+                // 现在会拿到一个空窗口（scheduler.windowStart 的 last_run >= run_at
+                // 分支），不会再做任何多余的重扫，也无需在这里逐群跳过。
                 if (earliest_missed == null or missed < earliest_missed.?) {
                     earliest_missed = missed;
                 }
