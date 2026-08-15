@@ -17,7 +17,7 @@ zig build -Doptimize=ReleaseSafe
 cp .env.example .env
 # 编辑 .env，填入 NapCat/Redis 的真实地址与目标群号
 
-# 起daemon：HTTP 服务 + 每日定时扫描
+# 起 daemon：HTTP 服务 + 每日定时扫描
 set -a && source .env && set +a
 ./zig-out/bin/hikari
 
