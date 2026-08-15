@@ -12,4 +12,5 @@ test {
     _ = @import("redis/client.zig");
     _ = @import("uuid.zig");
     _ = @import("store.zig");
+    _ = @import("http/hitokoto.zig");
 }
