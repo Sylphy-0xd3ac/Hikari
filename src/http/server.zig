@@ -15,6 +15,14 @@ pub const Server = struct {
     // `port()` 方法名导致编译失败的重命名不是一回事。
     st: *store.Store,
     listener: std.net.Server,
+    /// 已 accept 连接的接收超时（秒）。这个服务是单线程串行处理的：一条连上来
+    /// 就一直不发请求行的连接，会让 receiveHead 永久阻塞，整个公开 API 停摆
+    /// （Slowloris，一条连接就够）。有了它，静默连接最多占住这么久就会被踢掉，
+    /// 循环继续接下一条。测试里调小以便快速验证。
+    ///
+    /// 只设收方向、不设发方向：响应体都在几 KB 以内，塞得进内核发送缓冲区，
+    /// 写不会阻塞；真正的暴露面在读。
+    recv_timeout_s: u32 = 10,
 
     pub fn listen(
         gpa: std.mem.Allocator,
@@ -48,10 +56,25 @@ pub const Server = struct {
         }
     }
 
+    /// 给已 accept 的连接装上 SO_RCVTIMEO。设置失败不致命：拿不到超时保护也
+    /// 比直接拒绝这条连接强，记一行警告继续处理。
+    fn setRecvTimeout(self: *Server, sock: std.posix.socket_t) void {
+        const tv: std.posix.timeval = .{ .sec = @intCast(self.recv_timeout_s), .usec = 0 };
+        std.posix.setsockopt(
+            sock,
+            std.posix.SOL.SOCKET,
+            std.posix.SO.RCVTIMEO,
+            std.mem.asBytes(&tv),
+        ) catch |e| {
+            std.log.warn("http: could not set SO_RCVTIMEO: {s}", .{@errorName(e)});
+        };
+    }
+
     /// 供测试单步驱动：只 accept 一次、处理一个请求就返回。
     pub fn serveOnce(self: *Server) !void {
         const conn = try self.listener.accept();
         defer conn.stream.close();
+        self.setRecvTimeout(conn.stream.handle);
 
         var rbuf: [8192]u8 = undefined;
         var wbuf: [8192]u8 = undefined;
@@ -64,9 +87,15 @@ pub const Server = struct {
         try self.handle(&req);
     }
 
+    /// keep_alive = false 是刻意的，不是保守默认：serveOnce 里的
+    /// `defer conn.stream.close()` 无论如何都会关掉这条连接，而 req.respond 的
+    /// 默认值 keep_alive=true 不会发 `connection: close` 头。两者凑在一起就是
+    /// 在骗客户端——带连接池的客户端会把这条已经被我们关掉的 socket 留着复用，
+    /// 下一个请求撞上 EOF。宣称的行为必须跟实际行为一致。
     fn respondJson(req: *std.http.Server.Request, status: std.http.Status, body: []const u8) !void {
         try req.respond(body, .{
             .status = status,
+            .keep_alive = false,
             .extra_headers = &.{.{ .name = "content-type", .value = "application/json; charset=utf-8" }},
         });
     }
@@ -136,8 +165,10 @@ pub const Server = struct {
         const rendered = try hitokoto.render(gpa, quote, query);
         defer rendered.deinit(gpa);
 
+        // keep_alive = false 的理由同 respondJson。
         try req.respond(rendered.body, .{
             .status = .ok,
+            .keep_alive = false,
             .extra_headers = &.{.{ .name = "content-type", .value = rendered.content_type }},
         });
     }
@@ -280,6 +311,77 @@ fn request(gpa: std.mem.Allocator, method: std.http.Method, port: u16, path: []c
 
 fn get(gpa: std.mem.Allocator, port: u16, path: []const u8, out: *std.Io.Writer.Allocating) !std.http.Status {
     return request(gpa, .GET, port, path, out);
+}
+
+/// 用裸 socket 发一段原样的 HTTP 请求文本，读回整段响应原文（状态行 + 响应头 +
+/// 响应体）。std.http.Client.fetch 只把响应体交出来，验不了 `connection: close`
+/// 这类响应头。服务端处理完就关连接，所以读到 EOF 即可。
+fn rawRequest(gpa: std.mem.Allocator, port: u16, request_text: []const u8) ![]u8 {
+    const addr = try std.net.Address.parseIp("127.0.0.1", port);
+    const sock = try std.net.tcpConnectToAddress(addr);
+    defer sock.close();
+    try sock.writeAll(request_text);
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = try sock.read(&buf);
+        if (n == 0) break;
+        try out.appendSlice(gpa, buf[0..n]);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+test "200 响应带 connection: close —— 宣称的行为跟真的会关连接一致" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply() };
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    const raw = try rawRequest(gpa, h.srv.port(), "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    defer gpa.free(raw);
+
+    // serveOnce 的 `defer conn.stream.close()` 无论如何都会关掉这条连接。
+    // req.respond 默认 keep_alive=true 时不发 connection 头，带连接池的客户端
+    // 会把这条已经死掉的 socket 留着复用，下一个请求撞 EOF。
+    try std.testing.expect(std.mem.indexOf(u8, raw, " 200 OK") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "connection: close\r\n") != null);
+}
+
+test "错误响应（404）同样带 connection: close" {
+    const gpa = std.testing.allocator;
+    const h = try startHarness(gpa, &[_][]const u8{});
+    defer stopHarness(h);
+
+    const raw = try rawRequest(gpa, h.srv.port(), "GET /nope HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    defer gpa.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, " 404 Not Found") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "connection: close\r\n") != null);
+}
+
+test "静默客户端撞上接收超时，serveOnce 出错返回而不是永久卡住整个服务" {
+    const gpa = std.testing.allocator;
+    // 走不到 store，所以假 Redis 不需要任何脚本。
+    const fake = try FakeRedis.start(gpa, &[_][]const u8{});
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    srv.recv_timeout_s = 1;
+
+    // 连上来，一个字节都不发。没有 SO_RCVTIMEO 的话下面这行会永远不返回——
+    // 这个服务是串行 accept 的，线上表现就是整个公开 API 被一条连接拖死。
+    const sock = try std.net.tcpConnectToAddress(srv.listener.listen_address);
+    defer sock.close();
+
+    try std.testing.expectError(error.ReadFailed, srv.serveOnce());
 }
 
 test "GET / 返回 hitokoto JSON" {
