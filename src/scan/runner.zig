@@ -157,6 +157,21 @@ pub const Deps = struct {
     observed_qq: u64,
     admin_qqs: []const u64,
     group_ids: []const u64,
+    /// getMsg 单次重试前的等待时长。生产上 24/2300 探针在负载压力下失败，紧接着
+    /// 立刻重试大概率撞上同一波拥堵（这轮扫描本身就在跟 get_group_info/
+    /// get_group_member_info/回复补拉/合并转发挤同一条 NapCat 连接），留几百毫秒
+    /// 给它消退。默认 300ms。测试把它设成 0：既不依赖真实时钟就能覆盖"先失败一次、
+    /// 重试成功"的路径，也不会为了跑测试套件真的等一次 300ms。
+    get_msg_retry_delay_ns: u64 = 300 * std.time.ns_per_ms,
+};
+
+/// 一个群这一轮里 getMsg 重试的效果统计：命中过重试的调用次数，以及重试真的把
+/// 结果救回来的次数（第二次成功）。只在 scanGroup 这一次调用的作用域内存在、
+/// 随之清零——不跨群累积，避免"这个群这一轮到底救回来几次"被前面群的旧数字
+/// 稀释掉。
+const GetMsgStats = struct {
+    retried: usize = 0,
+    retry_rescued: usize = 0,
 };
 
 /// 把一行文案排进这个群待发的合并转发队列（`lines`）。这条队列在整个
@@ -433,10 +448,39 @@ fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
     );
 }
 
-fn getMsg(deps: Deps, arena: std.mem.Allocator, message_id: i64) ?std.json.Value {
+/// 单次 get_msg 调用，失败**恰好重试一次**——policy 跟 redis.Client.command 的
+/// "传输层失败拆连接重拨、只重试一次"是同一个纪律：生产实测显示这类失败是
+/// 跟同一时间窗口内其它 NapCat 调用挤在一起造成的瞬时拥堵，不是消息真的没了
+/// （431/431 事后逐条 get_msg 都拿到了 status: ok），所以值得再试一次；但
+/// 无限重试/退避梯度换不来更多确定性，只会在真出问题时把一次卡顿放大成
+/// 扫描线程长时间不动。第二次还失败就如实返回 null，调用方原有的警告照常
+/// 触发，行为跟改动前一致。
+///
+/// 重试前的等待只发生在第一次失败之后——成功路径（生产里 431 次探针的绝大
+/// 多数）不付一分钱延迟：`deps.get_msg_retry_delay_ns` 默认 300ms，
+/// 431 次都睡这么久会平白给每天的扫描加 86 秒，这里的分支结构保证了
+/// sleep 只在真的要重试时才执行。
+///
+/// arena 归属：两次尝试（包括请求体的 Stringify 与 callData 内部的 HTTP 响应/
+/// JSON 解析）全部分配在调用方传入的同一份 arena 里，never freed individually——
+/// 这正是本文件里 fetchPage/buildForwardBody 等函数一贯的用法。第一次失败留下
+/// 的那些中间缓冲区不会被显式释放，但也不会被重复释放或造成悬垂引用：它们只是
+/// 跟着 arena 活到 scanGroup 收尾时一次性 deinit，不是逐次 malloc/free 意义上的
+/// 内存泄漏，是这套代码里其它多次调用同一个 arena 的函数（比如翻页循环里每页
+/// 都往同一个 pool 追加）共享的同一种权衡。
+fn getMsg(deps: Deps, arena: std.mem.Allocator, message_id: i64, stats: *GetMsgStats) ?std.json.Value {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{ .message_id = message_id }, .{}, &aw.writer) catch return null;
-    return deps.nap.callData(arena, "get_msg", aw.written()) catch null;
+    const body = aw.written();
+
+    if (deps.nap.callData(arena, "get_msg", body)) |v| return v else |_| {}
+
+    stats.retried += 1;
+    if (deps.get_msg_retry_delay_ns > 0) std.Thread.sleep(deps.get_msg_retry_delay_ns);
+
+    const retried = deps.nap.callData(arena, "get_msg", body) catch return null;
+    stats.retry_rescued += 1;
+    return retried;
 }
 
 /// 单个群这一轮该不该写它自己的 `hikari:lastrun:{group_id}`：只在这个群
@@ -646,6 +690,11 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     const line = try willProcessLine(a, window.items.len);
     pushLine(a, lines, gid, line);
 
+    // getMsg 重试统计的作用域正好跨过下面这两步——它们是这个群里仅有的两处
+    // getMsg 调用点。声明在这里、用到步骤 4 结束，理由跟 pages/stop_reason
+    // 一样：一份局部状态，随 scanGroup 这次调用生生灭灭，不需要活得更久。
+    var get_msg_stats: GetMsgStats = .{};
+
     // ---- 3. 补拉不在池里的 reply 目标 ----
     for (window.items) |m| {
         const rid = m.replyTarget() orelse continue;
@@ -661,7 +710,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         // 绝大多数是普通聊天回复，从来用不上；真正被 classify 需要却解析不了
         // 的目标，会出现在下面 outcome.unresolved 里并在那里统一警告一次，
         // 不在这里重复发一遍。
-        const data = getMsg(deps, a, rid) orelse continue;
+        const data = getMsg(deps, a, rid, &get_msg_stats) orelse continue;
         if (try onebot.parseMessage(a, data)) |parsed| try pool.append(a, parsed);
     }
 
@@ -669,7 +718,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     var star_ids: std.ArrayList(i64) = .empty;
     for (window.items) |m| {
         if (m.user_id != deps.observed_qq) continue;
-        const data = getMsg(deps, a, m.message_id) orelse {
+        const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: star-reaction probe for message {d} failed", .{ gid, m.message_id });
             continue;
         };
@@ -687,6 +736,17 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
             .{ gid, m.message_id, napcat.star_emoji_id, seen },
         );
     }
+
+    // getMsg 重试统计只进日志，不进合并转发（spec 明确要求：运营方在群里看到
+    // 的七行是产品行为的信号，重试是不是生效是运维诊断信息，两者不共用一个
+    // 通道）。只在这个群这一轮真的发生过重试时才打——没发生就是没什么可报的，
+    // 跟上面 emojiIdsSummary "只在没匹配上时才打" 是同一个不刷屏的原则；
+    // 发生了就把命中次数和救回次数都报出来，这正是判断这次修复在生产上到底
+    // 有没有起作用所需要的那两个数字。
+    if (get_msg_stats.retried > 0) std.log.info(
+        "group {d}: get_msg retries: {d} call(s) needed a retry, {d} succeeded on retry",
+        .{ gid, get_msg_stats.retried, get_msg_stats.retry_rescued },
+    );
 
     // ---- 5. 判定 ----
     var outcome = try rules.classify(deps.gpa, window.items, pool.items, star_ids.items, .{
@@ -1741,4 +1801,143 @@ test "fetchBotQq：正常拿到 user_id 时不使用 OBSERVED_QQ" {
     };
 
     try std.testing.expectEqual(@as(u64, 2131597992), fetchBotQq(deps));
+}
+
+// ---------------------------------------------------------------------------
+// getMsg 单次重试。三个测试都把 get_msg_retry_delay_ns 设成 0——不依赖真实
+// 时钟就能确定性地覆盖"第一次失败要不要重试"这几条分支，也不会为了跑测试
+// 套件真的睡一次 300ms。行为断言用的是"服务端总共接到几次 get_msg 请求"和
+// GetMsgStats 的计数，不是计时——重试有没有发生、发生几次，从请求次数和
+// 计数器上就能精确判定，不需要凭时长猜。fetchBotQq 测试已经证明 `.st =
+// undefined` 在不碰 deps.st 的函数里是安全的，getMsg 同样只碰 deps.nap 和
+// deps.get_msg_retry_delay_ns，这里沿用同一手法，不用真的起一条 Redis 连接。
+
+test "getMsg：第一次失败、第二次成功——重试且救回，计数器与返回值都对" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":315507131}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+        .get_msg_retry_delay_ns = 0,
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+
+    var stats: GetMsgStats = .{};
+    const data = getMsg(deps, ar.allocator(), 315507131, &stats);
+
+    nap_srv.stop();
+
+    try std.testing.expect(data != null);
+    try std.testing.expectEqual(@as(i64, 315507131), data.?.object.get("message_id").?.integer);
+    try std.testing.expectEqual(@as(usize, 1), stats.retried);
+    try std.testing.expectEqual(@as(usize, 1), stats.retry_rescued);
+    // 两次都是同一个 message_id 的请求体——重试没有偷偷换成别的消息。
+    try std.testing.expectEqual(@as(usize, 2), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings("{\"message_id\":315507131}", nap_srv.bodies.items[0]);
+    try std.testing.expectEqualStrings("{\"message_id\":315507131}", nap_srv.bodies.items[1]);
+}
+
+test "getMsg：两次都失败——恰好重试一次后如实返回 null，不会有第三次尝试" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+        .get_msg_retry_delay_ns = 0,
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+
+    var stats: GetMsgStats = .{};
+    const data = getMsg(deps, ar.allocator(), 1, &stats);
+
+    nap_srv.stop();
+
+    try std.testing.expect(data == null);
+    try std.testing.expectEqual(@as(usize, 1), stats.retried);
+    try std.testing.expectEqual(@as(usize, 0), stats.retry_rescued);
+    try std.testing.expectEqual(@as(usize, 2), nap_srv.bodies.items.len);
+}
+
+test "getMsg：第一次就成功——不重试，服务端只接到一次请求（证明成功路径不付延迟）" {
+    const gpa = std.testing.allocator;
+    // 只挂一条回复：如果实现在成功之后还是多打了一次 get_msg，第二次请求
+    // 会落在已经跑完 for 循环、连接已被关掉的服务端上，得到的绝不会是
+    // 这里断言的"仅一次成功"结果——用请求次数本身当断言，不用计时器。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":42}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    // 故意留着默认的 300ms 延迟（不覆盖 get_msg_retry_delay_ns）：成功路径
+    // 根本不应该碰到 sleep 分支，这个测试要能在毫秒级跑完才算真的证明了这
+    // 一点——如果哪天 sleep 被误挪到了 if 判断之外，这个测试会因为超时变慢
+    // 而不只是逻辑断言失败。
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+
+    var stats: GetMsgStats = .{};
+    const data = getMsg(deps, ar.allocator(), 42, &stats);
+
+    nap_srv.stop();
+
+    try std.testing.expect(data != null);
+    try std.testing.expectEqual(@as(i64, 42), data.?.object.get("message_id").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), stats.retried);
+    try std.testing.expectEqual(@as(usize, 0), stats.retry_rescued);
+    try std.testing.expectEqual(@as(usize, 1), nap_srv.bodies.items.len);
 }
