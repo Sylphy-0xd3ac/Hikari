@@ -8,7 +8,7 @@ pub const key_index = "hikari:index";
 pub const key_bylen = "hikari:bylen";
 pub const key_tomb = "hikari:tomb";
 pub const key_seq = "hikari:seq";
-pub const key_lastrun = "hikari:lastrun";
+pub const key_lastrun_prefix = "hikari:lastrun";
 
 pub const Quote = struct {
     id: u64,
@@ -48,6 +48,13 @@ pub fn utf8Length(s: []const u8) usize {
 
 pub fn quoteKey(buf: *[64]u8, message_id: i64) []const u8 {
     return std.fmt.bufPrint(buf, "hikari:quote:{d}", .{message_id}) catch unreachable;
+}
+
+/// 每个群各自的"上次扫描窗口终点"键。原先是单个全局 `hikari:lastrun`，但
+/// `QQ_GROUP_IDS` 是逐群独立跑的：一个群失败不该让另一个群的成功掩盖它，
+/// 全局键做不到这一点（见 runner.zig runOnce 的调用点）。
+pub fn lastRunKey(buf: *[64]u8, group_id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_lastrun_prefix, group_id }) catch unreachable;
 }
 
 fn dupInt(gpa: std.mem.Allocator, v: anytype) ![]const u8 {
@@ -274,18 +281,22 @@ pub const Store = struct {
         try self.client.commandOk(&.{ "DEL", qk });
     }
 
-    pub fn setLastRun(self: *Store, ts: i64) Error!void {
+    pub fn setLastRun(self: *Store, group_id: u64, ts: i64) Error!void {
+        var kb: [64]u8 = undefined;
+        const key = lastRunKey(&kb, group_id);
         var buf: [32]u8 = undefined;
         const s = std.fmt.bufPrint(&buf, "{d}", .{ts}) catch unreachable;
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.client.commandOk(&.{ "SET", key_lastrun, s });
+        try self.client.commandOk(&.{ "SET", key, s });
     }
 
-    pub fn getLastRun(self: *Store) Error!?i64 {
+    pub fn getLastRun(self: *Store, group_id: u64) Error!?i64 {
+        var kb: [64]u8 = undefined;
+        const key = lastRunKey(&kb, group_id);
         self.mutex.lock();
         defer self.mutex.unlock();
-        const v = try self.client.command(&.{ "GET", key_lastrun });
+        const v = try self.client.command(&.{ "GET", key });
         defer v.deinit(self.client.gpa);
         return switch (v) {
             .bulk => |b| if (b) |s| (std.fmt.parseInt(i64, s, 10) catch null) else null,
@@ -739,7 +750,7 @@ test "revoke 依次发 SADD tomb / SREM / ZREM / DEL —— tombstone 先落盘"
     });
 }
 
-test "setLastRun 发 SET hikari:lastrun" {
+test "setLastRun 发 SET hikari:lastrun:{group_id}，按群区分键" {
     const gpa = std.testing.allocator;
     const srv = try FakeServer.start(gpa, "+OK\r\n");
     defer {
@@ -750,15 +761,18 @@ test "setLastRun 发 SET hikari:lastrun" {
     var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
     defer c.deinit();
     var store = Store.init(gpa, &c);
-    try store.setLastRun(1700000000);
+    try store.setLastRun(12345, 1700000000);
     c.deinit();
     srv.stop();
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SET") != null);
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_lastrun) != null);
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "1700000000") != null);
+
+    // 断言完整连续帧，不是三段独立的子串存在性检查：这个仓库之前有一轮review
+    // 发现独立的 indexOf 检查会让参数换位（比如 group_id 和 ts 对调）悄悄通过。
+    try expectFrameSequence(srv.received.items, &.{
+        "*3\r\n$3\r\nSET\r\n$20\r\nhikari:lastrun:12345\r\n$10\r\n1700000000\r\n",
+    });
 }
 
-test "getLastRun 读到值时解析出来，nil 时返回 null" {
+test "getLastRun 读到值时解析出来，nil 时返回 null；键按 group_id 区分" {
     const gpa = std.testing.allocator;
     {
         const srv = try FakeServer.start(gpa, "$10\r\n1700000000\r\n");
@@ -770,7 +784,12 @@ test "getLastRun 读到值时解析出来，nil 时返回 null" {
         var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
         defer c.deinit();
         var store = Store.init(gpa, &c);
-        try std.testing.expectEqual(@as(?i64, 1700000000), try store.getLastRun());
+        try std.testing.expectEqual(@as(?i64, 1700000000), try store.getLastRun(12345));
+        c.deinit();
+        srv.stop();
+        try expectFrameSequence(srv.received.items, &.{
+            "*2\r\n$3\r\nGET\r\n$20\r\nhikari:lastrun:12345\r\n",
+        });
     }
     {
         const srv = try FakeServer.start(gpa, "$-1\r\n");
@@ -782,7 +801,12 @@ test "getLastRun 读到值时解析出来，nil 时返回 null" {
         var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
         defer c.deinit();
         var store = Store.init(gpa, &c);
-        try std.testing.expectEqual(@as(?i64, null), try store.getLastRun());
+        try std.testing.expectEqual(@as(?i64, null), try store.getLastRun(999));
+        c.deinit();
+        srv.stop();
+        try expectFrameSequence(srv.received.items, &.{
+            "*2\r\n$3\r\nGET\r\n$18\r\nhikari:lastrun:999\r\n",
+        });
     }
 }
 

@@ -5,6 +5,8 @@ const rules = @import("rules.zig");
 const store = @import("../store.zig");
 const uuid = @import("../uuid.zig");
 const scheduler = @import("../scheduler.zig");
+const redis = @import("../redis/client.zig");
+const resp = @import("../redis/resp.zig");
 
 pub const page_size: usize = 200;
 
@@ -329,12 +331,24 @@ fn getMsg(deps: Deps, arena: std.mem.Allocator, message_id: i64) ?std.json.Value
     return deps.nap.callData(arena, "get_msg", aw.written()) catch null;
 }
 
+/// 单个群这一轮该不该写它自己的 `hikari:lastrun:{group_id}`：只在这个群
+/// 本身成功（`ok == true`）时写。抽成独立函数，一是让 runOnce 的循环体
+/// 读起来是"扫、然后按结果决定写不写"这一步一步，二是让这条"失败的群不写、
+/// 成功的群写"的规则能绕开 scanGroup（依赖真实 NapCat HTTP，测试环境起不来）
+/// 直接单测：只需要一个 *Store，不需要一整套 Deps/NapCat。
+fn applyLastRun(st: *store.Store, group_id: u64, ok: bool, run_at: i64) void {
+    if (!ok) return;
+    st.setLastRun(group_id, run_at) catch |e| {
+        std.log.warn("group {d}: setLastRun failed: {s}", .{ group_id, @errorName(e) });
+    };
+}
+
 /// 跑一次完整扫描。失败不抛出，改为在日志里发 Failed 行。
 ///
-/// `setLastRun` 只在"至少一个群跑成功"时才调用：全体失败就不标记今天已跑过，
-/// 好让 scheduler.missedRun 在下次进程启动时补跑；只要有一个群成功，就仍然
-/// 调用它——重新扫一遍已经成功的群（重复处理，但 store 的 exists/isTombstoned
-/// 会挡掉重复入库）比彻底漏掉今天这次更糟。
+/// `hikari:lastrun:{group_id}` 是逐群独立的键（见 store.zig lastRunKey）：
+/// 每个群只在它自己这一轮成功时才写自己的键，失败的群完全不写，不受同一轮
+/// 里其他群成不成功影响。这样一个群的失败不会被兄弟群的成功掩盖——重启补跑
+/// （main.zig）逐群读这个键，只有失败的那个群会被判定为"漏跑"而重新扫描。
 pub fn runOnce(deps: Deps, run_at: i64) void {
     const win_start = scheduler.windowStart(run_at);
 
@@ -343,14 +357,12 @@ pub fn runOnce(deps: Deps, run_at: i64) void {
         sendLine(deps, gid, processing_line);
     }
 
-    var any_succeeded = false;
     for (deps.group_ids) |gid| {
         const ok = scanGroup(deps, gid, win_start, run_at) catch |e| catch_blk: {
             const msg = failedLine(deps.gpa, @errorName(e)) catch {
                 // 格式化 Failed 行本身失败（理论上只会是 gpa OOM）：不能因此
-                // 中断整个 runOnce——那样会连带跳过其余尚未处理的群，也会
-                // 跳过下面对 any_succeeded 的正确统计。只记警告，把这个群
-                // 计为失败，继续处理下一个群。
+                // 中断整个 runOnce——那样会连带跳过其余尚未处理的群。只记
+                // 警告，把这个群计为失败，继续处理下一个群。
                 std.log.warn("group {d}: scanGroup failed ({s}) and failedLine formatting also failed", .{ gid, @errorName(e) });
                 break :catch_blk false;
             };
@@ -358,15 +370,7 @@ pub fn runOnce(deps: Deps, run_at: i64) void {
             sendLine(deps, gid, msg);
             break :catch_blk false;
         };
-        if (ok) any_succeeded = true;
-    }
-
-    if (any_succeeded) {
-        deps.st.setLastRun(run_at) catch |e| {
-            std.log.warn("setLastRun failed: {s}", .{@errorName(e)});
-        };
-    } else {
-        std.log.warn("all groups failed this run; skipping setLastRun so a missed run gets retried", .{});
+        applyLastRun(deps.st, gid, ok, run_at);
     }
 }
 
@@ -521,8 +525,11 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     // 归属信息没问出来就一条都不写：buildQuote 把 from/from_who 原样烧进每一条
     // 语录，而设计里没有任何事后编辑的路径——一次 get_group_info 抖动会让这一批
     // 语录永远带着空的 from/from_who 对外服务。宁可整批不写、这个群算失败、
-    // 不 setLastRun，等重启补跑或者下一次扫描重来：候选仍在窗口里，
-    // isTombstoned/exists 保证重扫是幂等的。
+    // 不写这个群自己的 setLastRun，等下一次进程重启时的补跑（main.zig）重来：
+    // scheduler.windowStart 是固定的 run_at - 24h，下一次正常触发时刻的窗口
+    // 已经往前挪了一天，看不到这批候选——只有重启补跑会拿同一个 run_at 重新
+    // 扫这个群，所以这条路是唯一能补上的，不是"下一次扫描"顺带就补上了。
+    // 候选仍在窗口里，isTombstoned/exists 保证重扫是幂等的。
     const attributed = from != null and from_who != null;
 
     var added: usize = 0;
@@ -877,4 +884,88 @@ test "oldestId 时间并列时按 message_id 取最小者，与输入顺序无�
         .{ .message_id = 9, .user_id = 1, .time = 300, .segments = &.{} },
     };
     try std.testing.expectEqual(@as(?i64, 2), oldestId(&b_first));
+}
+
+// ---------------------------------------------------------------------------
+// applyLastRun：只需要一个 *Store，不需要真的驱动 scanGroup（那要真实 NapCat
+// HTTP，测试环境起不来）。沿用 store.zig 的单连接 FakeServer 思路——每个测试
+// 文件各自起一份私有拷贝，而不是从 store.zig 导出复用（那边的 FakeServer 本来
+// 就没打算 pub）。
+
+const FakeServer = struct {
+    listener: std.net.Server,
+    thread: std.Thread,
+    script: []const u8,
+    received: std.ArrayList(u8),
+    gpa: std.mem.Allocator,
+    stopped: bool,
+
+    fn serve(self: *FakeServer) void {
+        const conn = self.listener.accept() catch return;
+        defer conn.stream.close();
+        var buf: [4096]u8 = undefined;
+        _ = conn.stream.writeAll(self.script) catch return;
+        while (true) {
+            const n = conn.stream.read(&buf) catch return;
+            if (n == 0) return;
+            self.received.appendSlice(self.gpa, buf[0..n]) catch return;
+        }
+    }
+
+    fn start(gpa: std.mem.Allocator, script: []const u8) !*FakeServer {
+        const self = try gpa.create(FakeServer);
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.* = .{
+            .listener = try addr.listen(.{ .reuse_address = true }),
+            .thread = undefined,
+            .script = script,
+            .received = .empty,
+            .gpa = gpa,
+            .stopped = false,
+        };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return self;
+    }
+
+    fn port(self: *FakeServer) u16 {
+        return self.listener.listen_address.getPort();
+    }
+
+    fn stop(self: *FakeServer) void {
+        if (self.stopped) return;
+        self.stopped = true;
+        self.listener.deinit();
+        self.thread.join();
+    }
+};
+
+test "applyLastRun：失败的群不写 setLastRun，成功的兄弟群照写——互不影响" {
+    const gpa = std.testing.allocator;
+    // 脚本只放一条 "+OK\r\n"：失败的那次 applyLastRun 调用必须完全不发命令
+    // （否则这唯一一条回复会被那次调用吃掉，成功的那次就读不到回复而报错，
+    // 测试会失败——这正是"脚本大小按实际会发生的命令数配"的意义所在）。
+    const srv = try FakeServer.start(gpa, "+OK\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    // 先处理失败的群：不该有任何字节发给 Redis。
+    applyLastRun(&st, 200, false, 1700000000);
+    // 再处理成功的群：应该看到完整的 SET hikari:lastrun:100 1700000000 帧。
+    applyLastRun(&st, 100, true, 1700000000);
+
+    c.deinit();
+    srv.stop();
+
+    const expected_frame = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:100", "1700000000" });
+    defer gpa.free(expected_frame);
+    try std.testing.expectEqualSlices(u8, expected_frame, srv.received.items);
+
+    // 失败的群（200）完全没有对应的键出现在发出去的字节里。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:lastrun:200") == null);
 }

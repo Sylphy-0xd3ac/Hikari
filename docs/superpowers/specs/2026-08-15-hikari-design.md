@@ -73,7 +73,7 @@ QQ 表情回应有两类：`emoji_type=1` 是 QQ 系统表情（id 为两三位�
 
 ✨ = U+2728 = 十进制 **10024**，`emoji_type=2`。
 
-该常量定义在一处（`scan/rules.zig`），且扫描时会把所有**未匹配**的 `emoji_id` 打进日志，便于首次实跑时核对真实值。
+该常量定义在一处（`src/napcat.zig`），且扫描时会把所有**未匹配**的 `emoji_id` 打进日志，便于首次实跑时核对真实值。
 
 ## 4. 扫描逻辑
 
@@ -196,7 +196,7 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 | `hikari:bylen` | ZSET | score = `length`（码点数），member = `message_id` |
 | `hikari:tomb` | SET | 被作废的 `message_id` |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` |
-| `hikari:lastrun` | STRING | 上次扫描窗口终点的 Unix 秒 |
+| `hikari:lastrun:{group_id}` | STRING | 这个群上次扫描窗口终点的 Unix 秒，逐群独立 |
 
 **写入**（单条语录，按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `SADD hikari:index {id}`
 
@@ -211,7 +211,10 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 - 无长度过滤 → `SRANDMEMBER hikari:index` 后 `HGETALL`
 - 有 `min_length` / `max_length` → `ZRANGEBYSCORE hikari:bylen {min} {max}` 拿到候选 id 列表，本地随机选一个后 `HGETALL`
 
-`hikari:lastrun` 用于进程重启后判断是否漏跑：如果当前时间已越过今天的 `SCAN_TIME` 而 `lastrun` 早于它，立即补跑一次，之后回归正常日程。
+`hikari:lastrun:{group_id}` 用于进程重启后逐群判断是否漏跑：对每个群分别检查，如果当前时间已越过今天的
+`SCAN_TIME` 而这个群自己的 `lastrun` 早于它，就判定这个群漏跑。只要有任意一个群漏跑，立即用其中最早的
+漏跑时刻补跑一次（补跑会重新扫全部群；已经跟上的群只是幂等地重扫一遍已处理过的窗口，无害，不需要也不做
+逐群跳过），之后回归正常日程。一个群失败不会因为同一轮里另一个群成功而被掩盖——两个群各自的键互不影响。
 
 ## 6. HTTP 服务
 

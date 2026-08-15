@@ -75,8 +75,11 @@ set -a && source .env && set +a
 
 调度循环每一轮都会重新计算一次本地时区相对 UTC 的偏移（`scheduler.localOffsetSeconds`），而不是在循环
 外算一次复用——夏令时切换会改变这个偏移，进程一次起来常常要跑几个月，缓存旧偏移会导致跨越 DST 边界之后
-触发时刻整体偏移一小时。进程重启时会额外判断「今天该跑的时刻是否已经过去但还没跑」（`missedRun`），是
-则立即补跑一次；首次启动没有基线（`hikari:lastrun` 不存在），补跑判断直接跳过，等下一个正常触发时刻。
+触发时刻整体偏移一小时。进程重启时会额外判断「今天该跑的时刻是否已经过去但还没跑」（`missedRun`），
+逐群判断（每个群各自的 `hikari:lastrun:{group_id}`，见下方键结构）：只要有一个群漏跑，就立即用最早的
+那个漏跑时刻补跑一次（补跑会重新扫全部群，已经跟上的群只是幂等地重扫一遍已处理过的窗口，无害）；
+某个群首次启动没有基线（它自己的 `hikari:lastrun:{group_id}` 不存在），这个群的补跑判断直接跳过，
+等下一个正常触发时刻。
 
 ## HTTP 接口
 
@@ -112,7 +115,7 @@ set -a && source .env && set +a
 | `hikari:bylen` | ZSET | score = 语录长度（UTF-8 码点数），member = `message_id` |
 | `hikari:tomb` | SET | 被作废的 `message_id`（永久） |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` 生成 `id` 字段 |
-| `hikari:lastrun` | STRING | 上次扫描窗口终点的 Unix 秒，用于重启补跑判断 |
+| `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立，用于重启补跑判断 |
 
 ## 联调 Runbook
 
@@ -132,7 +135,9 @@ set -a && source .env && set +a
    `Added X messages, skipped Y messages.` + `Successfully.`，每群一份）且计数合理。
    这一轮出过岔子时最后一行不是 `Successfully.` 而是 `Failed: ...`，原因串里会分别列出
    作废失败、入库失败、群归属信息拿不到各多少条——三者任一发生都会压掉 `Successfully.`，
-   也会跳过 `hikari:lastrun` 的更新，好让下一次启动补跑。
+   也会跳过**这个群自己**的 `hikari:lastrun:{group_id}` 更新，好让下一次启动补跑这一个群；
+   `hikari:lastrun:{group_id}` 是逐群独立的键，不受同一轮里其他群成不成功影响——一个群
+   失败不会被跑成功的兄弟群掩盖。
 5. 用 curl 核对 HTTP 接口：
    ```bash
    curl 'http://127.0.0.1:8080/'
