@@ -159,20 +159,113 @@ pub const Deps = struct {
     group_ids: []const u64,
 };
 
-fn sendLine(deps: Deps, group_id: u64, text: []const u8) void {
+/// 把一行文案排进这个群待发的合并转发队列（`lines`）。这条队列在整个
+/// scanGroup 运行期间只增不减，直到 runOnce 在这个群的扫描收尾（不管是正常
+/// 走完还是中途出 `try` 错误被 catch 住）时一次性打包成一条
+/// `send_group_forward_msg` 发出去。
+///
+/// 失败（本质只会是 arena 背后的 gpa OOM）只打警告、丢这一行，不让整轮扫描
+/// 因为排队失败而中断——这个姿态跟旧版 sendLine 网络发送失败时"只 warn 不
+/// 中断"是一路的，只是失败点从"发送"挪到了"排队"。
+fn pushLine(a: std.mem.Allocator, lines: *std.ArrayList([]const u8), group_id: u64, text: []const u8) void {
+    lines.append(a, text) catch |e| {
+        std.log.warn("group {d}: failed to queue line into forward message ({s}): {s}", .{ group_id, @errorName(e), text });
+    };
+}
+
+/// send_group_forward_msg 一个 node 段的三层结构：node → data → content[] →
+/// {type:"text", data:{text}}。字段名、嵌套层数、`user_id` 是字符串这几点
+/// 都照抄针对生产 NapCat 探测到的真实请求体（见本次改动的设计说明），不是
+/// 猜的。
+const ForwardTextData = struct { text: []const u8 };
+const ForwardContentItem = struct {
+    type: []const u8 = "text",
+    data: ForwardTextData,
+};
+const ForwardNodeData = struct {
+    user_id: []const u8,
+    nickname: []const u8 = "Hikari",
+    content: [1]ForwardContentItem,
+};
+const ForwardNode = struct {
+    type: []const u8 = "node",
+    data: ForwardNodeData,
+};
+
+fn forwardNode(user_id: []const u8, text: []const u8) ForwardNode {
+    return .{ .data = .{ .user_id = user_id, .content = .{.{ .data = .{ .text = text } }} } };
+}
+
+/// 把 lines 拼成 send_group_forward_msg 的请求体。nodes 数组和最终 JSON 串
+/// 全部分配在调用方传入的 arena 里：任何一步分配失败，arena 在 runOnce 那层
+/// `defer ar.deinit()` 时会把之前已经分配出去的 node 一并释放——arena 本身
+/// 就是 store.zig hashFields / buildQuote 那种手写 errdefer 链在这里的等价物，
+/// 不需要再逐个 node 手写一遍。
+fn buildForwardBody(a: std.mem.Allocator, group_id: u64, user_id: []const u8, lines: []const []const u8) ![]u8 {
+    const nodes = try a.alloc(ForwardNode, lines.len);
+    for (lines, 0..) |line, i| nodes[i] = forwardNode(user_id, line);
+
+    var aw: std.Io.Writer.Allocating = .init(a);
+    try std.json.Stringify.value(.{
+        .group_id = group_id,
+        .messages = nodes,
+    }, .{}, &aw.writer);
+    return aw.toOwnedSlice();
+}
+
+/// 把这个群排好队的 lines 打包成一条合并转发消息发出去。`lines` 为空时
+/// 什么都不发——正常路径下 runOnce 已经无条件排过横幅+Processing 两行，
+/// 这个分支只在那两行都排队失败（见 pushLine）的极端情况下才会命中。
+fn sendForward(deps: Deps, a: std.mem.Allocator, group_id: u64, bot_qq: u64, lines: []const []const u8) void {
+    if (lines.len == 0) return;
+
+    const uid = std.fmt.allocPrint(a, "{d}", .{bot_qq}) catch |e| {
+        std.log.warn("group {d}: formatting bot user_id failed ({s}); forward message not sent", .{ group_id, @errorName(e) });
+        return;
+    };
+    const body = buildForwardBody(a, group_id, uid, lines) catch |e| {
+        std.log.warn("group {d}: building send_group_forward_msg payload failed ({s}); forward message not sent", .{ group_id, @errorName(e) });
+        return;
+    };
+    _ = deps.nap.callData(a, "send_group_forward_msg", body) catch |e| {
+        std.log.warn("send_group_forward_msg failed for group {d}: {s}", .{ group_id, @errorName(e) });
+    };
+}
+
+/// 每次 runOnce 只问一次 get_login_info，取到的机器人 QQ 供全部群、全部
+/// node 复用（design 要求"取一次、逐群逐 node 复用"）。失败——网络、响应
+/// 格式不对、字段缺失或不是数字——一律退回 OBSERVED_QQ 并打警告：这个值
+/// 只影响合并转发里 node 显示的头像，选错是观感问题，不值得为它中断整轮
+/// 扫描，更不该因为取不到就不发日志了。
+fn fetchBotQq(deps: Deps) u64 {
     var ar = std.heap.ArenaAllocator.init(deps.gpa);
     defer ar.deinit();
     const a = ar.allocator();
 
-    var aw: std.Io.Writer.Allocating = .init(a);
-    std.json.Stringify.value(.{
-        .group_id = group_id,
-        .message = .{.{ .type = "text", .data = .{ .text = text } }},
-    }, .{}, &aw.writer) catch return;
-
-    _ = deps.nap.callData(a, "send_group_msg", aw.written()) catch |e| {
-        std.log.warn("send_group_msg failed for group {d}: {s}", .{ group_id, @errorName(e) });
+    const data = deps.nap.callData(a, "get_login_info", "{}") catch |e| {
+        std.log.warn("get_login_info failed ({s}); forward messages will use OBSERVED_QQ={d} as the node avatar", .{ @errorName(e), deps.observed_qq });
+        return deps.observed_qq;
     };
+    const obj = switch (data) {
+        .object => |o| o,
+        else => {
+            std.log.warn("get_login_info returned a non-object; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
+            return deps.observed_qq;
+        },
+    };
+    const v = obj.get("user_id") orelse {
+        std.log.warn("get_login_info reply has no user_id field; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
+        return deps.observed_qq;
+    };
+    const n = onebot.asInt(v) orelse {
+        std.log.warn("get_login_info user_id is not a number; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
+        return deps.observed_qq;
+    };
+    if (n < 0) {
+        std.log.warn("get_login_info user_id is negative ({d}); forward messages will use OBSERVED_QQ={d} as the node avatar", .{ n, deps.observed_qq });
+        return deps.observed_qq;
+    }
+    return @intCast(n);
 }
 
 /// 取群名。**null 与空串是两回事**：空串表示"问到了，这个群就是没名字"，
@@ -398,26 +491,46 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64) i64 {
 /// `last_run` 本身就是逐群独立的状态，固定在循环外算等于假装所有群这一轮
 /// 该回看的跨度都一样——它们并不一样。
 pub fn runOnce(deps: Deps, run_at: i64) void {
-    for (deps.group_ids) |gid| {
-        for (banner) |line| sendLine(deps, gid, line);
-        sendLine(deps, gid, processing_line);
-    }
+    // design.md §7 要求这个 QQ 每轮只问一次、逐群逐 node 复用；放在两个 for
+    // 循环之前，早于任何一个群的扫描。
+    const bot_qq = fetchBotQq(deps);
 
     for (deps.group_ids) |gid| {
+        // 每个群一份独立的 arena，寿命跨过 scanGroup 的成功/失败两条路径，
+        // 直到这个群的合并转发发出去才 deinit——这是"崩溃不等于安静"这条
+        // 约束的关键：scanGroup 中途 `try` 出错时，它自己再也没有机会碰这份
+        // 内存了，但只要 arena 还活着，已经排进 lines 的那几行（横幅、
+        // Processing...、也许还有 Will process）连同后面补上的 Failed 行
+        // 依然能被 sendForward 打包发出去，而不是随 scanGroup 的报错一起
+        // 消失。
+        var ar = std.heap.ArenaAllocator.init(deps.gpa);
+        defer ar.deinit();
+        const a = ar.allocator();
+
+        var lines: std.ArrayList([]const u8) = .empty;
+        for (banner) |line| pushLine(a, &lines, gid, line);
+        pushLine(a, &lines, gid, processing_line);
+
         const win_start = resolveWindowStart(deps.st, gid, run_at);
-        const ok = scanGroup(deps, gid, win_start, run_at) catch |e| catch_blk: {
-            const msg = failedLine(deps.gpa, @errorName(e)) catch {
-                // 格式化 Failed 行本身失败（理论上只会是 gpa OOM）：不能因此
-                // 中断整个 runOnce——那样会连带跳过其余尚未处理的群。只记
-                // 警告，把这个群计为失败，继续处理下一个群。
+        const ok = scanGroup(deps, a, &lines, gid, win_start, run_at) catch |e| catch_blk: {
+            const msg = failedLine(a, @errorName(e)) catch {
+                // 格式化 Failed 行本身失败（理论上只会是 arena 背后的 gpa
+                // OOM）：不能因此中断整个 runOnce——那样会连带跳过其余尚未
+                // 处理的群。已经排进 lines 的内容仍会照常合并转发出去，只是
+                // 少了最后一行的说明；只记警告，把这个群计为失败，继续处理
+                // 下一个群。
                 std.log.warn("group {d}: scanGroup failed ({s}) and failedLine formatting also failed", .{ gid, @errorName(e) });
                 break :catch_blk false;
             };
-            defer deps.gpa.free(msg);
-            sendLine(deps, gid, msg);
+            pushLine(a, &lines, gid, msg);
             break :catch_blk false;
         };
         applyLastRun(deps.st, gid, ok, run_at);
+
+        // 不管这一轮是正常收尾还是在 scanGroup 中途被 catch 住，lines 里已经
+        // 排队的内容都要发出去：哪怕只排进了横幅四行就崩了，群里也会看到那
+        // 四行 + 一行 Failed，而不是彻底沉默。
+        sendForward(deps, a, gid, bot_qq, lines.items);
     }
 }
 
@@ -460,10 +573,9 @@ pub fn noAdvanceOutcome(msgs: []const onebot.Message, anchor: i64) NoAdvanceOutc
 /// false = 落库阶段出现了至少一次 store.add 失败（已经在函数内部发了
 /// Failed 行，不需要 runOnce 再发一次）。真正的硬失败（分页/判定阶段的
 /// `try` 出错）仍然走 `!bool` 的错误通道，由 runOnce 的 catch 处理。
-fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
-    var ar = std.heap.ArenaAllocator.init(deps.gpa);
-    defer ar.deinit();
-    const a = ar.allocator();
+fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8), gid: u64, win_start: i64, win_end: i64) !bool {
+    // `a` 与 `lines` 由 runOnce 传入并拥有——它们的寿命跨过这次调用本身
+    // （包括这次调用以 `try` 错误告终的情形），理由见 runOnce 里对应注释。
 
     // ---- 1. 翻页拉历史，窗口外再多拉一页作解析缓冲 ----
     var pool: std.ArrayList(onebot.Message) = .empty;
@@ -531,9 +643,8 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
         }
     }.lt);
 
-    const line = try willProcessLine(deps.gpa, window.items.len);
-    defer deps.gpa.free(line);
-    sendLine(deps, gid, line);
+    const line = try willProcessLine(a, window.items.len);
+    pushLine(a, lines, gid, line);
 
     // ---- 3. 补拉不在池里的 reply 目标 ----
     for (window.items) |m| {
@@ -679,22 +790,19 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
         trouble.unattributed = outcome.candidates.len;
     }
 
-    const result = try resultLine(deps.gpa, added, skipped);
-    defer deps.gpa.free(result);
-    sendLine(deps, gid, result);
+    const result = try resultLine(a, added, skipped);
+    pushLine(a, lines, gid, result);
 
     // 出过岔子就不能用 Successfully. 收尾——那是运营方唯一的"这次跑成功了"信号。
     // 改发 Failed 行，带上各类失败的条数与最后一次的错误原因。
     if (trouble.any()) {
-        const reason = try troubleReason(deps.gpa, trouble);
-        defer deps.gpa.free(reason);
-        const msg = try failedLine(deps.gpa, reason);
-        defer deps.gpa.free(msg);
-        sendLine(deps, gid, msg);
+        const reason = try troubleReason(a, trouble);
+        const msg = try failedLine(a, reason);
+        pushLine(a, lines, gid, msg);
         return false;
     }
 
-    sendLine(deps, gid, success_line);
+    pushLine(a, lines, gid, success_line);
     return true;
 }
 
@@ -1296,4 +1404,341 @@ test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clampe
     var st = store.Store.init(gpa, &c);
 
     try std.testing.expectEqual(run_at - scheduler.max_lookback_seconds, resolveWindowStart(&st, 100, run_at));
+}
+
+// ---------------------------------------------------------------------------
+// buildForwardBody：七行文案改用一条 send_group_forward_msg 之后最容易踩的坑
+// 就是"顺序被打乱"或"某一行被悄悄改写"——本项目已经有过一轮两个独立
+// indexOf 存在性检查放过参数换位的先例（见 napcat.zig call 测试注释），这里
+// 直接锁死整段 JSON 的逐字节内容，不满足于挨个 indexOf 找子串。
+
+test "buildForwardBody：七行按顺序原样打进 node 数组，Failed 行替换 Successfully 那一个位置" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (banner) |line| try lines.append(a, line);
+    try lines.append(a, processing_line);
+    try lines.append(a, try willProcessLine(a, 1234));
+    try lines.append(a, try resultLine(a, 12, 34));
+    try lines.append(a, try failedLine(a, "NapCatError"));
+
+    const body = try buildForwardBody(a, 1039716984, "2131597992", lines.items);
+
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":1039716984,\"messages\":[" ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Hikari!\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Made with ❤️ by CuzTeam, AmethystDevs-Lab\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Will process 1234 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 12 messages, skipped 34 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Failed: NapCatError\"}}]}}" ++
+            "]}",
+        body,
+    );
+}
+
+test "buildForwardBody：正常收尾时最后一个 node 是 Successfully，不是 Failed" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    var lines: std.ArrayList([]const u8) = .empty;
+    for (banner) |line| try lines.append(a, line);
+    try lines.append(a, processing_line);
+    try lines.append(a, try willProcessLine(a, 0));
+    try lines.append(a, try resultLine(a, 0, 0));
+    try lines.append(a, success_line);
+
+    const body = try buildForwardBody(a, 1, "1", lines.items);
+    try std.testing.expect(std.mem.endsWith(
+        u8,
+        body,
+        "{\"type\":\"node\",\"data\":{\"user_id\":\"1\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Successfully.\"}}]}}]}",
+    ));
+}
+
+test "buildForwardBody：空 lines 产出空 messages 数组，不崩" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const body = try buildForwardBody(a, 42, "1", &.{});
+    try std.testing.expectEqualStrings("{\"group_id\":42,\"messages\":[]}", body);
+}
+
+// ---------------------------------------------------------------------------
+// runOnce 端到端：改成合并转发之后最需要守住的两件事——
+//   (a) 七行原样按顺序落进真实发出去的 send_group_forward_msg 请求体；
+//   (b) 一个群在 scanGroup 内部出岔子（不管是 Trouble 那种"软失败"还是
+//       `try` 传播的"硬失败"）时，Failed 行仍然作为这条合并转发的最后一个
+//       node 被发出去，而不是这个群那一轮彻底沉默——这正是这次改动被要求
+//       重点守住的行为。
+// 起一对真实 TCP fake server（NapCat + Redis），完整跑一遍 runOnce，直接抓
+// 落地的原始请求体逐字节断言。
+
+const FakeNapcatServer = struct {
+    listener: std.net.Server,
+    thread: std.Thread,
+    replies: []const []const u8,
+    bodies: std.ArrayList([]u8),
+    gpa: std.mem.Allocator,
+    stopped: bool,
+
+    fn serve(self: *FakeNapcatServer) void {
+        const conn = self.listener.accept() catch return;
+        defer conn.stream.close();
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [8192]u8 = undefined;
+        var sr = conn.stream.reader(&rbuf);
+        var sw = conn.stream.writer(&wbuf);
+        var hs = std.http.Server.init(sr.interface(), &sw.interface);
+        for (self.replies) |body| {
+            var req = hs.receiveHead() catch return;
+            var body_buf: [8192]u8 = undefined;
+            const body_reader = req.readerExpectNone(&body_buf);
+            if (body_reader.allocRemaining(self.gpa, .unlimited) catch null) |b| {
+                self.bodies.append(self.gpa, b) catch self.gpa.free(b);
+            }
+            req.respond(body, .{
+                .status = .ok,
+                .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+            }) catch return;
+        }
+    }
+
+    fn start(gpa: std.mem.Allocator, replies: []const []const u8) !*FakeNapcatServer {
+        const self = try gpa.create(FakeNapcatServer);
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.* = .{
+            .listener = try addr.listen(.{ .reuse_address = true }),
+            .thread = undefined,
+            .replies = replies,
+            .bodies = .empty,
+            .gpa = gpa,
+            .stopped = false,
+        };
+        self.thread = try std.Thread.spawn(.{}, serve, .{self});
+        return self;
+    }
+
+    fn port(self: *FakeNapcatServer) u16 {
+        return self.listener.listen_address.getPort();
+    }
+
+    fn stop(self: *FakeNapcatServer) void {
+        if (self.stopped) return;
+        self.stopped = true;
+        self.listener.deinit();
+        self.thread.join();
+    }
+
+    fn destroy(self: *FakeNapcatServer) void {
+        for (self.bodies.items) |b| self.gpa.free(b);
+        self.bodies.deinit(self.gpa);
+        self.gpa.destroy(self);
+    }
+};
+
+test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里最后一个，合并转发确实发出去了" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // hikari:lastrun 未命中（nil）：退化成固定 24h 窗口，
+    // win_start = run_at - 86400 = 1_700_013_600。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 七次 NapCat 调用，按 runOnce 实际发生的顺序：
+    //   1. get_login_info（runOnce 开头，逐群复用）
+    //   2. get_group_msg_history 第一页：1 条被观察者发的消息，落在窗口内
+    //   3. get_group_msg_history 第二页：空页，翻页收尾
+    //   4. get_msg：那条消息的表情回应探测，命中 ✨（路径 1 候选）
+    //   5. get_group_info：故意失败，让 groupName 返回 null → attributed=false
+    //   6. get_group_member_info：正常返回（但已经不影响 attributed 的结果）
+    //   7. send_group_forward_msg：最终发出的合并转发
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"今天也是好天气\"}}]}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"晴\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":242408478,\"res_id\":\"tPWS\",\"forward_id\":\"tPWS\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{55},
+    };
+
+    runOnce(deps, run_at);
+
+    // 显式收尾后再读两边抓到的字节，避免读到服务端线程还没来得及写完的数据
+    // ——这是本文件里 applyLastRun 测试已经在用的同一个顺序。
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    // 这个群这一轮判失败：applyLastRun 不该再补一次 SET。
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "SET") == null);
+
+    try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":55,\"messages\":[" ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Hikari!\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Made with ❤️ by CuzTeam, AmethystDevs-Lab\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Will process 1 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 0 messages, skipped 0 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Failed: 1 quote(s) not written: group attribution unavailable\"}}]}}" ++
+            "]}",
+        nap_srv.bodies.items[6],
+    );
+}
+
+test "runOnce：scanGroup 中途硬失败（try 传播的错误）时仍然发出合并转发，Failed 是最后一个 node，不是彻底沉默" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 只有三次 NapCat 调用：get_login_info、失败的 get_group_msg_history
+    // （触发 fetchPage 里的 `try`，让 scanGroup 直接把 error.NapCatError
+    // 传播给 runOnce 的 catch）、以及最终仍然要发出去的合并转发。注意这里
+    // 排进 lines 的只有横幅三行 + Processing 四行——"Will process" 和
+    // "Added/skipped" 这两行从未被算出来，因为程序根本没走到那一步；这正是
+    // "崩溃不等于安静"这条约束要求的最诚实的行为：把已经排队的都发出去，
+    // 不假装凑出一份完整的七行。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{77},
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "SET") == null);
+
+    try std.testing.expectEqual(@as(usize, 3), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":77,\"messages\":[" ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Hikari!\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Made with ❤️ by CuzTeam, AmethystDevs-Lab\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Failed: NapCatError\"}}]}}" ++
+            "]}",
+        nap_srv.bodies.items[2],
+    );
+}
+
+test "fetchBotQq：get_login_info 失败时退回 OBSERVED_QQ" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined, // fetchBotQq 不碰 deps.st
+        .observed_qq = 99999,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+    };
+
+    try std.testing.expectEqual(@as(u64, 99999), fetchBotQq(deps));
+}
+
+test "fetchBotQq：正常拿到 user_id 时不使用 OBSERVED_QQ" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qq = 99999,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+    };
+
+    try std.testing.expectEqual(@as(u64, 2131597992), fetchBotQq(deps));
 }

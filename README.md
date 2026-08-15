@@ -152,14 +152,21 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
    - 另一个人引用被观察者的另一句话，只回 `✨`（路径 2）；
    - 管理员发 `✨ 手动补录测试`（路径 3）；
    - 管理员引用其中一条候选，只回 `💦`（作废）。
-4. 等定时触发，确认群里收到七行运行日志（横幅三行 + `Processing...` + `Will process N messages.` +
-   `Added X messages, skipped Y messages.` + `Successfully.`，每群一份）且计数合理。
+4. 等定时触发，确认每个群收到**一条**合并转发（聊天记录）消息，点开后是七行（横幅三行 +
+   `Processing...` + `Will process N messages.` + `Added X messages, skipped Y messages.` +
+   `Successfully.`）且计数合理；这七行不再是七条独立消息，是 `send_group_forward_msg` 打包发的
+   一条消息里的七个 node，发送时机是这个群扫描全部跑完之后，不是边扫边发——扫描本身仍然要跑
+   1–2 分钟，这段时间群里不会有任何提示。
    这一轮出过岔子时最后一行不是 `Successfully.` 而是 `Failed: ...`，原因串里会分别列出
    作废失败、入库失败、群归属信息拿不到各多少条——三者任一发生都会压掉 `Successfully.`，
    也会跳过**这个群自己**的 `hikari:lastrun:{group_id}` 更新，好让它下一次扫描（不管是下一个
    正常触发时刻还是重启补跑）的窗口起点仍然停在上一次成功的位置、自动把这一轮漏掉的都补上；
    `hikari:lastrun:{group_id}` 是逐群独立的键，不受同一轮里其他群成不成功影响——一个群
-   失败不会被跑成功的兄弟群掩盖。
+   失败不会被跑成功的兄弟群掩盖。扫描中途真的崩溃（不是"落库遇到几条失败"那种软失败）时，
+   这个群仍然会收到一条合并转发，只是行数可能少于七行（`Will process` / `Added, skipped`
+   这两行要等对应阶段跑到才会有）、最后一行是 `Failed: <原因>`——不会因为崩溃就什么都不发。
+   合并转发里每个 node 的头像是机器人自己的 QQ（`runOnce` 每轮调一次 `get_login_info` 取到，
+   取不到时退回 `OBSERVED_QQ` 并打警告，纯观感问题，不影响这一轮判定成不成功）。
 5. 用 curl 核对 HTTP 接口：
    ```bash
    curl 'http://127.0.0.1:8080/'
@@ -170,7 +177,7 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 6. 记录联调结果，尤其是第 3 点里 `get_msg` 的顶层 `user_id`——这是四条线上假设里唯一还没被
    坐实的一条（见下）。
 
-### 四个 NapCat 线上假设：三个已被 2026-08-15 首次生产运行坐实，一个仍待核对
+### 五个 NapCat 线上假设：四个已被坐实，一个仍待核对
 
 核对全靠进程自己的 stderr 日志。**按上面推荐的 `-Doptimize=ReleaseSafe` 构建时 `std.log` 的默认
 级别恰好是 `info`**，下面用到的 `info` 行开箱即可见；用 `ReleaseFast` / `ReleaseSmall` 构建则只剩
@@ -223,14 +230,33 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
    `none matched star_emoji_id=10024: ...` 这一行；若打出了，冒号后面是这条消息上实际出现过的
    全部 `emoji_id`（`id×次数`），✨ 的真实 id 会在那串里。
 
+5. **`send_group_forward_msg` 的请求体结构——已确认，针对生产 NapCat 手工探测坐实。** 运行日志
+   从逐条 `send_group_msg` 改成合并转发（见 7 节）之前，针对真实 NapCat 手工发过一次
+   `send_group_forward_msg`：
+
+   ```json
+   {"group_id": 1039716984, "messages": [
+     {"type":"node","data":{"user_id":"2131597992","nickname":"Hikari","content":[{"type":"text","data":{"text":"Hikari!"}}]}},
+     {"type":"node","data":{"user_id":"2131597992","nickname":"Hikari","content":[{"type":"text","data":{"text":"Successfully."}}]}}
+   ]}
+   ```
+
+   NapCat 回了 `{"status":"ok","retcode":0,"data":{"message_id":242408478,"res_id":"...","forward_id":"..."}}`，
+   确认 `user_id` 要传字符串、`node → data → content[]` 的三层嵌套、以及每个 node 会在合并转发里
+   独立成一行。`get_login_info` 取机器人自己 QQ 的返回形状（`data.user_id` 是数字）沿用 OneBot 11
+   标准接口，未单独针对这次改动重新探测。
+
 ## 本仓库中实际验证过的部分
 
-- `zig build` 产出二进制、`zig build test` 167/167 通过。
+- `zig build` 产出二进制、`zig build test` 201/201 通过。
 - 不设任何环境变量运行，进程以非零状态退出并在日志里点名具体缺失哪个环境变量。
 - 故意设置非法值（如 `SCAN_TIME=25:00`）运行，进程点名的是那个变量本身，不是别的。
 - 有本地 Redis 可用时，用合法 Redis 配置 + 不存在的 NapCat 地址运行，HTTP 服务仍能正常启动；对空库
   发请求返回 404 JSON 错误体。
 
 **没有验证过的部分**：需要真实 NapCat 实例、真实 QQ 账号与群权限的联调（上面 Runbook 的步骤 3、4、
-以及「四个 NapCat 线上假设」小节里第 3 条——`get_msg` 是否返回顶层 `user_id`，四条里唯一还没被
-2026-08-15 首次生产运行坐实的一条）——这需要人工执行，见上面的 Runbook。
+以及「五个 NapCat 线上假设」小节里第 3 条——`get_msg` 是否返回顶层 `user_id`，五条里唯一还没被
+生产运行坐实的一条）——这需要人工执行，见上面的 Runbook。合并转发这条改动本身只做到了单元测试
+级别（起假 HTTP server 验证 `send_group_forward_msg`/`get_login_info` 请求体与 runOnce 的调用
+时序，见 `src/scan/runner.zig`），还没有对着真实群跑过一轮、亲眼确认收到的是一条折叠起来的合并
+转发消息而不是七条独立消息。

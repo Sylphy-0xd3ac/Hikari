@@ -38,7 +38,8 @@ Hikari 是一个常驻进程，做两件事：
 | `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]` |
 | `get_group_info` | 取群名 | 填充 hitokoto 的 `from` |
 | `get_group_member_info` | 取被观察者群名片 | 填充 hitokoto 的 `from_who` |
-| `send_group_msg` | 发送运行日志 | 每行一条 |
+| `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
+| `send_group_forward_msg` | 发送运行日志 | 每群一条合并转发消息，七行各占一个 node；见 7 节 |
 
 ### 3.1 表情回应的读取代价
 
@@ -269,7 +270,9 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 
 ## 7. 运行日志
 
-每次定时运行，逐行发送到 `QQ_GROUP_IDS` 中的每一个群，每行一条 `send_group_msg`：
+每次定时运行，`QQ_GROUP_IDS` 中的每一个群各收到**一条**合并转发（合并转发／聊天记录）消息，
+用 `send_group_forward_msg` 发送。这七行文案与原先逐条发送时逐字相同，只是不再各自单独一条
+`send_group_msg`，而是各占一个 `node`，合并转发的消息顺序即节点顺序：
 
 ```
 Hikari!
@@ -281,11 +284,43 @@ Added 12 messages, skipped 34 messages.
 Successfully.
 ```
 
-时序：前 4 行在扫描开始前发出；`Will process N messages.` 在历史翻页完成、窗口内消息数确定后发出；`Added X messages, skipped Y messages.` 与 `Successfully.` 在入库完成后发出。
-
 `N` 是窗口内消息总数，`X` 是本次新入库条数，`Y` 是被各关卡拦下的候选数。
 
-运行中抛出异常时，最后一行替换为 `Failed: <原因>`，其余已发出的行不回滚。
+运行中抛出异常时，最后一行替换为 `Failed: <原因>`。
+
+### 7.1 为什么不再逐条发送
+
+七条独立消息每天刷一遍群是骚扰；改成一条合并转发后，群里只看到一条折叠起来的聊天记录，
+点开才展开七行。代价是显式接受的：原来的"渐进反馈"（扫描还没跑完就先看到横幅、
+`Processing...`）没有了——现在这个群这一轮的全部输出在扫描彻底跑完（或彻底失败）之前
+不会出现在群里。一次扫描历史上跑了 1–2 分钟，这段时间里群里不会有任何提示，直到合并转发
+一次性发出。
+
+### 7.2 node 结构与 `user_id`
+
+每个 node 是：
+
+```json
+{"type":"node","data":{"user_id":"<bot_qq>","nickname":"Hikari","content":[{"type":"text","data":{"text":"<这一行文案>"}}]}}
+```
+
+`user_id` 是**机器人自己的 QQ**（不是被观察者、也不是发这条日志的哪个人），控制的是合并转发里
+这一行显示的头像；`nickname` 固定 `"Hikari"`。机器人 QQ 不在配置项里，`runOnce` 每轮只调用一次
+`get_login_info` 取到后逐群逐行复用，取失败（网络、响应格式不对、字段缺失）时退回
+`OBSERVED_QQ` 并打警告——这个值只影响头像显示，选错是观感问题，不值得为它中断整轮扫描。
+
+### 7.3 崩溃与"发不出去"
+
+七行文案的产生时机跟原来一样：前四行（横幅三行 + `Processing...`）在扫描开始前就已确定；
+`Will process N messages.` 要等翻页拉完历史才知道；`Added X, skipped Y` 与最后一行（
+`Successfully.` 或 `Failed: <原因>`）要等落库结束才知道。这些行在产生的当下被追加进这个群
+待发的队列里，**扫描全程结束（不论成功还是中途出错）时才一次性打包发出**。
+
+一个群在扫描中途真的崩溃（不是"落库遇到几条失败"那种软失败，而是分页/判定阶段的硬错误）
+时，已经产生的那些行——至少是横幅四行——仍然连同一行 `Failed: <原因>` 一起，作为这个群的
+合并转发发出去，而不是这个群这一轮彻底没有任何输出。这行队列因此不总是恰好七行：中途崩溃时
+`Will process` / `Added, skipped` 这两行可能根本没来得及产生，实际发出的可能只有五行；这是
+刻意接受的诚实行为，不假装凑出一份完整的七行。
 
 ## 8. 模块划分
 
