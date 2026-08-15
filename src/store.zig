@@ -242,9 +242,16 @@ pub const Store = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
+        // 顺序即事务语义：exists() 查的是 hikari:index，所以 SADD 是提交点，
+        // 必须最后发。这样三种部分失败（只有 HSET 成功 / HSET+ZADD 成功）
+        // 留下的状态都满足 exists() == false，下一次扫描原样重做一遍即可修复
+        // （三条命令都幂等）。若把 SADD 提到 ZADD 前面，"HSET+SADD 成功、
+        // ZADD 失败" 会让这条语录 exists() == true 而永远不在 hikari:bylen 里：
+        // GET / 随机得到它，任何 min_length/max_length 查询都永远看不见它，
+        // 而且再也不会被修复。
         try self.client.commandOk(args);
-        try self.client.commandOk(&.{ "SADD", key_index, ids });
         try self.client.commandOk(&.{ "ZADD", key_bylen, lens, ids });
+        try self.client.commandOk(&.{ "SADD", key_index, ids });
     }
 
     pub fn revoke(self: *Store, message_id: i64) Error!void {
@@ -255,10 +262,16 @@ pub const Store = struct {
 
         self.mutex.lock();
         defer self.mutex.unlock();
-        try self.client.commandOk(&.{ "DEL", qk });
+        // tombstone 先落盘：它是这次作废唯一持久的事实（"这条消息永远不再入库"），
+        // 而删索引、删 hash 都只是它的后果。这样任何一次部分失败最坏留下一个
+        // 孤儿 hash（没人索引得到它，只占空间），而不是 hikari:index 里一个
+        // 没有 hash 的悬空 id——后者会被 randomAny 抽中、HGETALL 回空，让一个
+        // 非空的库对外返回 404，且永远不会自愈。SREM 也排在 ZREM 前面，理由
+        // 同 add()：index 是对外可见性的开关，先关它。
+        try self.client.commandOk(&.{ "SADD", key_tomb, ids });
         try self.client.commandOk(&.{ "SREM", key_index, ids });
         try self.client.commandOk(&.{ "ZREM", key_bylen, ids });
-        try self.client.commandOk(&.{ "SADD", key_tomb, ids });
+        try self.client.commandOk(&.{ "DEL", qk });
     }
 
     pub fn setLastRun(self: *Store, ts: i64) Error!void {
@@ -578,6 +591,23 @@ fn encodeArrayReply(gpa: std.mem.Allocator, items: []const []const u8) ![]u8 {
     return resp.encodeCommand(gpa, items);
 }
 
+/// 按给定顺序在 `bytes` 里逐帧定位：每一帧都必须存在，且必须出现在前一帧之后。
+///
+/// 断言的是**完整连续的 RESP 命令帧**，不是命令名子串。只查命令名的话，帧内
+/// 参数换位（比如 ZADD 的 score/member 对调、SREM 打到了 bylen 上）照样全部
+/// 通过；写库顺序本身是这两个函数的正确性所在（哪一步先落盘决定了部分失败会
+/// 留下什么状态），所以顺序也必须一起钉死。
+fn expectFrameSequence(bytes: []const u8, frames: []const []const u8) !void {
+    var at: usize = 0;
+    for (frames) |f| {
+        const idx = std.mem.indexOfPos(u8, bytes, at, f) orelse {
+            std.debug.print("missing or out-of-order RESP frame: {s}\n", .{f});
+            return error.TestUnexpectedResult;
+        };
+        at = idx + f.len;
+    }
+}
+
 test "nextId 发 INCR hikari:seq 并返回结果" {
     const gpa = std.testing.allocator;
     const srv = try FakeServer.start(gpa, ":5\r\n");
@@ -649,7 +679,7 @@ test "isTombstoned 发 SISMEMBER hikari:tomb" {
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_tomb) != null);
 }
 
-test "add 依次发 HSET / SADD / ZADD" {
+test "add 依次发 HSET / ZADD / SADD —— hikari:index 是提交点" {
     const gpa = std.testing.allocator;
     const srv = try FakeServer.start(gpa, ":15\r\n:1\r\n:1\r\n");
     defer {
@@ -665,18 +695,21 @@ test "add 依次发 HSET / SADD / ZADD" {
 
     c.deinit();
     srv.stop();
-    const bytes = srv.received.items;
-    const hset_at = std.mem.indexOf(u8, bytes, "HSET") orelse return error.TestUnexpectedResult;
-    const sadd_at = std.mem.indexOf(u8, bytes, "SADD") orelse return error.TestUnexpectedResult;
-    const zadd_at = std.mem.indexOf(u8, bytes, "ZADD") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(hset_at < sadd_at);
-    try std.testing.expect(sadd_at < zadd_at);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "hikari:quote:12345") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, key_index) != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, key_bylen) != null);
+
+    // 顺序不是随便定的：exists() 查的是 hikari:index，所以 SADD 必须是最后
+    // 一步，这样任何一次部分失败留下的状态都满足 exists() == false，下一次
+    // 扫描会原样重做一遍（HSET/ZADD/SADD 都幂等）。反过来把 SADD 放在 ZADD
+    // 前面的话，"HSET+SADD 成功、ZADD 失败" 会让这条语录 exists() == true，
+    // 从此每次扫描都跳过它，而它永远进不了 hikari:bylen——GET / 能随机到，
+    // 任何带 min_length/max_length 的查询都永远看不见，且不会自愈。
+    try expectFrameSequence(srv.received.items, &.{
+        "*32\r\n$4\r\nHSET\r\n$18\r\nhikari:quote:12345\r\n",
+        "*4\r\n$4\r\nZADD\r\n$12\r\nhikari:bylen\r\n$1\r\n7\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nSADD\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
+    });
 }
 
-test "revoke 依次发 DEL / SREM / ZREM / SADD tomb" {
+test "revoke 依次发 SADD tomb / SREM / ZREM / DEL —— tombstone 先落盘" {
     const gpa = std.testing.allocator;
     const srv = try FakeServer.start(gpa, ":1\r\n:1\r\n:1\r\n:1\r\n");
     defer {
@@ -692,16 +725,18 @@ test "revoke 依次发 DEL / SREM / ZREM / SADD tomb" {
 
     c.deinit();
     srv.stop();
-    const bytes = srv.received.items;
-    const del_at = std.mem.indexOf(u8, bytes, "DEL") orelse return error.TestUnexpectedResult;
-    const srem_at = std.mem.indexOf(u8, bytes, "SREM") orelse return error.TestUnexpectedResult;
-    const zrem_at = std.mem.indexOf(u8, bytes, "ZREM") orelse return error.TestUnexpectedResult;
-    const sadd_at = std.mem.indexOf(u8, bytes, "SADD") orelse return error.TestUnexpectedResult;
-    try std.testing.expect(del_at < srem_at);
-    try std.testing.expect(srem_at < zrem_at);
-    try std.testing.expect(zrem_at < sadd_at);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, "hikari:quote:12345") != null);
-    try std.testing.expect(std.mem.indexOf(u8, bytes, key_tomb) != null);
+
+    // tombstone 是这次作废唯一持久的事实：它一旦落盘，即使后面三步全失败，
+    // 下一次扫描的 isTombstoned 也会挡住重新入库，而运营方看到的是"还能查到
+    // 这条语录"这种可见、可重试的故障。反过来先 DEL 再 SREM 的话，DEL 成功、
+    // SREM 失败会在 hikari:index 里留下一个没有 hash 的悬空 id：randomAny
+    // 抽中它，HGETALL 回空，非空库对外返回 404，而且永远不会自愈。
+    try expectFrameSequence(srv.received.items, &.{
+        "*3\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n",
+        "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
+    });
 }
 
 test "setLastRun 发 SET hikari:lastrun" {

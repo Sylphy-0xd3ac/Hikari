@@ -198,9 +198,13 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` |
 | `hikari:lastrun` | STRING | 上次扫描窗口终点的 Unix 秒 |
 
-**写入**（单条语录，pipeline 发送）：`HSET hikari:quote:{id} ...` + `SADD hikari:index {id}` + `ZADD hikari:bylen {length} {id}`
+**写入**（单条语录，按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `SADD hikari:index {id}`
 
-**删除**：`DEL hikari:quote:{id}` + `SREM hikari:index {id}` + `ZREM hikari:bylen {id}` + `SADD hikari:tomb {id}`
+顺序即事务语义。`exists()` 查的是 `hikari:index`，所以 `SADD` 是提交点、必须最后发：任何一次部分失败留下的状态都满足 `exists() == false`，下一次扫描原样重做一遍就修好了（三条命令都幂等）。反过来若 `SADD` 先于 `ZADD`，"`HSET`+`SADD` 成功、`ZADD` 失败" 会让这条语录 `exists() == true` 却永远不在 `hikari:bylen` 里——`GET /` 能随机到，任何带 `min_length`/`max_length` 的查询都永远看不见，且不会自愈。
+
+**删除**（同样按此顺序）：`SADD hikari:tomb {id}` → `SREM hikari:index {id}` → `ZREM hikari:bylen {id}` → `DEL hikari:quote:{id}`
+
+tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 hash 都只是它的后果。这样最坏留下一个孤儿 hash（没人索引得到，只占空间），而不是 `hikari:index` 里一个没有 hash 的悬空 id——后者会被 `SRANDMEMBER` 抽中、`HGETALL` 回空，让一个非空的库对外返回 404，且永远不会自愈。
 
 **随机取一条**：
 
