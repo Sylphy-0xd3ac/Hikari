@@ -6,4 +6,5 @@ pub fn main() !void {
 
 test {
     _ = @import("config.zig");
+    _ = @import("onebot.zig");
 }
