@@ -16,4 +16,5 @@ test {
     _ = @import("http/server.zig");
     _ = @import("napcat.zig");
     _ = @import("scheduler.zig");
+    _ = @import("scan/runner.zig");
 }
