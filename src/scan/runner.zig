@@ -80,6 +80,10 @@ pub const BuildArgs = struct {
     message_id: i64,
     group_id: u64,
     user_id: u64,
+    // 默认 "hikari"：扫描器的调用点全部不设置这个字段，行为不变。
+    // import.zig 显式传 "import"，让手工导入的语录在库里和 API 响应里都能
+    // 跟扫描产生的语录区分开。
+    commit_from: []const u8 = "hikari",
 };
 
 /// 逐字段分配并立刻 errdefer：前面已经成功分配的字符串字段在后面任意一步
@@ -100,7 +104,7 @@ pub fn buildQuote(gpa: std.mem.Allocator, a: BuildArgs) !store.Quote {
     errdefer gpa.free(q.from_who);
     q.creator = try gpa.dupe(u8, "Hikari");
     errdefer gpa.free(q.creator);
-    q.commit_from = try gpa.dupe(u8, "hikari");
+    q.commit_from = try gpa.dupe(u8, a.commit_from);
     errdefer gpa.free(q.commit_from);
     q.created_at = try std.fmt.allocPrint(gpa, "{d}", .{a.created_at});
 
@@ -173,7 +177,7 @@ fn sendLine(deps: Deps, group_id: u64, text: []const u8) void {
 /// 值不是字符串）。调用方靠这个区分要不要把这批语录写进库——buildQuote 会把
 /// from 原样烧进每一条语录，而设计里没有任何事后编辑的路径，一次 API 抖动
 /// 就会让这一批语录永远带着空归属对外服务。
-fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
+pub fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{ .group_id = group_id }, .{}, &aw.writer) catch |e| {
         std.log.warn("group {d}: building get_group_info request failed: {s}", .{ group_id, @errorName(e) });
@@ -206,7 +210,7 @@ fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
 /// 取被观察者在这个群里的名片（群名片优先，其次昵称）。null / 空串的区分同
 /// groupName：两个字段都缺是"没问出来"，两个字段都在但都是空是"这人确实
 /// 没设名片也没有昵称"。
-fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
+pub fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{
         .group_id = group_id,

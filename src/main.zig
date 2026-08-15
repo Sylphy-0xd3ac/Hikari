@@ -6,11 +6,29 @@ const store = @import("store.zig");
 const http_server = @import("http/server.zig");
 const runner = @import("scan/runner.zig");
 const scheduler = @import("scheduler.zig");
+const import = @import("import.zig");
 
 pub fn main() !void {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dbg.deinit();
     const gpa = dbg.allocator();
+
+    // 子命令分发：无参数（args.len == 1，只有程序名）时完全落到下面原有的
+    // "起daemon" 路径，行为跟加子命令之前逐字节一致——这个 if 块只在
+    // 用户显式传了第一个参数时才会截住执行流。
+    const args = try std.process.argsAlloc(gpa);
+    defer std.process.argsFree(gpa, args);
+    if (args.len > 1) {
+        if (std.mem.eql(u8, args[1], "import")) {
+            if (args.len != 3) {
+                std.log.err("usage: hikari import <file>", .{});
+                std.process.exit(1);
+            }
+            return runImportCommand(gpa, args[2]);
+        }
+        std.log.err("unknown subcommand: {s} (usage: hikari [import <file>])", .{args[1]});
+        std.process.exit(1);
+    }
 
     var bad: ?[]const u8 = null;
     var cfg = config.load(gpa, &bad) catch |e| {
@@ -96,6 +114,46 @@ pub fn main() !void {
     }
 }
 
+/// `hikari import <file>`：装配一条独立的 Redis 连接 + NapCat 客户端（不跟
+/// 常驻路径共享，理由跟 main() 里 http_redis/scan_redis 分开是同一个——
+/// redis.Client 一旦被移动/复制就会失效，这条命令本来就是独立进程运行到
+/// 结束就退出，没有必要也不该尝试复用常驻路径的连接管理）。
+fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
+    var bad: ?[]const u8 = null;
+    var cfg = config.load(gpa, &bad) catch |e| {
+        std.log.err("config error ({s}) at env var: {s}", .{ @errorName(e), bad orelse "?" });
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var imp_redis = try redis.Client.connect(gpa, cfg.redis_host, cfg.redis_port, cfg.redis_password, cfg.redis_db);
+    defer imp_redis.deinit();
+    var imp_store = store.Store.init(gpa, &imp_redis);
+
+    var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
+    defer nap.deinit();
+
+    const deps: runner.Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &imp_store,
+        .observed_qq = cfg.observed_qq,
+        .admin_qqs = cfg.admin_qqs,
+        .group_ids = cfg.group_ids,
+    };
+
+    const summary = import.run(deps, path, std.time.timestamp()) catch |e| {
+        std.log.err("import failed: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
+
+    const text = try import.formatSummary(gpa, summary);
+    defer gpa.free(text);
+    try std.fs.File.stdout().writeAll(text);
+
+    if (summary.write_failed > 0) std.process.exit(1);
+}
+
 test {
     _ = @import("config.zig");
     _ = @import("onebot.zig");
@@ -109,4 +167,5 @@ test {
     _ = @import("napcat.zig");
     _ = @import("scheduler.zig");
     _ = @import("scan/runner.zig");
+    _ = @import("import.zig");
 }
