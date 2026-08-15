@@ -148,30 +148,33 @@ pub const Server = struct {
 /// 额外记录收到的字节（`received`），跟 store.zig / redis/client.zig 里的
 /// FakeServer 同一个用途：不光要验证响应状态码，还要能钉住发给 Redis 的
 /// 命令参数本身（比如 min/max 有没有被换位）。
+/// 脚本用完就主动关掉这条连接、回到 accept 等下一条：redis.Client 现在会在
+/// 传输层失败（含 ProtocolError）之后自己重拨并重试一次，所以假 Redis 必须能
+/// 接住第二条连接，否则重拨会挂在一个永远没人 accept 的半连接上，整个测试卡死。
+/// 每条新连接都从头重放同一份 replies。
 const FakeRedis = struct {
     listener: std.net.Server,
     thread: std.Thread,
     replies: []const []const u8,
     received: std.ArrayList(u8),
     gpa: std.mem.Allocator,
+    shutdown: std.atomic.Value(bool),
     stopped: bool,
 
     fn serve(self: *FakeRedis) void {
-        const conn = self.listener.accept() catch return;
-        defer conn.stream.close();
-        var buf: [8192]u8 = undefined;
-        var i: usize = 0;
-        while (i < self.replies.len) {
-            const n = conn.stream.read(&buf) catch return;
-            if (n == 0) return;
-            self.received.appendSlice(self.gpa, buf[0..n]) catch return;
-            conn.stream.writeAll(self.replies[i]) catch return;
-            i += 1;
-        }
         while (true) {
-            const n = conn.stream.read(&buf) catch return;
-            if (n == 0) return;
-            self.received.appendSlice(self.gpa, buf[0..n]) catch return;
+            const conn = self.listener.accept() catch return;
+            defer conn.stream.close();
+            if (self.shutdown.load(.acquire)) return;
+            var buf: [8192]u8 = undefined;
+            var i: usize = 0;
+            while (i < self.replies.len) {
+                const n = conn.stream.read(&buf) catch break;
+                if (n == 0) break;
+                self.received.appendSlice(self.gpa, buf[0..n]) catch break;
+                conn.stream.writeAll(self.replies[i]) catch break;
+                i += 1;
+            }
         }
     }
 
@@ -184,21 +187,31 @@ const FakeRedis = struct {
             .replies = replies,
             .received = .empty,
             .gpa = gpa,
+            .shutdown = .init(false),
             .stopped = false,
         };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
     }
 
-    /// 只负责关监听 + join，幂等（可以显式调用一次拿到稳定的 `received`
+    /// 只负责停服务线程 + 关监听，幂等（可以显式调用一次拿到稳定的 `received`
     /// 之后，再让 defer 里兜底的第二次调用变成空操作）。`received` 的释放
     /// 和结构体本身的销毁交给 `destroy`，这样调用方可以在 stop() 之后、
     /// destroy() 之前安全读取 received.items。
+    ///
+    /// 服务线程现在是个 accept 循环，停的时候多半正卡在 accept() 上。直接
+    /// listener.deinit() 关掉监听 fd 会让阻塞中的 accept 拿到 EBADF，而
+    /// std.posix.accept 把 EBADF 当成 unreachable——会直接 panic。所以先立
+    /// shutdown 标志、自己拨一条连接把 accept 叫醒，join 之后才关监听。
     fn stop(self: *FakeRedis) void {
         if (self.stopped) return;
         self.stopped = true;
-        self.listener.deinit();
+        self.shutdown.store(true, .release);
+        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |s| {
+            s.close();
+        } else |_| {}
         self.thread.join();
+        self.listener.deinit();
     }
 
     fn destroy(self: *FakeRedis, gpa: std.mem.Allocator) void {
