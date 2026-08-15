@@ -100,20 +100,44 @@ pub const Server = struct {
         });
     }
 
+    /// `/extra/batch/:count` 的前缀。单独命名成常量是因为路由判断和路径段
+    /// 切分（`path[extra_batch_prefix.len..]`）必须用同一个字符串——写成两个
+    /// 字面量会有一份将来改动时漏改另一份的风险。
+    const extra_batch_prefix = "/extra/batch/";
+
     fn handle(self: *Server, req: *std.http.Server.Request) !void {
         const gpa = self.gpa;
         const target = req.head.target;
 
-        // 先按路径路由，再看方法：未知路径一律 404（不论方法），只有落在 "/"
-        // 上、方法又不是 GET 时才是 405。先判方法会让 "POST /nope" 之类的
-        // 请求错误地报出 405（意味着 "/nope" 上其实存在别的方法），而不是
-        // 404（这个路径压根不存在）——两者语义不同，顺序不能反。
+        // 先按路径路由，再看方法：未知路径一律 404（不论方法），只有落在
+        // 一个已知路径上、方法又不对时才是 405。先判方法会让 "POST /nope"
+        // 之类的请求错误地报出 405（意味着 "/nope" 上其实存在别的方法），
+        // 而不是 404（这个路径压根不存在）——两者语义不同，顺序不能反。
+        // 三个已知路径统一走这一条路由，各自的方法检查放在各自的处理函数里。
         const path_end = std.mem.indexOfScalar(u8, target, '?') orelse target.len;
-        if (!std.mem.eql(u8, target[0..path_end], "/")) {
-            const b = try hitokoto.errorBody(gpa, "not found");
-            defer gpa.free(b);
-            return respondJson(req, .not_found, b);
+        const path = target[0..path_end];
+
+        if (std.mem.eql(u8, path, "/")) return self.handleRoot(req, target);
+        if (std.mem.eql(u8, path, "/extra/all")) return self.handleExtraAll(req);
+        if (std.mem.startsWith(u8, path, extra_batch_prefix)) {
+            const rest = path[extra_batch_prefix.len..];
+            // `rest` 不含 '/' 才是 "/extra/batch/:count" 这一条路由本身：
+            // 空串（"/extra/batch/"，缺 count）算命中这条路由、count 校验时
+            // 再拒；含 '/' 的（"/extra/batch/1/2"）路径结构上就不是这一条
+            // 路由能表达的形状，落到下面的通用 404，跟 "/nope" 同一个道理——
+            // 这个资源压根不存在，不是"这个资源存在但传参有误"。
+            if (std.mem.indexOfScalar(u8, rest, '/') == null) {
+                return self.handleExtraBatch(req, rest);
+            }
         }
+
+        const b = try hitokoto.errorBody(gpa, "not found");
+        defer gpa.free(b);
+        return respondJson(req, .not_found, b);
+    }
+
+    fn handleRoot(self: *Server, req: *std.http.Server.Request, target: []const u8) !void {
+        const gpa = self.gpa;
 
         if (req.head.method != .GET) {
             const b = try hitokoto.errorBody(gpa, "method not allowed");
@@ -172,7 +196,92 @@ pub const Server = struct {
             .extra_headers = &.{.{ .name = "content-type", .value = rendered.content_type }},
         });
     }
+
+    /// `GET /extra/all`：返回全部语录，JSON 数组。不认 `encode`/`min_length`/
+    /// `max_length`/`callback`/`select`——一言协议没有多条语录的形态，这条
+    /// 路径落在 `/extra/` 前缀下就是在承认它是自定义扩展，query string 整个
+    /// 被忽略，不解析。
+    ///
+    /// 库空 → `[]` + 200，不是 404：跟 `/` 的"没有可服务的东西"不是一回事。
+    /// 数组端点返回空数组本身就是一个成功的答案（"这就是全部，全部是零条"），
+    /// 404 意味着"这条资源不存在"，语义不对。`/` 的单条语义不适用于这里。
+    fn handleExtraAll(self: *Server, req: *std.http.Server.Request) !void {
+        const gpa = self.gpa;
+
+        if (req.head.method != .GET) {
+            const b = try hitokoto.errorBody(gpa, "method not allowed");
+            defer gpa.free(b);
+            return respondJson(req, .method_not_allowed, b);
+        }
+
+        const quotes = self.st.allQuotes(gpa) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            const b = try hitokoto.errorBody(gpa, "storage backend unavailable");
+            defer gpa.free(b);
+            return respondJson(req, .internal_server_error, b);
+        };
+        defer {
+            for (quotes) |q| q.deinit(gpa);
+            gpa.free(quotes);
+        }
+
+        const body = try hitokoto.jsonArrayBody(gpa, quotes);
+        defer gpa.free(body);
+        return respondJson(req, .ok, body);
+    }
+
+    /// `GET /extra/batch/:count`：随机返回 `count` 条语录，JSON 数组，
+    /// **允许重复**——运营方明确选了这个语义（见 `store.randomMany` 的
+    /// SRANDMEMBER 负数形式）。同样不认 `/` 的那套 query 参数。
+    ///
+    /// `count` 上限钉在 1000：它直接来自 URL，不做上限的话
+    /// `/extra/batch/999999999` 是任何人都能触发的分配耗尽攻击——这不是
+    /// 保守，是这条路径独有的暴露面。`/extra/all` 不需要这条护栏，因为它的
+    /// 规模由库大小决定，不是由用户输入决定。
+    fn handleExtraBatch(self: *Server, req: *std.http.Server.Request, count_str: []const u8) !void {
+        const gpa = self.gpa;
+
+        if (req.head.method != .GET) {
+            const b = try hitokoto.errorBody(gpa, "method not allowed");
+            defer gpa.free(b);
+            return respondJson(req, .method_not_allowed, b);
+        }
+
+        // parseInt(usize, ...) 天然拒绝负号、小数点、空串、非数字字符——
+        // usize 装不下负数，"-1"/"abc"/"" 都直接落进 catch。0 单独判断：
+        // parseInt 能解析出 0，但语义上"要 0 条"不是一个合法的批量请求。
+        const count = std.fmt.parseInt(usize, count_str, 10) catch {
+            const b = try hitokoto.errorBody(gpa, "count must be a positive integer");
+            defer gpa.free(b);
+            return respondJson(req, .bad_request, b);
+        };
+        if (count == 0 or count > max_batch_count) {
+            const b = try hitokoto.errorBody(gpa, "count must be between 1 and 1000");
+            defer gpa.free(b);
+            return respondJson(req, .bad_request, b);
+        }
+
+        const quotes = self.st.randomMany(gpa, count) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            const b = try hitokoto.errorBody(gpa, "storage backend unavailable");
+            defer gpa.free(b);
+            return respondJson(req, .internal_server_error, b);
+        };
+        defer {
+            for (quotes) |q| q.deinit(gpa);
+            gpa.free(quotes);
+        }
+
+        const body = try hitokoto.jsonArrayBody(gpa, quotes);
+        defer gpa.free(body);
+        return respondJson(req, .ok, body);
+    }
 };
+
+/// `/extra/batch/:count` 的上限。见 `handleExtraBatch` 顶部注释——这不是
+/// 随手挑的保守数字，是"用户输入直接决定 Redis 命令与分配规模"这条暴露面
+/// 唯一的护栏。
+const max_batch_count: usize = 1000;
 
 /// 按脚本顺序回复的假 Redis。每次收到一条命令就吐出脚本里的下一段。
 ///
@@ -573,6 +682,242 @@ test "Redis 返回协议错误时是 500 + JSON 错误体，而不是直接断�
     const status = try get(gpa, h.srv.port(), "/", &body);
     try std.testing.expectEqual(std.http.Status.internal_server_error, status);
 
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("message") != null);
+}
+
+// ---------------------------------------------------------------------------
+// /extra/all 与 /extra/batch/:count —— 全量导出 / 允许重复的批量随机抽样。
+// 两者都是自定义扩展，不认 `/` 的那套 encode/min_length/max_length/callback/
+// select，JSON 数组只是每个元素跟 encode=json 单条对象同构。
+
+fn hgetallReply2() []const u8 {
+    return "*24\r\n" ++
+        "$2\r\nid\r\n$2\r\n43\r\n" ++
+        "$4\r\nuuid\r\n$36\r\n660e8400-e29b-41d4-a716-446655440001\r\n" ++
+        "$8\r\nhitokoto\r\n$15\r\n第二条语录\r\n" ++
+        "$4\r\ntype\r\n$1\r\ng\r\n" ++
+        "$4\r\nfrom\r\n$9\r\n测试群\r\n" ++
+        "$8\r\nfrom_who\r\n$6\r\n小红\r\n" ++
+        "$7\r\ncreator\r\n$6\r\nHikari\r\n" ++
+        "$10\r\ncreated_at\r\n$10\r\n1700000100\r\n" ++
+        "$6\r\nlength\r\n$1\r\n5\r\n" ++
+        "$10\r\nmessage_id\r\n$3\r\n999\r\n" ++
+        "$8\r\ngroup_id\r\n$3\r\n999\r\n" ++
+        "$7\r\nuser_id\r\n$5\r\n10002\r\n";
+}
+
+test "GET /extra/all 返回全部语录的 JSON 数组" {
+    const gpa = std.testing.allocator;
+    const smembers = "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n";
+    const replies = [_][]const u8{ smembers, hgetallReply(), hgetallReply2() };
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("今天也是好天气", arr[0].object.get("hitokoto").?.string);
+    try std.testing.expectEqualStrings("第二条语录", arr[1].object.get("hitokoto").?.string);
+}
+
+test "GET /extra/all 库空时返回 [] 而不是 404 —— 数组端点的\"没有\"是一个成功答案" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{"*0\r\n"};
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    try std.testing.expectEqualStrings("[]", body.written());
+}
+
+test "非 GET 请求 /extra/all 返回 405" {
+    const gpa = std.testing.allocator;
+    const h = try startHarness(gpa, &[_][]const u8{});
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try std.testing.expectEqual(
+        std.http.Status.method_not_allowed,
+        try request(gpa, .DELETE, h.srv.port(), "/extra/all", &body),
+    );
+}
+
+test "GET /extra/all 遇到 Redis 协议错误时是 500 + JSON 错误体，而不是断连" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{"%1\r\n"};
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all", &body);
+    try std.testing.expectEqual(std.http.Status.internal_server_error, status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("message") != null);
+}
+
+test "GET /extra/batch/:count 用 SRANDMEMBER 的负数形式取样（允许重复），命令帧钉死符号" {
+    const gpa = std.testing.allocator;
+    // 同一个 id 出现两次：真实 Redis 的负数形式允许重复，这里直接在脚本层
+    // 模拟"抽中了同一条两次"，顺带验证 handleExtraBatch 不会偷偷去重。
+    const srandmember = "*2\r\n$5\r\n12345\r\n$5\r\n12345\r\n";
+    const replies = [_][]const u8{ srandmember, hgetallReply(), hgetallReply() };
+    const fake = try FakeRedis.start(gpa, &replies);
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, srv.port(), "/extra/batch/2", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    thread.join();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+
+    client.deinit();
+    fake.stop();
+    // 符号是这条命令唯一容易搞反、又不会被普通子串检查抓到的地方：搞反成
+    // 正数形式会让 Redis 走去重语义，在 count 超过库大小时还会静默截断到
+    // 库大小——两种情况普通测试都可能"恰好"通过。这里钉死完整帧：命令名、
+    // key、"-2" 三段的相对顺序与内容一起验证。
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fake.received.items,
+        "*3\r\n$11\r\nSRANDMEMBER\r\n$12\r\nhikari:index\r\n$2\r\n-2\r\n",
+    ) != null);
+}
+
+test "count 上限：1000 放行到 store 层（命令帧钉死 -1000），1001 未接触 Redis 就 400" {
+    const gpa = std.testing.allocator;
+    {
+        // SRANDMEMBER 对空库回空数组，不论请求的 count 是多少——用这个
+        // 空库回复反过来验证 1000 确实穿过了校验、命令确实发出去了。
+        const replies = [_][]const u8{"*0\r\n"};
+        const fake = try FakeRedis.start(gpa, &replies);
+        defer {
+            fake.stop();
+            fake.destroy(gpa);
+        }
+        var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+        defer client.deinit();
+        var st = store.Store.init(gpa, &client);
+        var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+        defer srv.deinit();
+        const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        const status = try get(gpa, srv.port(), "/extra/batch/1000", &body);
+        try std.testing.expectEqual(std.http.Status.ok, status);
+        thread.join();
+        try std.testing.expectEqualStrings("[]", body.written());
+
+        client.deinit();
+        fake.stop();
+        try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "$5\r\n-1000\r\n") != null);
+    }
+    {
+        // 1001 一步都不该碰 Redis：给一个空脚本，如果实现错误地先发了命令
+        // 再校验，这里会因为读不到回复而超时/失败，而不是安静地凑巧通过。
+        const h = try startHarness(gpa, &[_][]const u8{});
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(
+            std.http.Status.bad_request,
+            try get(gpa, h.srv.port(), "/extra/batch/1001", &body),
+        );
+    }
+}
+
+test "count 为 0、负数或非数字 -> 400" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "/extra/batch/0", "/extra/batch/-1", "/extra/batch/abc" }) |path| {
+        const h = try startHarness(gpa, &[_][]const u8{});
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(std.http.Status.bad_request, try get(gpa, h.srv.port(), path, &body));
+    }
+}
+
+test "畸形路径：/extra/batch（缺 count）与 /extra/batch/1/2（多余路径段）是 404，/extra/allx 也是 404" {
+    const gpa = std.testing.allocator;
+    // 这两个路径结构上都不是 "/extra/batch/:count" 这一条路由能表达的
+    // 形状——跟 "/nope" 是同一类："这个资源压根不存在"，不是"资源存在但
+    // 参数有误"。"/extra/allx" 同理：它既不等于 "/extra/all"，也不是
+    // "/extra/batch/" 前缀，落进通用 404。
+    for ([_][]const u8{ "/extra/batch", "/extra/batch/1/2", "/extra/allx" }) |path| {
+        const h = try startHarness(gpa, &[_][]const u8{});
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(std.http.Status.not_found, try get(gpa, h.srv.port(), path, &body));
+    }
+}
+
+test "/extra/batch/（空 count 段）命中路由但 count 校验失败 -> 400，不是 404" {
+    const gpa = std.testing.allocator;
+    // 跟上一条测试里 "/extra/batch"（无尾随斜杠）区分开：这里的路径结构
+    // 是 "/extra/batch/" + 空字符串，仍然落进 "/extra/batch/:count" 这条
+    // 路由——只是 count 这一段是空的，校验时按"非数字"处理，跟
+    // "/extra/batch/abc" 走的是同一条错误路径。
+    const h = try startHarness(gpa, &[_][]const u8{});
+    defer stopHarness(h);
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try std.testing.expectEqual(
+        std.http.Status.bad_request,
+        try get(gpa, h.srv.port(), "/extra/batch/", &body),
+    );
+}
+
+test "非 GET 请求 /extra/batch/:count 返回 405" {
+    const gpa = std.testing.allocator;
+    const h = try startHarness(gpa, &[_][]const u8{});
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try std.testing.expectEqual(
+        std.http.Status.method_not_allowed,
+        try request(gpa, .DELETE, h.srv.port(), "/extra/batch/5", &body),
+    );
+}
+
+test "GET /extra/batch/:count 遇到 Redis 协议错误时是 500 + JSON 错误体，而不是断连" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{"%1\r\n"};
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/batch/5", &body);
+    try std.testing.expectEqual(std.http.Status.internal_server_error, status);
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("message") != null);

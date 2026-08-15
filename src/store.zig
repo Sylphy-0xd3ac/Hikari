@@ -352,6 +352,85 @@ pub const Store = struct {
         };
         return self.fetchById(gpa, id_str);
     }
+
+    /// `/extra/all`：拿到 hikari:index 的全部成员，逐个 HGETALL 展开。库空时
+    /// SMEMBERS 回一个空数组（不是 nil），走到 fetchMany 时 ids 为空，直接
+    /// 产出一个长度为 0 的、gpa 拥有的切片——调用方（HTTP 层）统一用
+    /// `gpa.free` 释放返回值，不区分空库还是非空库，所以这里不能像
+    /// randomAny 那样在空/nil 分支提前 return 一个不是 gpa 分配出来的切片。
+    pub fn allQuotes(self: *Store, gpa: std.mem.Allocator) Error![]Quote {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = try self.client.command(&.{ "SMEMBERS", key_index });
+        defer v.deinit(self.client.gpa);
+        const items: []const resp.Value = switch (v) {
+            .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+            else => &[_]resp.Value{},
+        };
+        return self.fetchMany(gpa, items);
+    }
+
+    /// `/extra/batch/:count`：SRANDMEMBER 的负数形式（`-count`）允许重复，
+    /// 正数形式只会去重、且在 count 超过库大小时静默截断到库大小——调用方
+    /// （HTTP 层）明确选择了"允许重复"这个语义，所以这里必须发负数形式，
+    /// 不能图省事发正数。`count` 的上限校验（1000）由调用方在发这条命令
+    /// 之前做：那是一处"用户输入直接决定分配/命令规模"的护栏，属于 HTTP 层
+    /// 的职责，不是这里的。
+    pub fn randomMany(self: *Store, gpa: std.mem.Allocator, count: usize) Error![]Quote {
+        var buf: [32]u8 = undefined;
+        const neg = std.fmt.bufPrint(&buf, "-{d}", .{count}) catch unreachable;
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = try self.client.command(&.{ "SRANDMEMBER", key_index, neg });
+        defer v.deinit(self.client.gpa);
+        const items: []const resp.Value = switch (v) {
+            .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+            else => &[_]resp.Value{},
+        };
+        return self.fetchMany(gpa, items);
+    }
+
+    /// 把一组 id（SMEMBERS/SRANDMEMBER 回复里的 bulk string 数组）逐个
+    /// HGETALL 展开成 Quote 数组。只在 allQuotes/randomMany 内部调用，此时
+    /// 锁已经被持有——理由同 fetchById。
+    ///
+    /// 清理纪律：`out` 从声明起就有 errdefer 兜底，覆盖已经成功 append 进
+    /// `out` 的每个 Quote（各自持有七个独立分配的字符串）——`fetchById`
+    /// 本身失败（Redis I/O/协议错误）时不会留下任何新孤儿，因为它要么整体
+    /// 失败要么整体成功返回一个完整的 Quote，还没被 append 就跟着 try 直接
+    /// 传播。
+    ///
+    /// 但 `q` 拿到手之后、成功 append 进 `out` 之前还有一个不算短的窗口：
+    /// `out.append` 自己也会分配（扩容底层数组），也可能失败。这个失败点
+    /// 不能用裸 `try out.append(gpa, q)`——那样 `q` 已经完整分配好的七个
+    /// 字符串会在这一步失败时被孤儿化：它既不在 `out.items` 里（append 没有
+    /// 成功），外层 errdefer 也就看不到它，于是在这条只有分配失败测试才会
+    /// 走到的路径上泄漏（`checkAllAllocationFailures` 在这里真的抓到过：
+    /// fail_index 落在 `out.append` 内部的扩容分配上，`q` 七个字段全部已经
+    /// 分配完成却因为这一处裸 `try` 而丢失引用）。改成 `catch` 显式在同一处
+    /// 释放 `q` 后再把错误传播出去，保证 append 失败的这一条也被释放恰好
+    /// 一次，不依赖外层 errdefer 兜它。
+    fn fetchMany(self: *Store, gpa: std.mem.Allocator, ids: []const resp.Value) Error![]Quote {
+        var out: std.ArrayList(Quote) = .empty;
+        errdefer {
+            for (out.items) |q| q.deinit(gpa);
+            out.deinit(gpa);
+        }
+        for (ids) |item| {
+            const id_str = switch (item) {
+                .bulk => |b| b orelse continue,
+                else => continue,
+            };
+            if (try self.fetchById(gpa, id_str)) |q| {
+                out.append(gpa, q) catch |e| {
+                    q.deinit(gpa);
+                    return e;
+                };
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
 };
 
 fn sampleQuote() Quote {
@@ -917,4 +996,191 @@ test "randomByLength 候选为空数组时返回 null" {
     defer c.deinit();
     var store = Store.init(gpa, &c);
     try std.testing.expectEqual(@as(?Quote, null), try store.randomByLength(gpa, 1, 100));
+}
+
+// ---------------------------------------------------------------------------
+// allQuotes / randomMany —— `/extra/all` 与 `/extra/batch/:count` 的存储层。
+
+test "allQuotes 用 SMEMBERS 拿全部 id 再逐个 HGETALL 展开" {
+    const gpa = std.testing.allocator;
+    var q2 = sampleQuote();
+    q2.message_id = 999;
+    q2.hitokoto = "第二条语录";
+    q2.length = 5;
+
+    const args1 = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args1);
+    const args2 = try hashFields(gpa, q2);
+    defer freeHashFields(gpa, args2);
+    const h1 = try encodeArrayReply(gpa, args1[2..]);
+    defer gpa.free(h1);
+    const h2 = try encodeArrayReply(gpa, args2[2..]);
+    defer gpa.free(h2);
+    const smembers = try encodeArrayReply(gpa, &.{ "12345", "999" });
+    defer gpa.free(smembers);
+
+    const script = try std.mem.concat(gpa, u8, &.{ smembers, h1, h2 });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.allQuotes(gpa);
+    defer {
+        for (quotes) |q| q.deinit(gpa);
+        gpa.free(quotes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), quotes.len);
+    try std.testing.expectEqualStrings("今天也是好天气", quotes[0].hitokoto);
+    try std.testing.expectEqualStrings("第二条语录", quotes[1].hitokoto);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SMEMBERS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_index) != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:quote:12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:quote:999") != null);
+}
+
+test "allQuotes 库空时返回长度为 0 的数组（不是 null）" {
+    const gpa = std.testing.allocator;
+    // SMEMBERS 在空集合上回一个空数组（`*0\r\n`），不是 nil——`hikari:index`
+    // 本身要么不存在（Redis 对不存在的 key 做 SMEMBERS 就是空数组）要么存在
+    // 但为空，两种情况在协议层都是同一种回复。
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.allQuotes(gpa);
+    defer gpa.free(quotes);
+    try std.testing.expectEqual(@as(usize, 0), quotes.len);
+}
+
+test "randomMany 发 SRANDMEMBER 的负数形式（允许重复），命令帧钉死符号" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const h = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(h);
+
+    // count=3，让同一个 id 在 SRANDMEMBER 回复里重复出现三次——真实 Redis
+    // 的负数形式就是这样（允许重复），验证 fetchMany 老老实实按回复出现
+    // 的次数逐条 HGETALL，不会因为 id 相同就去重合并成一条。
+    const srandmember = try encodeArrayReply(gpa, &.{ "12345", "12345", "12345" });
+    defer gpa.free(srandmember);
+    const script = try std.mem.concat(gpa, u8, &.{ srandmember, h, h, h });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.randomMany(gpa, 3);
+    defer {
+        for (quotes) |q| q.deinit(gpa);
+        gpa.free(quotes);
+    }
+    try std.testing.expectEqual(@as(usize, 3), quotes.len);
+
+    c.deinit();
+    srv.stop();
+    // 符号是这条命令唯一容易搞反、又不会被普通子串检查抓到的地方：搞反成
+    // 正数形式（"3"）会让 Redis 走去重语义，在 count 超过库大小时还会静默
+    // 截断到库大小——两种情况普通测试都可能"恰好"通过。这里钉死完整帧，
+    // 命令名、key、"-3" 三段的相对顺序与内容一起验证。
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        srv.received.items,
+        "*3\r\n$11\r\nSRANDMEMBER\r\n$12\r\nhikari:index\r\n$2\r\n-3\r\n",
+    ) != null);
+}
+
+test "randomMany 库空时返回长度为 0 的数组" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.randomMany(gpa, 5);
+    defer gpa.free(quotes);
+    try std.testing.expectEqual(@as(usize, 0), quotes.len);
+}
+
+/// checkAllAllocationFailures 专用：`gpa` 是被注入失败的 allocator，只应该
+/// 覆盖 `store.allQuotes` 本身"逐条 HGETALL 展开成 Quote 数组"这条路径——
+/// 这正是本仓库缺陷史里点名的那类：一条语录内部有七个独立分配的字符串，
+/// N 条语录里任意一条、任意一个字段的分配失败，前面已经 append 进 out 的
+/// 每一条都必须被释放恰好一次，不多不少。
+///
+/// 网络层（FakeServer 的服务线程、redis.Client 的连接/读写缓冲、RESP 回复
+/// 解码用的 `client.gpa`）全部改用 `std.testing.allocator`（`net_gpa`，不参与
+/// 失败注入），原因有两条：一是 FakeServer 的服务线程与本线程会并发调用
+/// 同一个 allocator，`std.testing.FailingAllocator` 的失败计数不是为并发
+/// 访问设计的，混用会让失败点落不到确定的分配上，测试变得不确定；二是
+/// 这里想测的是 `allQuotes` 自己的清理纪律，网络层的分配失败路径已经在
+/// `redis/client.zig` 和本文件别处测过，不需要在这里重复覆盖。
+fn checkAllQuotesAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+
+    var q2 = sampleQuote();
+    q2.message_id = 999;
+    q2.hitokoto = "第二条语录";
+    q2.length = 5;
+
+    const args1 = try hashFields(net_gpa, sampleQuote());
+    defer freeHashFields(net_gpa, args1);
+    const args2 = try hashFields(net_gpa, q2);
+    defer freeHashFields(net_gpa, args2);
+    const h1 = try encodeArrayReply(net_gpa, args1[2..]);
+    defer net_gpa.free(h1);
+    const h2 = try encodeArrayReply(net_gpa, args2[2..]);
+    defer net_gpa.free(h2);
+    const smembers = try encodeArrayReply(net_gpa, &.{ "12345", "999" });
+    defer net_gpa.free(smembers);
+
+    const script = try std.mem.concat(net_gpa, u8, &.{ smembers, h1, h2 });
+    defer net_gpa.free(script);
+
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(net_gpa, &c);
+
+    const quotes = try st.allQuotes(gpa);
+    for (quotes) |q| q.deinit(gpa);
+    gpa.free(quotes);
+}
+
+test "allQuotes 在多条语录构建过程中任意一步分配失败都不泄漏、不重复释放（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllQuotesAlloc, .{});
 }

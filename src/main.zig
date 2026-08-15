@@ -26,7 +26,14 @@ pub fn main() !void {
             }
             return runImportCommand(gpa, args[2]);
         }
-        std.log.err("unknown subcommand: {s} (usage: hikari [import <file>])", .{args[1]});
+        if (std.mem.eql(u8, args[1], "run")) {
+            if (args.len != 2) {
+                std.log.err("usage: hikari run", .{});
+                std.process.exit(1);
+            }
+            return runRunCommand(gpa);
+        }
+        std.log.err("unknown subcommand: {s} (usage: hikari [import <file>|run])", .{args[1]});
         std.process.exit(1);
     }
 
@@ -156,6 +163,54 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
     try std.fs.File.stdout().writeAll(text);
 
     if (summary.write_failed > 0) std.process.exit(1);
+}
+
+/// `hikari run`：跑一次扫描立刻退出，不起 HTTP 服务。装配跟常驻路径
+/// （main() 里那条）逐字段相同——同一个 config.load、同一种独立 Redis
+/// 连接、同一个 runner.Deps 构造方式——因为这必须是一次真实的运行：窗口
+/// 起点仍然是 `hikari:lastrun:{group_id}`，跑完仍然逐群写回它，跟定时
+/// 路径没有任何区别。这正是这个子命令存在的意义：运营方过去想手动验证一次
+/// 扫描，得靠"临时改 SCAN_TIME、重启、等、再改回去"这套仪式；`runOnce`
+/// 从来就不关心调用者是谁，唯一缺的只是一个不需要仪式的入口。
+///
+/// `run_at = std.time.timestamp()`：窗口因此是 `[last_run, now)`——上次
+/// 成功运行之后错过的整段，跟调度路径完全同一条计算逻辑（含 7 天回看
+/// 上限），不是"固定回看 24 小时"那种阉割版本。
+///
+/// 退出码：只有 config 加载失败或 Redis 连不上才是非零——这两步失败意味着
+/// 这次调用压根没跑起来，运营方需要能从退出码看出"根本没跑"和"跑了但
+/// 某些群失败了"的区别。后者 `runOnce` 按设计吞掉每个群自己的错误（见
+/// `scan/runner.zig`），这里不改这个既有行为：单个群失败不该让整条命令
+/// 退出码变成非零，否则 cron/CI 里跑这条命令会在"完全正常的部分失败"
+/// 场景下持续报警。
+fn runRunCommand(gpa: std.mem.Allocator) !void {
+    var bad: ?[]const u8 = null;
+    var cfg = config.load(gpa, &bad) catch |e| {
+        std.log.err("config error ({s}) at env var: {s}", .{ @errorName(e), bad orelse "?" });
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var run_redis = redis.Client.connect(gpa, cfg.redis_host, cfg.redis_port, cfg.redis_password, cfg.redis_db) catch |e| {
+        std.log.err("redis connect failed: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
+    defer run_redis.deinit();
+    var run_store = store.Store.init(gpa, &run_redis);
+
+    var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
+    defer nap.deinit();
+
+    const deps: runner.Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &run_store,
+        .observed_qq = cfg.observed_qq,
+        .admin_qqs = cfg.admin_qqs,
+        .group_ids = cfg.group_ids,
+    };
+
+    runner.runOnce(deps, std.time.timestamp());
 }
 
 test {

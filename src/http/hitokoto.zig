@@ -201,6 +201,46 @@ fn jsString(gpa: std.mem.Allocator, s: []const u8) ![]u8 {
     return aw.toOwnedSlice();
 }
 
+/// `/extra/all` 与 `/extra/batch/:count` 用：把一组语录序列化成 JSON 数组，
+/// 每个元素跟 `render(..., encode=json)` 产出的对象同构（同一个 `Payload`
+/// 类型）。这两个端点不认 `encode`/`min_length`/`max_length`/`callback`/
+/// `select`——一言协议本身没有多条语录的形态，这两个端点落在 `/extra/`
+/// 前缀下就是在承认它们是超出协议范围的自定义扩展，所以这里不接受、也
+/// 不看 `Query`。
+///
+/// `.uuid = &q.uuid` 取的是切片元素（`quotes[i]`）自己的地址，不是循环变量
+/// 的地址：用 `|*q|` 按指针捕获，`q` 指向的是 `quotes` 底层数组里的那个
+/// 具体元素，地址在整个 `writeJson` 调用期间稳定；如果按值捕获（`|q|`），
+/// `q` 会是每次迭代复用的一份拷贝，`&q.uuid` 在循环结束后要么指向最后一次
+/// 迭代遗留的内容，要么在实现按栈槽复用时让多个元素的 `uuid` 字段全部
+/// 悄悄指向同一块内存——这不是这里选的实现方式，但值得记录清楚为什么必须
+/// 用指针捕获。
+pub fn jsonArrayBody(gpa: std.mem.Allocator, quotes: []const store.Quote) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+
+    const payloads = try gpa.alloc(Payload, quotes.len);
+    defer gpa.free(payloads);
+    for (quotes, 0..) |*q, i| {
+        payloads[i] = .{
+            .id = q.id,
+            .uuid = &q.uuid,
+            .hitokoto = q.hitokoto,
+            .type = q.kind,
+            .from = q.from,
+            .from_who = q.from_who,
+            .creator = q.creator,
+            .creator_uid = q.creator_uid,
+            .reviewer = q.reviewer,
+            .commit_from = q.commit_from,
+            .created_at = q.created_at,
+            .length = q.length,
+        };
+    }
+    try writeJson(payloads, &aw.writer, .{});
+    return aw.toOwnedSlice();
+}
+
 pub fn errorBody(gpa: std.mem.Allocator, message: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
@@ -504,4 +544,62 @@ test "render(callback) 在分配失败时不泄漏 jsonBody 中间结果（check
     const query = try parseQuery(gpa, "/?callback=moe");
     defer query.deinit(gpa);
     try std.testing.checkAllAllocationFailures(gpa, checkRenderAlloc, .{ sample(), query });
+}
+
+// ---------------------------------------------------------------------------
+// jsonArrayBody —— `/extra/all` 与 `/extra/batch/:count` 的 JSON 数组编码。
+
+fn sample2() store.Quote {
+    return .{
+        .id = 43,
+        .uuid = "660e8400-e29b-41d4-a716-446655440001".*,
+        .hitokoto = "第二条语录",
+        .kind = "g",
+        .from = "测试群",
+        .from_who = "小红",
+        .creator = "Hikari",
+        .creator_uid = 0,
+        .reviewer = 0,
+        .commit_from = "hikari",
+        .created_at = "1700000100",
+        .length = 5,
+        .message_id = 999,
+        .group_id = 999,
+        .user_id = 10002,
+    };
+}
+
+test "jsonArrayBody 产出与元素个数一致的 JSON 数组，字段跟 encode=json 的单条对象同构" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    const body = try jsonArrayBody(gpa, &quotes);
+    defer gpa.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("今天也是好天气", arr[0].object.get("hitokoto").?.string);
+    try std.testing.expectEqualStrings("550e8400-e29b-41d4-a716-446655440000", arr[0].object.get("uuid").?.string);
+    try std.testing.expectEqualStrings("第二条语录", arr[1].object.get("hitokoto").?.string);
+    try std.testing.expectEqualStrings("660e8400-e29b-41d4-a716-446655440001", arr[1].object.get("uuid").?.string);
+    try std.testing.expectEqual(@as(i64, 43), arr[1].object.get("id").?.integer);
+}
+
+test "jsonArrayBody 空切片产出 []" {
+    const gpa = std.testing.allocator;
+    const body = try jsonArrayBody(gpa, &.{});
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("[]", body);
+}
+
+fn checkJsonArrayBodyAlloc(gpa: std.mem.Allocator, quotes: []const store.Quote) !void {
+    const b = try jsonArrayBody(gpa, quotes);
+    gpa.free(b);
+}
+
+test "jsonArrayBody 在多条语录序列化时分配失败不泄漏（checkAllAllocationFailures）" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    try std.testing.checkAllAllocationFailures(gpa, checkJsonArrayBodyAlloc, .{quotes[0..]});
 }

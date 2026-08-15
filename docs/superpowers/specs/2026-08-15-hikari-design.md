@@ -291,7 +291,39 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 
 - 库空 / 长度过滤后无结果 → 404，JSON 错误体
 - `charset` 非 `utf-8`、`min_length` > `max_length`、参数非数字 → 400，JSON 错误体
-- 路径非 `/` → 404
+- 路径非 `/`、`/extra/all`、`/extra/batch/:count` 之一 → 404
+
+### 6.1 `/extra/all` 与 `/extra/batch/:count`：两个自定义扩展端点
+
+Hitokoto 协议本身没有"一次要多条语录"的形态。这两个端点落在 `/extra/` 前缀下就是在承认这一点——
+它们是本项目对协议的扩展，不是协议本身的一部分，因此**不认** `/` 的那套查询参数：`encode` /
+`min_length` / `max_length` / `callback` / `select` 全部被忽略，query string 整体不解析。响应固定
+`Content-Type: application/json; charset=utf-8`，body 是一个 JSON 数组，元素跟 `GET /?encode=json`
+产出的对象逐字段同构（第 4.7 节的完整字段集）。方法非 `GET` → 405，Redis I/O 失败 → 500 + JSON
+错误体，均与 `GET /` 一致。
+
+**`GET /extra/all`**：返回全部语录，`SMEMBERS hikari:index` 拿到全部 id 后逐个 `HGETALL`，**不设
+上限**——这条端点的响应规模由语录库大小决定，不是由请求本身决定，不是需要防的那类暴露面。库空时
+返回 `[]` + **200**，不是 404：数组端点返回空数组本身就是一个成功的答案（"这就是全部，全部是零
+条"），跟 `GET /` 那种"没有可服务的单条语录"是不同的语义——`GET /` 的 404 表达的是"没有东西可以
+给你"，`/extra/all` 的 `[]` 表达的是"我把全部都给你了，全部是零条"，两者不能共用一个状态码。
+
+**`GET /extra/batch/:count`**：随机返回 `count` 条语录，**允许重复**——这是运营方明确选择的语义。
+实现上依赖 `SRANDMEMBER hikari:index -count`（**负数**形式）：Redis 的 `SRANDMEMBER key <n>` 在
+`n` 为正数时只返回互不相同的成员，`n` 为负数时允许重复且恰好返回 `|n|` 个结果。正数形式对这条端点
+是错的：一是它会静默去重，"允许重复"这个承诺不成立；二是 `count` 超过库大小时它会静默把结果截断到
+库大小，调用方拿到的条数会少于请求的 `count` 却拿不到任何提示。`count` 必须是 1–1000 之间的整数，
+否则 400——上限卡在 1000 不是保守起见：`count` 直接来自 URL，是任何人都能触碰到的输入，不设上限的
+话 `/extra/batch/999999999` 是一次谁都能发起的分配 / Redis 命令规模耗尽攻击，这条护栏是这条端点
+独有的暴露面。`/extra/all` 没有对应的上限，因为它的响应规模由库大小决定，不受用户输入控制，攻击面
+不存在。库空时同样返回 `[]` + 200，理由同上。
+
+路由上，`/extra/batch/:count` 是"前缀 + 单一路径段"的匹配：`/extra/batch/` 后面必须恰好一段、不能
+再带 `/`。`/extra/batch`（缺 count，没有尾随斜杠）、`/extra/batch/1/2`（count 之后还有多余路径段）
+落进跟 `/nope` 相同的通用 404——这两种情况在路径结构上就不是这条路由能表达的形状，是"这个资源压根
+不存在"，不是"资源存在但参数有误"。`/extra/batch/`（尾随斜杠、count 段为空）仍然命中这条路由，只是
+校验 `count` 时把空串当非法数字处理，产出 400——空字符串结构上确实是"这条路由 + 一个空的 count 段"，
+跟 `/extra/batch/abc` 走的是同一条错误路径，不是路由层面的缺失。
 
 ## 7. 运行日志
 
@@ -358,11 +390,11 @@ Successfully in 87s.
 build.zig
 build.zig.zon
 src/
-  main.zig            入口：读 env、起 HTTP 线程、跑调度循环
+  main.zig            入口：无参数时读 env、起 HTTP 线程、跑调度循环；`import`/`run` 子命令
   config.zig          env 解析与校验
   redis/resp.zig      RESP2 编解码                        [纯函数]
   redis/client.zig    TCP 连接、命令发送、重连
-  store.zig           语录存储层 add/has/remove/randomAny/randomByLength/nextId
+  store.zig           语录存储层 add/has/remove/randomAny/randomByLength/allQuotes/randomMany/nextId
   napcat.zig          NapCat HTTP 客户端 callAction(action, params)
   onebot.zig          OB11 消息模型：段解析、replyTarget、renderText   [纯函数]
   scan/rules.zig      判定逻辑 classify(msgs, cfg) → {revoked, candidates}  [纯函数]

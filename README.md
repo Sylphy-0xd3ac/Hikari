@@ -65,10 +65,24 @@ zig build -Doptimize=ReleaseSafe
 # 跑测试
 zig build test
 
-# 运行
+# 运行（不带参数：常驻进程，起 HTTP 服务 + 每日定时扫描）
 set -a && source .env && set +a
 ./zig-out/bin/hikari
+
+# 子命令：跑一次扫描立刻退出，不起 HTTP 服务
+./zig-out/bin/hikari run
+
+# 子命令：从文件批量导入历史语录
+./zig-out/bin/hikari import <file>
 ```
+
+`hikari run` 装配跟不带参数的常驻路径完全同一套（同一个 `config.load`、同一种独立 Redis 连接、
+同一个 `runner.Deps`），只是只调一次 `runner.runOnce(deps, std.time.timestamp())` 就退出，不起
+HTTP 服务。它是一次**真实**的运行：窗口是 `[hikari:lastrun:{group_id}, now)`（跟定时路径完全
+同一条计算逻辑，含 7 天回看上限），跑完照常逐群写回 `hikari:lastrun:{group_id}`——不是"干跑"，
+不做任何特殊处理。退出码只在 config 加载失败或 Redis 连不上时非零；单个群扫描失败是
+`runOnce` 一直以来的既有行为（吞掉、记日志、不写那个群的 `lastrun`），不会让这条命令本身退出码
+变成非零。
 
 进程内部开两条独立的 Redis 连接：一条给 HTTP 服务用，一条给每日扫描用。两者各自持有自己的连接，不跨
 线程共享——`redis.Client` 内部的 reader/writer 持有指向自身的指针，`Store` 的锁只保护单个 `Store`
@@ -131,6 +145,31 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 数字、`callback` 非法 → 400；路径非 `/` → 404；方法非 `GET` → 405；Redis 不可用 → 500。均为 JSON
 错误体。
 
+### `/extra/*`：两个自定义扩展端点
+
+一言协议本身没有"多条语录"的形态，下面两个端点落在 `/extra/` 前缀下就是在承认这一点——它们
+**不认** `/` 的那套查询参数（`encode`/`min_length`/`max_length`/`callback`/`select`，均被忽略，
+不解析），响应固定是 `Content-Type: application/json; charset=utf-8` 的 JSON 数组，数组元素跟
+`GET /?encode=json` 产出的对象逐字段同构。方法非 `GET` → 405；Redis 不可用 → 500；均为 JSON 错误体，
+跟 `/` 一致。
+
+- **`GET /extra/all`** —— 返回**全部**语录，无上限。库空时返回 `[]` + **200**，不是 404：数组端点
+  返回空数组本身就是一个成功的答案（"这就是全部，全部是零条"），跟 `/` 那种"没有可服务的单条语录"
+  是不同的语义，不能共用 404。这条端点不设上限是刻意的——它的响应规模由语录库大小决定，不是由请求
+  本身决定，不是这里需要防的那类暴露面。
+- **`GET /extra/batch/:count`** —— 随机返回 `count` 条语录，**允许重复**（内部走 Redis
+  `SRANDMEMBER hikari:index -count` 的负数形式；正数形式只会去重、且在 `count` 超过库大小时静默
+  截断到库大小，都不是这里想要的）。`count` 必须是 1–1000 之间的整数，否则 400；上限卡在 1000 不是
+  保守起见，是因为 `count` 直接来自 URL——不设上限的话 `/extra/batch/999999999` 是任何人都能触发的
+  分配 / Redis 命令规模耗尽攻击，这条护栏是这条端点独有的暴露面，`/extra/all` 没有这个问题（它的
+  规模不受用户输入控制）。库空时同样返回 `[]` + 200。
+
+```bash
+curl 'http://127.0.0.1:8080/extra/all'
+curl 'http://127.0.0.1:8080/extra/batch/5'
+curl -i 'http://127.0.0.1:8080/extra/batch/99999999'   # 应为 400（超过 1000 上限）
+```
+
 ## Redis 键结构
 
 | 键 | 类型 | 内容 |
@@ -152,15 +191,19 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 
 ### 步骤
 
-1. 复制 `.env.example` 为 `.env`，填真实值，把 `SCAN_TIME` 设成两三分钟后的时刻。
-2. `set -a && source .env && set +a && ./zig-out/bin/hikari`
-3. 在目标群里造数据：
+1. 复制 `.env.example` 为 `.env`，填真实值。
+2. 在目标群里造数据：
    - 被观察者发一句话，给它贴 ✨ 表情回应（路径 1）；
    - 另一个人引用被观察者的另一句话，只回 `✨`（路径 2）；
    - 管理员发 `✨ 手动补录测试`（路径 3）；
    - 被观察者连发两条话，都贴上 ✨ 和 🔥（路径 4，链式收录，应合并为一条）；
    - 管理员引用其中一条候选，只回 `💦`（作废）。
-4. 等定时触发，确认每个群收到**一条**合并转发（聊天记录）消息，点开后是七行（横幅三行 +
+3. 触发一次扫描：`set -a && source .env && set +a && ./zig-out/bin/hikari run`——跑完立刻退出，
+   不用起 HTTP 服务、不用等定时触发。**这条命令替代了以前"把 `SCAN_TIME` 临时改成两三分钟后、
+   重启、等、再改回去"这套仪式**：`hikari run` 装配跟常驻路径完全同一套（同一个 config、同一种
+   独立 Redis 连接、同一个 `runner.Deps`），只是只跑一次 `runOnce` 就退出，窗口计算、
+   `hikari:lastrun:{group_id}` 写回都跟定时路径完全一致，不是"干跑"。
+4. 确认每个群收到**一条**合并转发（聊天记录）消息，点开后是七行（横幅三行 +
    `Processing...` + `Will process N messages.` + `Added X messages, skipped Y messages.` +
    `Successfully in {d}s.`，秒数是这个群自己这一轮扫描花的时长，不是整个运行的总时长）且计数
    合理；这七行不再是七条独立消息，是 `send_group_forward_msg` 打包发的一条消息里的七个 node，
@@ -177,12 +220,15 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
    这两行要等对应阶段跑到才会有）、最后一行是 `Failed: <原因>`——不会因为崩溃就什么都不发。
    合并转发里每个 node 的头像是机器人自己的 QQ（`runOnce` 每轮调一次 `get_login_info` 取到，
    取不到时退回 `OBSERVED_QQ` 并打警告，纯观感问题，不影响这一轮判定成不成功）。
-5. 用 curl 核对 HTTP 接口：
+5. 用 curl 核对 HTTP 接口——`hikari run` 不起 HTTP 服务，这一步另外用不带参数的
+   `./zig-out/bin/hikari` 起常驻进程（第 3 步落的数据已经在 Redis 里，不需要重新造）：
    ```bash
    curl 'http://127.0.0.1:8080/'
    curl 'http://127.0.0.1:8080/?encode=text'
    curl 'http://127.0.0.1:8080/?min_length=1&max_length=5'
    curl -i 'http://127.0.0.1:8080/?charset=gbk'   # 应为 400
+   curl 'http://127.0.0.1:8080/extra/all'
+   curl 'http://127.0.0.1:8080/extra/batch/5'
    ```
 6. 记录联调结果备查。
 
@@ -276,7 +322,8 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 
 ## 本仓库中实际验证过的部分
 
-- `zig build` 产出二进制、`zig build test` 201/201 通过。
+- `zig build` 产出二进制、`zig build test` 242/242 通过；`zig build -Dtarget=x86_64-linux-gnu
+  -Doptimize=ReleaseSafe`（部署目标）交叉编译通过。
 - 不设任何环境变量运行，进程以非零状态退出并在日志里点名具体缺失哪个环境变量。
 - 故意设置非法值（如 `SCAN_TIME=25:00`）运行，进程点名的是那个变量本身，不是别的。
 - 有本地 Redis 可用时，用合法 Redis 配置 + 不存在的 NapCat 地址运行，HTTP 服务仍能正常启动；对空库
