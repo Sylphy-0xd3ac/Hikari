@@ -385,6 +385,9 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     var before: ?i64 = null;
     var reached_start = false;
     var guard: usize = 0;
+    // 真正拉到内容的页数。跟 guard 不是一回事：最后一次 fetchPage 可能什么都
+    // 没拿到（翻到头了 / 响应看不懂），那一次不算一页。警告里报的是这个数。
+    var pages: usize = 0;
     // 循环跑满 200 页而没走到任何一个 break 时留下的原因；下面每个 break
     // 之前都会覆盖它。
     var stop_reason: []const u8 = "page guard exhausted (200 pages)";
@@ -396,7 +399,8 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
             break;
         }
         try pool.appendSlice(a, page.msgs);
-        logPage(gid, guard, page.msgs);
+        logPage(gid, pages, page.msgs);
+        pages += 1;
 
         const oldest = oldestTime(page.msgs) orelse {
             stop_reason = "page carried no usable timestamp";
@@ -425,7 +429,7 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     if (!reached_start) {
         std.log.warn(
             "group {d}: history window NOT fully covered — stopped after {d} page(s) with {d} message(s) pooled, before reaching window start {d}; reason: {s}. Messages and 💦 revocations older than this run's oldest page were never examined and will not be revisited.",
-            .{ gid, guard, pool.items.len, win_start, stop_reason },
+            .{ gid, pages, pool.items.len, win_start, stop_reason },
         );
     }
 
