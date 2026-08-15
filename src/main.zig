@@ -15,4 +15,5 @@ test {
     _ = @import("http/hitokoto.zig");
     _ = @import("http/server.zig");
     _ = @import("napcat.zig");
+    _ = @import("scheduler.zig");
 }
