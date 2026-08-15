@@ -423,13 +423,20 @@ test "min_length/max_length 命中时返回 200，且发给 Redis 的 min/max �
     // 之后 received 才是稳定、不会再变化、可以安全读取的状态。
     client.deinit();
     fake.stop();
-    try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "ZRANGEBYSCORE") != null);
-    // 不能只查裸的 "3" / "20" 子串：那两个数字前缀恰好也会出现在 RESP 里
-    // 到处都是的 bulk 长度头（比如 "$3\r\n..."）里，裸子串匹配永远为真，
-    // 测不出 min/max 是不是真的按正确顺序发出去了。改成匹配 min/max 各自
-    // 完整的 RESP bulk 编码——这正是能把 min/max 换位这种 bug 测出来的地方。
-    try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "$1\r\n3\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "$2\r\n20\r\n") != null);
+    // 不能只分别查 "ZRANGEBYSCORE" / key / "$1\r\n3\r\n" / "$2\r\n20\r\n"
+    // 这几个子串是否存在：min/max 被换位成 "... 20 3" 时，四段子串依然
+    // 全部存在，只是相对顺序变了，四条独立的 indexOf 会全部通过，测不出
+    // 换位。改成断言整条命令帧——命令名、key、min、max 的相对位置一起钉
+    // 死在一个连续字节串里，换位会让这个字节串在整个流里都找不到。
+    // 帧内容照抄 resp.encodeCommand 的编码格式：
+    // "*{参数个数}\r\n" + 每个参数 "${长度}\r\n{内容}\r\n"，
+    // 参数依次是 ZRANGEBYSCORE、key_bylen（"hikari:bylen"，12 字节）、
+    // "3"（1 字节）、"20"（2 字节），共 4 个参数。
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fake.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$12\r\nhikari:bylen\r\n$1\r\n3\r\n$2\r\n20\r\n",
+    ) != null);
 }
 
 // ---------------------------------------------------------------------------

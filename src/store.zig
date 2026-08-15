@@ -830,13 +830,20 @@ test "randomByLength 用 ZRANGEBYSCORE 拿候选再 HGETALL 取回整条语录" 
 
     c.deinit();
     srv.stop();
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "ZRANGEBYSCORE") != null);
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_bylen) != null);
-    // 不能只查子串 "5" / "10"：那两个数字前缀恰好也出现在流里到处都是的
-    // "$5\r\n" bulk 长度头里，查子串永远为真，测不出 min/max 是否真的被发送。
-    // 改成匹配 RESP 里 min/max 各自的完整 bulk 编码。
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "$1\r\n5\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "$2\r\n10\r\n") != null);
+    // 不能分别独立查 "ZRANGEBYSCORE" / key / "$1\r\n5\r\n" / "$2\r\n10\r\n"
+    // 是否存在：min/max 被换位成 "... 10 5" 时，四段子串依然全部存在，
+    // 只是相对顺序变了，四条独立的 indexOf 会全部通过，测不出换位。
+    // 改成断言整条命令帧——命令名、key、min、max 的相对位置一起钉死在一个
+    // 连续字节串里，换位会让这个字节串在整个流里都找不到。帧内容照抄
+    // resp.encodeCommand 的编码格式："*{参数个数}\r\n" + 每个参数
+    // "${长度}\r\n{内容}\r\n"，参数依次是 ZRANGEBYSCORE、
+    // key_bylen（"hikari:bylen"，12 字节）、"5"（1 字节）、"10"（2 字节），
+    // 共 4 个参数。
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        srv.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$12\r\nhikari:bylen\r\n$1\r\n5\r\n$2\r\n10\r\n",
+    ) != null);
 }
 
 test "randomByLength 候选为空数组时返回 null" {
