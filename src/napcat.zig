@@ -6,6 +6,13 @@ pub const star_emoji_id = "10024";
 /// 数值形式由字符串形式在 comptime 推导，两者不可能漂移。
 const star_emoji_id_num: i64 = std.fmt.parseInt(i64, star_emoji_id, 10) catch unreachable;
 
+/// 🔥 = U+1F525，同样以十进制码点做 emoji_id。用于"链式收录"：被观察者把一句话
+/// 拆成几条发，群友额外贴 🔥（在 ✨ 之外）标记它们应当拼成一条语录。
+pub const fire_emoji_id = "128293";
+/// 数值形式由字符串形式在 comptime 推导，两者不可能漂移——同 star_emoji_id_num
+/// 一样，这个模式此前真的漂移过一次。
+const fire_emoji_id_num: i64 = std.fmt.parseInt(i64, fire_emoji_id, 10) catch unreachable;
+
 pub const Error = error{
     NapCatError,
     BadResponse,
@@ -13,9 +20,9 @@ pub const Error = error{
     RequestFailed,
 };
 
-/// 在 get_msg 的 data 里判断有没有 ✨ 表情回应。
-/// emoji_id 可能是字符串也可能是数字；likes_cnt 缺省视为 1。
-pub fn hasStarReaction(data: std.json.Value) bool {
+/// hasStarReaction / hasFireReaction 共用的判定逻辑：emoji_id 可能是字符串也可能是
+/// 数字；likes_cnt 缺省视为 1。
+fn hasReaction(data: std.json.Value, id_str: []const u8, id_num: i64) bool {
     const obj = switch (data) {
         .object => |o| o,
         else => return false,
@@ -31,14 +38,25 @@ pub fn hasStarReaction(data: std.json.Value) bool {
         };
         const idv = io.get("emoji_id") orelse continue;
         const matches = switch (idv) {
-            .string => |s| std.mem.eql(u8, s, star_emoji_id),
-            else => if (onebot.asInt(idv)) |n| n == star_emoji_id_num else false,
+            .string => |s| std.mem.eql(u8, s, id_str),
+            else => if (onebot.asInt(idv)) |n| n == id_num else false,
         };
         if (!matches) continue;
         const cnt = if (io.get("likes_cnt")) |cv| (onebot.asInt(cv) orelse 1) else 1;
         if (cnt > 0) return true;
     }
     return false;
+}
+
+/// 在 get_msg 的 data 里判断有没有 ✨ 表情回应。
+pub fn hasStarReaction(data: std.json.Value) bool {
+    return hasReaction(data, star_emoji_id, star_emoji_id_num);
+}
+
+/// 在 get_msg 的 data 里判断有没有 🔥 表情回应。跟 hasStarReaction 读的是同一个
+/// get_msg 响应体，不需要额外调用。
+pub fn hasFireReaction(data: std.json.Value) bool {
+    return hasReaction(data, fire_emoji_id, fire_emoji_id_num);
 }
 
 /// 把 get_msg 的 data 里出现过的**全部** emoji_id 收成一行 `id×次数` 文本
@@ -212,6 +230,50 @@ test "hasStarReaction 缺省 likes_cnt 按 1 计（视为存在但未计数）" 
     const a = ar.allocator();
     const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"10024\"}]}");
     try std.testing.expect(hasStarReaction(v));
+}
+
+test "hasFireReaction 识别 🔥 表情回应，与 ✨ 互不干扰" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const both = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"10024","emoji_type":"2","likes_cnt":1},
+        \\                     {"emoji_id":"128293","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(hasStarReaction(both));
+    try std.testing.expect(hasFireReaction(both));
+
+    const star_only = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"10024","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(hasStarReaction(star_only));
+    try std.testing.expect(!hasFireReaction(star_only));
+
+    const fire_only = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"128293","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(!hasStarReaction(fire_only));
+    try std.testing.expect(hasFireReaction(fire_only));
+
+    const neither = try parseVal(a, "{\"emoji_likes_list\":[]}");
+    try std.testing.expect(!hasFireReaction(neither));
+}
+
+test "hasFireReaction 接受数字形式的 emoji_id" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":128293}]}");
+    try std.testing.expect(hasFireReaction(v));
+}
+
+test "hasFireReaction 忽略 likes_cnt 为 0 的条目" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"128293\",\"likes_cnt\":0}]}");
+    try std.testing.expect(!hasFireReaction(v));
 }
 
 test "emojiIdsSummary 列出全部 emoji_id 与计数（首次实跑核对 star_emoji_id 用）" {

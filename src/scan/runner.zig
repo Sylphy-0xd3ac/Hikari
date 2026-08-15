@@ -743,26 +743,33 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         if (try onebot.parseMessage(a, data)) |parsed| try pool.append(a, parsed);
     }
 
-    // ---- 4. 逐条查被观察者消息的表情回应 ----
+    // ---- 4. 逐条查被观察者消息的表情回应（✨ 与 🔥 共用同一次 get_msg，不额外调用）----
     var star_ids: std.ArrayList(i64) = .empty;
+    var fire_ids: std.ArrayList(i64) = .empty;
     for (window.items) |m| {
         if (m.user_id != deps.observed_qq) continue;
         const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: star-reaction probe for message {d} failed", .{ gid, m.message_id });
             continue;
         };
+        var matched = false;
         if (napcat.hasStarReaction(data)) {
             try star_ids.append(a, m.message_id);
-            continue;
+            matched = true;
         }
+        if (napcat.hasFireReaction(data)) {
+            try fire_ids.append(a, m.message_id);
+            matched = true;
+        }
+        if (matched) continue;
         // design.md §3.3 要求把未匹配的 emoji_id 打进日志，README 线上假设 #4
         // 靠它核对 ✨ 的真实 emoji_id：这个常量要是错了，扫描器一条都收不到，
         // 现象跟"今天真的没人贴 ✨"一模一样，不会报任何错。只在这条消息确实有
         // 表情回应、且一个都没匹配上时打，避免给没有任何回应的消息刷屏。
         const seen = napcat.emojiIdsSummary(a, data) catch continue;
         if (seen.len > 0) std.log.info(
-            "group {d}: message {d} carries emoji reactions but none matched star_emoji_id={s}: {s}",
-            .{ gid, m.message_id, napcat.star_emoji_id, seen },
+            "group {d}: message {d} carries emoji reactions but none matched star_emoji_id={s} or fire_emoji_id={s}: {s}",
+            .{ gid, m.message_id, napcat.star_emoji_id, napcat.fire_emoji_id, seen },
         );
     }
 
@@ -778,7 +785,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     );
 
     // ---- 5. 判定 ----
-    var outcome = try rules.classify(deps.gpa, window.items, pool.items, star_ids.items, .{
+    var outcome = try rules.classify(deps.gpa, window.items, pool.items, star_ids.items, fire_ids.items, .{
         .observed_qq = deps.observed_qq,
         .admin_qqs = deps.admin_qqs,
     });
