@@ -271,8 +271,9 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 ## 7. 运行日志
 
 每次定时运行，`QQ_GROUP_IDS` 中的每一个群各收到**一条**合并转发（合并转发／聊天记录）消息，
-用 `send_group_forward_msg` 发送。这七行文案与原先逐条发送时逐字相同，只是不再各自单独一条
-`send_group_msg`，而是各占一个 `node`，合并转发的消息顺序即节点顺序：
+用 `send_group_forward_msg` 发送。前六行文案与原先逐条发送时逐字相同，只是不再各自单独一条
+`send_group_msg`，而是各占一个 `node`，合并转发的消息顺序即节点顺序（第七行后来加了耗时，
+见下文）：
 
 ```
 Hikari!
@@ -281,10 +282,13 @@ Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy
 Processing...
 Will process 1234 messages.
 Added 12 messages, skipped 34 messages.
-Successfully.
+Successfully in 87s.
 ```
 
-`N` 是窗口内消息总数，`X` 是本次新入库条数，`Y` 是被各关卡拦下的候选数。
+`N` 是窗口内消息总数，`X` 是本次新入库条数，`Y` 是被各关卡拦下的候选数，`Successfully in
+{d}s.` 里的秒数是这个群从 `scanGroup` 开始处理、到这一行成文为止的耗时，向下取整到整秒
+（负值/时钟跳变时钳制到 0）——只测这个群自己这一轮的处理时长，不是整个运行的总时长，也不
+包含 `resolveWindowStart` 那次 Redis 读。
 
 运行中抛出异常时，最后一行替换为 `Failed: <原因>`。
 
@@ -313,7 +317,8 @@ Successfully.
 
 七行文案的产生时机跟原来一样：前四行（横幅三行 + `Processing...`）在扫描开始前就已确定；
 `Will process N messages.` 要等翻页拉完历史才知道；`Added X, skipped Y` 与最后一行（
-`Successfully.` 或 `Failed: <原因>`）要等落库结束才知道。这些行在产生的当下被追加进这个群
+`Successfully in {d}s.` 或 `Failed: <原因>`）要等落库结束才知道。`Failed:` 那一行故意不带
+耗时——一次失败跑的耗时不提供任何信息。这些行在产生的当下被追加进这个群
 待发的队列里，**扫描全程结束（不论成功还是中途出错）时才一次性打包发出**。
 
 一个群在扫描中途真的崩溃（不是"落库遇到几条失败"那种软失败，而是分页/判定阶段的硬错误）

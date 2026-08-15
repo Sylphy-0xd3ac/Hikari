@@ -16,7 +16,6 @@ pub const banner = [3][]const u8{
     "Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy",
 };
 pub const processing_line = "Processing...";
-pub const success_line = "Successfully.";
 
 pub fn willProcessLine(gpa: std.mem.Allocator, n: usize) ![]u8 {
     return std.fmt.allocPrint(gpa, "Will process {d} messages.", .{n});
@@ -28,6 +27,18 @@ pub fn resultLine(gpa: std.mem.Allocator, added: usize, skipped: usize) ![]u8 {
 
 pub fn failedLine(gpa: std.mem.Allocator, reason: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "Failed: {s}", .{reason});
+}
+
+/// 收尾行，带上这个群这一轮扫描花了多少整秒——运营方要求的改动，同一枚硬币
+/// 的另一面是 `Failed:` 那一行故意不带耗时（一次失败跑的耗时不提供任何信息，
+/// 见 scanGroup 里 trouble.any() 分支）。`elapsed_s` 允许是负数（时钟被 NTP
+/// 往回拨、或者注入的测试时钟本身没保证单调）时钳制到 0——打印一个负的耗时
+/// 比"看起来耗时为 0"更让人费解，0 至少是个诚实的"测不出来"信号。跟其他三个
+/// builder（willProcessLine/resultLine/failedLine）同一种签名形状、同一种
+/// allocator 纪律：一次 allocPrint，失败原样把 OOM error 交给调用方。
+pub fn successLine(gpa: std.mem.Allocator, elapsed_s: i64) ![]u8 {
+    const clamped: i64 = if (elapsed_s > 0) elapsed_s else 0;
+    return std.fmt.allocPrint(gpa, "Successfully in {d}s.", .{clamped});
 }
 
 /// 一个群这一轮里出的岔子。三类分开计数，因为它们的后果不一样，运营方需要
@@ -163,6 +174,15 @@ pub const Deps = struct {
     /// 给它消退。默认 300ms。测试把它设成 0：既不依赖真实时钟就能覆盖"先失败一次、
     /// 重试成功"的路径，也不会为了跑测试套件真的等一次 300ms。
     get_msg_retry_delay_ns: u64 = 300 * std.time.ns_per_ms,
+    /// scanGroup 拿来量"这个群这一轮扫了多久"的挂钟读数源，默认就是本仓库其它
+    /// 地方都在用的 `std.time.timestamp`（main.zig 的调度循环、hikari import
+    /// 都是这一个）——特意不引入单独的单调时钟抽象，耗时本来就只要求秒级精度，
+    /// 犯不上为它多背一套时钟类型。做成函数指针字段纯粹是为了可测：一次
+    /// scanGroup 调用里恰好读两次（进入时、Successfully 那一行成文时），
+    /// 生产路径两次读的都是真实墙钟；测试把它换成一个每次调用按固定序列出值
+    /// 的桩函数，这样端到端测试锁死的那段 JSON 字节里，耗时数字就不再是
+    /// "測出来" 的、跑多慢都不一样的噪声，而是测试自己钦定的确定值。
+    clock: *const fn () i64 = std.time.timestamp,
 };
 
 /// 一个群这一轮里 getMsg 重试的效果统计：命中过重试的调用次数，以及重试真的把
@@ -621,6 +641,15 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // `a` 与 `lines` 由 runOnce 传入并拥有——它们的寿命跨过这次调用本身
     // （包括这次调用以 `try` 错误告终的情形），理由见 runOnce 里对应注释。
 
+    // "这个群这一轮扫了多久"从这里开始计时——scanGroup 一进来就是"这个群的
+    // 处理"真正开始的地方（resolveWindowStart 那次 Redis 读已经在 runOnce
+    // 里做完了，不计入这段耗时，它反映的是这个群该看多远，不是这个群本身
+    // 处理花了多久）。收尾时（Successfully 那一行成文、也就是 sendForward
+    // 真正打包这批 node 之前的最后一刻）再读一次同一个 deps.clock，两次之差
+    // 就是要打进第七行的数字。Failed 路径不读第二次——那几个 return false
+    // 分支都在这次读之前，耗时对一次失败的跑没有意义，spec 明确不要。
+    const started_at = deps.clock();
+
     // ---- 1. 翻页拉历史，窗口外再多拉一页作解析缓冲 ----
     var pool: std.ArrayList(onebot.Message) = .empty;
     var before: ?i64 = null;
@@ -668,7 +697,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // 翻页没走到窗口起点 = 这一轮只看到了窗口的一部分，而 runOnce 之后照样会
     // setLastRun，漏掉的那一段永远不会被重扫。漏掉的不只是语录（那还有明天的
     // 窗口兜一次），还有作废指令——💦 只会被看到一次，漏了就是永久漏了。
-    // 所以这里必须留下可见的痕迹，而不是安静地按截断后的结果报 Successfully.。
+    // 所以这里必须留下可见的痕迹，而不是安静地按截断后的结果报 Successfully in Ns.。
     if (!reached_start) {
         std.log.warn(
             "group {d}: history window NOT fully covered — stopped after {d} page(s) with {d} message(s) pooled, before reaching window start {d}; reason: {s}. Messages and 💦 revocations older than this run's oldest page were never examined and will not be revisited.",
@@ -763,13 +792,13 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     var trouble: Trouble = .{};
     for (outcome.revoked) |rid| {
         deps.st.revoke(rid) catch |e| {
-            // 作废失败必须跟入库失败一样压掉 Successfully. 与 setLastRun。
+            // 作废失败必须跟入库失败一样压掉 Successfully in Ns. 与 setLastRun。
             // 压掉 setLastRun 现在还带一个好处：resolveWindowStart 按 last_run
             // 算窗口起点，这个群的 last_run 不动，下一次扫描（无论是重启补跑
             // 还是正常触发）的窗口会从旧起点重新覆盖到这条消息（受 7 天回看
             // 上限约束），撤稿请求还有机会重放，不是"这条 💦 明天就永久丢失"
             // 了——那是固定 24h 窗口时代的行为。只打一条 warn 然后照常报
-            // Successfully. 才是这个产品里最坏的失败模式，所以必须压掉。
+            // Successfully in Ns. 才是这个产品里最坏的失败模式，所以必须压掉。
             std.log.warn("group {d}: revoke {d} failed: {s}", .{ gid, rid, @errorName(e) });
             trouble.revoke_failed += 1;
             trouble.last_err = @errorName(e);
@@ -853,7 +882,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     const result = try resultLine(a, added, skipped);
     pushLine(a, lines, gid, result);
 
-    // 出过岔子就不能用 Successfully. 收尾——那是运营方唯一的"这次跑成功了"信号。
+    // 出过岔子就不能用 Successfully in Ns. 收尾——那是运营方唯一的"这次跑成功了"信号。
     // 改发 Failed 行，带上各类失败的条数与最后一次的错误原因。
     if (trouble.any()) {
         const reason = try troubleReason(a, trouble);
@@ -862,7 +891,9 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         return false;
     }
 
-    pushLine(a, lines, gid, success_line);
+    const elapsed_s = deps.clock() - started_at;
+    const msg = try successLine(a, elapsed_s);
+    pushLine(a, lines, gid, msg);
     return true;
 }
 
@@ -878,7 +909,6 @@ test "banner 三行文案逐字正确" {
 
 test "固定行文案正确" {
     try std.testing.expectEqualStrings("Processing...", processing_line);
-    try std.testing.expectEqualStrings("Successfully.", success_line);
 }
 
 test "willProcessLine 格式" {
@@ -904,6 +934,24 @@ test "resultLine 处理 0/0" {
     const a = try resultLine(gpa, 0, 0);
     defer gpa.free(a);
     try std.testing.expectEqualStrings("Added 0 messages, skipped 0 messages.", a);
+}
+
+test "successLine 格式：正常耗时、零耗时、负数被钳制到 0" {
+    const gpa = std.testing.allocator;
+
+    const a = try successLine(gpa, 42);
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings("Successfully in 42s.", a);
+
+    const b = try successLine(gpa, 0);
+    defer gpa.free(b);
+    try std.testing.expectEqualStrings("Successfully in 0s.", b);
+
+    // 时钟被往回拨（或者注入的测试时钟没保证单调）时 elapsed_s 可能是负的：
+    // 钳制到 0，不能把负号原样打进运营方看到的那一行。
+    const c = try successLine(gpa, -5);
+    defer gpa.free(c);
+    try std.testing.expectEqualStrings("Successfully in 0s.", c);
 }
 
 test "failedLine 格式" {
@@ -1512,13 +1560,13 @@ test "buildForwardBody：正常收尾时最后一个 node 是 Successfully，不
     try lines.append(a, processing_line);
     try lines.append(a, try willProcessLine(a, 0));
     try lines.append(a, try resultLine(a, 0, 0));
-    try lines.append(a, success_line);
+    try lines.append(a, try successLine(a, 7));
 
     const body = try buildForwardBody(a, 1, "1", lines.items);
     try std.testing.expect(std.mem.endsWith(
         u8,
         body,
-        "{\"type\":\"node\",\"data\":{\"user_id\":\"1\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Successfully.\"}}]}}]}",
+        "{\"type\":\"node\",\"data\":{\"user_id\":\"1\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Successfully in 7s.\"}}]}}]}",
     ));
 }
 
@@ -1746,6 +1794,107 @@ test "runOnce：scanGroup 中途硬失败（try 传播的错误）时仍然发�
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Failed: NapCatError\"}}]}}" ++
             "]}",
         nap_srv.bodies.items[2],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// deps.clock 的测试桩：runOnce 端到端测试要锁死 Successfully in Ns. 这一行
+// 的确切字节，不能让耗时取决于测试机跑多快。scanGroup 一次成功的调用恰好读
+// 两次 deps.clock（进入时、Successfully 成文时），这个桩按顺序把测试指定的
+// 读数吐回去，第三次及以后的调用重复最后一个值（防御性的——目前没有任何
+// 调用会读第三次，但把越界访问换成饱和读比让测试直接 panic 更容易定位问题）。
+
+var stub_clock_values: []const i64 = &.{};
+var stub_clock_calls: usize = 0;
+
+fn stubClock() i64 {
+    const idx = @min(stub_clock_calls, stub_clock_values.len - 1);
+    stub_clock_calls += 1;
+    return stub_clock_values[idx];
+}
+
+test "runOnce：正常收尾（没有 Trouble）时第七个 node 是 Successfully in Ns.，耗时由注入的 clock 决定" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // hikari:lastrun 未命中（nil）→ 退化成固定 24h 窗口；这个群这一轮判成功，
+    // applyLastRun 会补一次 SET，所以脚本要连着准备两条回复。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 五次 NapCat 调用：
+    //   1. get_login_info
+    //   2. get_group_msg_history 第一页就是空页——window 里没有消息，
+    //      不需要 get_msg 补拉或表情探测，把这个测试聚焦在 Successfully
+    //      那一行上，不掺进跟这条改动无关的分支。
+    //   3. get_group_info：成功
+    //   4. get_group_member_info：成功 → attributed=true，且没有候选，
+    //      trouble.any()==false，真正走到 Successfully 分支（不是 Failed）。
+    //   5. send_group_forward_msg：最终发出的合并转发
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"晴\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    // 两次读数相差 3——scanGroup 进入时读到 1_700_100_000，Successfully
+    // 成文时读到 1_700_100_003，第七行应该是 "Successfully in 3s."。
+    stub_clock_values = &.{ 1_700_100_000, 1_700_100_003 };
+    stub_clock_calls = 0;
+    defer {
+        stub_clock_values = &.{};
+        stub_clock_calls = 0;
+    }
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{88},
+        .clock = &stubClock,
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    // 这个群这一轮判成功：applyLastRun 确实补了一次 SET。
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "SET") != null);
+
+    try std.testing.expectEqual(@as(usize, 5), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":88,\"messages\":[" ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Hikari!\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Made with ❤️ by CuzTeam, AmethystDevs-Lab\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Will process 0 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 0 messages, skipped 0 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Successfully in 3s.\"}}]}}" ++
+            "]}",
+        nap_srv.bodies.items[4],
     );
 }
 
