@@ -187,6 +187,19 @@ pub fn classify(
 }
 
 /// 按 message_id 去重。已存在时：只有新来的是 admin_manual 而旧的不是，才替换。
+///
+/// 两个分支里的 free 都不能删——尤其是 else 分支那个，它不是死代码：
+///
+///   - else 分支（丢弃新来的 c）：**今天就会被走到**。c 是 admin_manual、
+///     existing 也是 admin_manual 时落到这里，而 admin_manual 是唯一带
+///     text_override 的路径，所以这个 free 真的在释放东西。触发条件是同一条
+///     管理员消息在 window 里出现了两次——README 线上假设 #2 正说明这很可能
+///     是 NapCat 的常态行为（`message_seq` 若是闭区间，相邻两页会重叠）。
+///     删掉它就是在团队已经预料会走到的路径上引入泄漏。
+///   - if 分支（替换掉 existing）：今天 existing.path != .admin_manual 意味着
+///     它是 star_reaction / quoted_star，两者的 text_override 恒为 null，所以
+///     这个 free 目前不会真的释放什么。保留它是为了将来新增带 text_override 的
+///     路径时不必回头补一次——代价只有一次 null 判断。
 fn appendCandidate(gpa: std.mem.Allocator, list: *std.ArrayList(Candidate), c: Candidate) !void {
     for (list.items) |*existing| {
         if (existing.message_id != c.message_id) continue;
@@ -427,6 +440,20 @@ test "去重：同一条消息被表情回应与引用 ✨ 同时命中 → 只�
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
     try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+}
+
+test "重复页：同一条路径3消息在窗口里出现两次 → 只留一条候选，且不泄漏 text_override" {
+    const gpa = std.testing.allocator;
+    // README 线上假设 #2：`message_seq` 若是闭区间，相邻两页会重叠，同一条
+    // 消息就会在 window 里出现两次。此时 appendCandidate 会为第二次也算出一份
+    // text_override，然后走 else 分支把它丢掉——那个 free 少了的话，
+    // std.testing.allocator 会在这个测试上报泄漏。这就是为什么那行不是死代码。
+    const m = textMsg(1, ADMIN, "✨ 手动补录测试");
+    const msgs = [_]onebot.Message{ m, m };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqualStrings("手动补录测试", out.candidates[0].text_override.?);
 }
 
 test "manualBody 单独可用" {

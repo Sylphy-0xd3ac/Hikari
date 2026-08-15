@@ -53,6 +53,12 @@ pub fn main() !void {
     {
         const now = std.time.timestamp();
         const off = scheduler.localOffsetSeconds(now);
+        // `catch null` 的后果是"当作从来没跑过"。注意方向：missedRun 只在
+        // last 早于今天该跑的时刻时才返回补跑时间，所以 null 会让补跑判断
+        // **退化成首次启动那条路**——真的漏跑了也不会被补上，而不是反过来
+        // 多触发一次扫描。多跑一次是无害的（exists/isTombstoned 挡重复），
+        // 漏跑不是；这里保持宽松是因为 Redis 刚起来读不到 lastrun 时不该
+        // 直接崩掉进程，代价记在这里。
         const last = scan_store.getLastRun() catch null;
         if (scheduler.missedRun(now, last, cfg.scan_hour, cfg.scan_minute, off)) |missed| {
             std.log.info("catching up on missed run at {d}", .{missed});
