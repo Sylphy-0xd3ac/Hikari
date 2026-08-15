@@ -421,6 +421,40 @@ pub fn runOnce(deps: Deps, run_at: i64) void {
     }
 }
 
+/// 翻页时锚点没能前进（`next_before == before`）：判断这是"翻到群历史最开头
+/// 了"这种合法终止，还是 NapCat 真的出了岔子。`message_seq` 是闭区间，锚点
+/// 消息本身会重复出现在锚定的那一页里，所以"锚点没前进"现在（`reverse_order:
+/// true` 修好之后）有两种截然不同的成因：
+///   - 这一页**只有锚点自己一条**：往回已经没有更老的消息了，翻到了群历史
+///     的最开头，是正常收尾。
+///   - 这一页不止一条，或者那一条不是锚点本身：锚点没有真的推进过，这是
+///     生产上第一轮踩到的那种 NapCat 原样返回同一页的真异常。
+/// 精确判据要求"只有一条，且就是锚点本身"而不是只看长度——单看长度==1
+/// 挡不住"长度恰好是 1 但内容不是锚点"这种仍然异常的情况被悄悄放过。
+///
+/// 抽成纯函数的理由同 pageStopReason：这个判断本身不发 HTTP，能单测；
+/// scanGroup 只根据返回值决定要不要打 `NOT fully covered ... will not be
+/// revisited` 那行警告——合法到达历史开头时绝不能打这行，那正是重跑之后
+/// 运营方拿来确认这次翻页方向修复是否生效的日志，一次假警报就会把人指向
+/// 一个不存在的 NapCat 问题。
+pub const NoAdvanceOutcome = struct {
+    reached_start: bool,
+    stop_reason: []const u8,
+};
+
+pub fn noAdvanceOutcome(msgs: []const onebot.Message, anchor: i64) NoAdvanceOutcome {
+    if (msgs.len == 1 and msgs[0].message_id == anchor) {
+        return .{
+            .reached_start = true,
+            .stop_reason = "anchor-only page (reached the start of the group's history)",
+        };
+    }
+    return .{
+        .reached_start = false,
+        .stop_reason = "pagination anchor stopped advancing (NapCat returned the same page again)",
+    };
+}
+
 /// 扫单个群。返回值不是错误通道——它是 runOnce 判断是否调用 setLastRun 用的
 /// 成功信号：true = 这个群从头到尾没出岔子（哪怕 Added/skipped 都是 0）；
 /// false = 落库阶段出现了至少一次 store.add 失败（已经在函数内部发了
@@ -461,8 +495,10 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
             stop_reason = "page carried no usable message_id";
             break;
         };
-        if (before != null and next_before == before.?) { // 不再前进，防死循环
-            stop_reason = "pagination anchor stopped advancing (NapCat returned the same page again)";
+        if (before != null and next_before == before.?) { // 不再前进：判断是不是翻到头了
+            const outcome = noAdvanceOutcome(page.msgs, before.?);
+            stop_reason = outcome.stop_reason;
+            if (outcome.reached_start) reached_start = true;
             break;
         }
         before = next_before;
@@ -1050,6 +1086,55 @@ test "oldestId 时间并列时按 message_id 取最小者，与输入顺序无�
         .{ .message_id = 9, .user_id = 1, .time = 300, .segments = &.{} },
     };
     try std.testing.expectEqual(@as(?i64, 2), oldestId(&b_first));
+}
+
+// ---------------------------------------------------------------------------
+// noAdvanceOutcome：翻页锚点没能前进时，区分"翻到群历史最开头了"（合法收尾，
+// 不该打 NOT fully covered 警告）与"NapCat 真的又出岔子了"（异常，该打）。
+// reverse_order 改成 true 之前，锚点没前进只可能是后一种；改完之后闭区间锚点
+// 让前一种变得可达，这里锁死两条分支各自的 reached_start 与 stop_reason，
+// 不满足于只断言其中一个字段——那样挡不住"该 true 却传了 false"或反过来。
+
+test "noAdvanceOutcome：页面只有锚点自己一条 → 判定为翻到历史开头，reached_start=true" {
+    const anchor_id: i64 = 555;
+    const msgs = [_]onebot.Message{
+        .{ .message_id = anchor_id, .user_id = 1, .time = 100, .segments = &.{} },
+    };
+    const outcome = noAdvanceOutcome(&msgs, anchor_id);
+    try std.testing.expectEqual(true, outcome.reached_start);
+    try std.testing.expectEqualStrings(
+        "anchor-only page (reached the start of the group's history)",
+        outcome.stop_reason,
+    );
+}
+
+test "noAdvanceOutcome：页面不止一条（即便都没前进）→ 判定为真异常，reached_start=false" {
+    const anchor_id: i64 = 555;
+    // 锚点本身仍在页里（闭区间），但还带着别的消息——如果锚点真的没推进过，
+    // 这不是"翻到头了"，是 NapCat 原样返回了同一页。
+    const msgs = [_]onebot.Message{
+        .{ .message_id = anchor_id, .user_id = 1, .time = 100, .segments = &.{} },
+        .{ .message_id = 42, .user_id = 1, .time = 90, .segments = &.{} },
+    };
+    const outcome = noAdvanceOutcome(&msgs, anchor_id);
+    try std.testing.expectEqual(false, outcome.reached_start);
+    try std.testing.expectEqualStrings(
+        "pagination anchor stopped advancing (NapCat returned the same page again)",
+        outcome.stop_reason,
+    );
+}
+
+test "noAdvanceOutcome：单条但不是锚点本身 → 仍判定为真异常（不能只看长度）" {
+    const anchor_id: i64 = 555;
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 999, .user_id = 1, .time = 100, .segments = &.{} },
+    };
+    const outcome = noAdvanceOutcome(&msgs, anchor_id);
+    try std.testing.expectEqual(false, outcome.reached_start);
+    try std.testing.expectEqualStrings(
+        "pagination anchor stopped advancing (NapCat returned the same page again)",
+        outcome.stop_reason,
+    );
 }
 
 // ---------------------------------------------------------------------------
