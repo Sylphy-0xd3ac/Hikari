@@ -28,7 +28,10 @@ pub const Client = struct {
         password: ?[]const u8,
         db: u32,
     ) Error!Client {
-        const stream = std.net.tcpConnectToHost(gpa, host, port) catch return error.ConnectionFailed;
+        const stream = std.net.tcpConnectToHost(gpa, host, port) catch |e| switch (e) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.ConnectionFailed,
+        };
         errdefer stream.close();
 
         const read_buf = try gpa.alloc(u8, 64 * 1024);
@@ -66,6 +69,7 @@ pub const Client = struct {
     }
 
     pub fn command(self: *Client, args: []const []const u8) Error!resp.Value {
+        if (self.closed) return error.ConnectionFailed;
         const payload = try resp.encodeCommand(self.gpa, args);
         defer self.gpa.free(payload);
 
@@ -99,6 +103,7 @@ const FakeServer = struct {
     script: []const u8,
     received: std.ArrayList(u8),
     gpa: std.mem.Allocator,
+    stopped: bool,
 
     fn serve(self: *FakeServer) void {
         const conn = self.listener.accept() catch return;
@@ -123,6 +128,7 @@ const FakeServer = struct {
             .script = script,
             .received = .empty,
             .gpa = gpa,
+            .stopped = false,
         };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
@@ -133,8 +139,12 @@ const FakeServer = struct {
     }
 
     /// 只负责关监听与 join。`received` 的释放与 destroy 交给调用方，
-    /// 这样测试可以在 join 之后安全读取 `received`。
+    /// 这样测试可以在 join 之后安全读取 `received`。幂等：测试里既会显式调用一次，
+    /// 又会在 defer 里再调一次（用来兜住失败路径），第二次必须是空操作，
+    /// 否则会重复 join 已结束的线程、重复关闭监听 fd。
     fn stop(self: *FakeServer) void {
+        if (self.stopped) return;
+        self.stopped = true;
         self.listener.deinit();
         self.thread.join();
     }
@@ -161,6 +171,15 @@ test "connect 带密码与 db 时先发 AUTH 再发 SELECT" {
     const gpa = std.testing.allocator;
     // 依次回应 AUTH、SELECT、PING
     const srv = try FakeServer.start(gpa, "+OK\r\n+OK\r\n+PONG\r\n");
+    // stop() 是幂等的：happy path 下面会显式调用一次，这里的 defer 只在
+    // 提前失败（connect/command/expect 出错）时才真正生效，保证线程一定
+    // 被 join、fd 一定被关，不会在失败路径上残留一个还在跑的后台线程
+    // 或者卡在 accept() 里挂起整个测试。
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
 
     var c = try Client.connect(gpa, "127.0.0.1", srv.port(), "s3cret", 2);
     defer c.deinit();
@@ -182,8 +201,6 @@ test "connect 带密码与 db 时先发 AUTH 再发 SELECT" {
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "AUTH") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "s3cret") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SELECT") != null);
-    srv.received.deinit(gpa);
-    gpa.destroy(srv);
 }
 
 test "commandInt 读整数回复" {
@@ -215,6 +232,15 @@ test "服务端返回 -ERR 时转成 error.RedisError" {
 test "command 把参数编码成 RESP 数组发出去" {
     const gpa = std.testing.allocator;
     const srv = try FakeServer.start(gpa, "+OK\r\n");
+    // stop() 是幂等的：happy path 下面会显式调用一次，这里的 defer 只在
+    // 提前失败（connect/commandOk/expect 出错）时才真正生效，保证线程一定
+    // 被 join、fd 一定被关。
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+
     var c = try Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
     defer c.deinit();
     try c.commandOk(&.{ "SET", "key", "val" });
@@ -225,6 +251,4 @@ test "command 把参数编码成 RESP 数组发出去" {
     srv.stop();
 
     try std.testing.expectEqualStrings("*3\r\n$3\r\nSET\r\n$3\r\nkey\r\n$3\r\nval\r\n", srv.received.items);
-    srv.received.deinit(gpa);
-    gpa.destroy(srv);
 }
