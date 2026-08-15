@@ -35,7 +35,7 @@ Hikari 是一个常驻进程，做两件事：
 | 接口 | 用途 | 关键点 |
 |---|---|---|
 | `get_group_msg_history` | 翻页拉取群历史 | 入参 `group_id`, `message_seq`, `count`, `reverse_order`。**返回的消息不含 `emoji_likes_list`**。`message_seq` 吃的是 `message_id`（两者同一值域），`reverse_order` 是"从锚点朝哪个方向走"——`false` = 往新（更晚）走，`true` = 往旧（更早）走；不带 `message_seq` 时该字段被忽略（走 `getAioFirstViewLatestMsgs`）。`message_seq` 是闭区间：带锚点的一页会把锚点消息本身包含在内（`reverse_order: true` 时锚点是那一页里最新的一条）。2026-08-15 首次生产运行 + 针对真实 NapCat 的 `count=5` 手工探测已确认以上语义 |
-| `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]` |
+| `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]`；顶层还含 `user_id`（与 `sender.user_id` 一致，`onebot.parseMessage` 依赖这个顶层字段解出发送者）。2026-08-15 针对生产 NapCat 直接探测 `get_msg` 已确认，顶层 key 为 `emoji_likes_list, font, group_id, group_name, message, message_format, message_id, message_seq, message_type, post_type, raw_message, real_id, real_seq, self_id, sender, sub_type, time, user_id` |
 | `get_group_info` | 取群名 | 填充 hitokoto 的 `from` |
 | `get_group_member_info` | 取被观察者群名片 | 填充 hitokoto 的 `from_who` |
 | `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
@@ -67,6 +67,8 @@ shortId = MD5(msgId | chatType | peerUid) 的前 31 bit
 - Pass A / 路径 2 中，`reply` 指向的消息若在窗口之外且已被 LRU 淘汰，`get_msg` 会返回"消息不存在"。
 
 处理方式：这类失败**不视为致命错误**，记入 skip 并打印一条警告日志（含 `reply.data.id`），扫描继续。同时，翻页拉取历史时在窗口起点之外**额外多拉一页**作为缓冲，让"引用昨天早些时候的消息"这一最常见情形能在窗口内直接解析，不必走 `get_msg`。
+
+路径 2 反查依赖 `get_msg` 返回体顶层带 `user_id`（`onebot.parseMessage` 找不到顶层 `user_id` 时直接返回 null，效果等同于上面这条"消息不存在"的处理路径）。2026-08-15 针对生产 NapCat 直接探测 `get_msg` 已确认顶层 `user_id` 存在且与 `sender.user_id` 一致，这条假设成立：窗口外、走 LRU 反查这条路（只要没被 5000 条 LRU 淘汰）能正常解出发送者。
 
 ### 3.3 ✨ 的标识
 

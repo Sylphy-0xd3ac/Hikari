@@ -138,10 +138,9 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 ## 联调 Runbook
 
 首次针对真实 NapCat + Redis 联调时按这个顺序走。这里原本有四处 NapCat 线上行为仓库内验证不了，
-2026-08-15 首次生产运行 + 一次针对真实 NapCat 的手工探测（对 `get_group_msg_history` 用 `count=5`
-分别探测不带锚点 / `reverse_order=false` / `reverse_order=true` 三种调用）已经把其中三条坐实，
-详见下面小节；只剩 #3 还要等真的走到 `get_msg` 反查那条路才能核对，仍按下面的方法核对，出问题时
-照着改代码。
+2026-08-15 首次生产运行 + 两次针对真实 NapCat 的手工探测（一次对 `get_group_msg_history` 用
+`count=5` 分别探测不带锚点 / `reverse_order=false` / `reverse_order=true` 三种调用，一次直接对
+`get_msg` 探测）已经把全部四条坐实，详见下面小节；仍按下面的方法核对，出问题时照着改代码。
 
 ### 步骤
 
@@ -176,10 +175,9 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
    curl 'http://127.0.0.1:8080/?min_length=1&max_length=5'
    curl -i 'http://127.0.0.1:8080/?charset=gbk'   # 应为 400
    ```
-6. 记录联调结果，尤其是第 3 点里 `get_msg` 的顶层 `user_id`——这是四条线上假设里唯一还没被
-   坐实的一条（见下）。
+6. 记录联调结果备查。
 
-### 五个 NapCat 线上假设：四个已被坐实，一个仍待核对
+### 五个 NapCat 线上假设：全部已被坐实
 
 核对全靠进程自己的 stderr 日志。**按上面推荐的 `-Doptimize=ReleaseSafe` 构建时 `std.log` 的默认
 级别恰好是 `info`**，下面用到的 `info` 行开箱即可见；用 `ReleaseFast` / `ReleaseSmall` 构建则只剩
@@ -212,11 +210,21 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
    「页数 − 1」条。这不会污染数据——`rules.appendCandidate` 按 `message_id` 去重会挡住重复——是
    刻意接受的行为，**不需要**在 `fetchPage` / 翻页循环里另外去重，看日志时知道这个数会偏高即可。
 
-3. **`get_msg` 是否返回顶层 `user_id`——仍未验证。** `onebot.parseMessage` 解析 `get_msg` 的返回时，
-   如果找不到顶层 `user_id` 会直接返回 null，导致所有需要单独 `get_msg` 才能解析出发送者的引用目标
-   （窗口外、走 LRU 反查那条路）都无法解析，日志会看到大量「unresolvable」警告。首次生产运行没有
-   触发这条路径（窗口内的引用都能直接从池子里解出发送者）。核对方法：手动引用一条窗口外的旧消息
-   触发这条路径，看警告是否符合预期（应该是偶发，不应该是全部）。
+3. **`get_msg` 是否返回顶层 `user_id`——已确认，针对生产 NapCat 手工探测坐实。** `onebot.parseMessage`
+   解析 `get_msg` 的返回时，如果找不到顶层 `user_id` 会直接返回 null，导致所有需要单独 `get_msg`
+   才能解析出发送者的引用目标（窗口外、走 LRU 反查那条路，即路径 2 的跨窗口情形）都无法解析，日志
+   会看到大量「unresolvable」警告，且与正常的 LRU 淘汰情形从日志上无法区分。首次生产运行没有触发
+   这条路径（窗口内的引用都能直接从池子里解出发送者），因此另外对真实 NapCat 的 `get_msg` 做了一次
+   直接探测：对一条真实群消息调用 `get_msg`，返回的顶层 key 为
+
+   ```
+   ['emoji_likes_list', 'font', 'group_id', 'group_name', 'message', 'message_format',
+    'message_id', 'message_seq', 'message_type', 'post_type', 'raw_message', 'real_id',
+    'real_seq', 'self_id', 'sender', 'sub_type', 'time', 'user_id']
+   ```
+
+   顶层 `user_id`（本次探测中为 `3303289608`）与 `sender.user_id` 一致，`message_id` / `time` /
+   `message_type` / `emoji_likes_list` 也均在顶层出现。假设成立：跨窗口的路径 2 反查可以正常工作。
 
 4. **✨ 的 `emoji_id` 是 `"10024"`——已确认，由生产数据坐实。** 定义在 `src/napcat.zig` 的
    `star_emoji_id` 常量，全仓库只这一处。首次生产运行通过 ✨ 收到了 6 条真实语录（`10024` 匹配
@@ -259,9 +267,9 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 - 有本地 Redis 可用时，用合法 Redis 配置 + 不存在的 NapCat 地址运行，HTTP 服务仍能正常启动；对空库
   发请求返回 404 JSON 错误体。
 
-**没有验证过的部分**：需要真实 NapCat 实例、真实 QQ 账号与群权限的联调（上面 Runbook 的步骤 3、4、
-以及「五个 NapCat 线上假设」小节里第 3 条——`get_msg` 是否返回顶层 `user_id`，五条里唯一还没被
-生产运行坐实的一条）——这需要人工执行，见上面的 Runbook。合并转发这条改动本身只做到了单元测试
+**没有验证过的部分**：需要真实 NapCat 实例、真实 QQ 账号与群权限的联调（上面 Runbook 的步骤 3、4，
+即在真实群里造数据、亲眼确认发出的合并转发消息与计数）——这需要人工执行，见上面的 Runbook。「五个
+NapCat 线上假设」小节列出的五条均已被坐实，不再属于这里的未验证部分。合并转发这条改动本身只做到了单元测试
 级别（起假 HTTP server 验证 `send_group_forward_msg`/`get_login_info` 请求体与 runOnce 的调用
 时序，见 `src/scan/runner.zig`），还没有对着真实群跑过一轮、亲眼确认收到的是一条折叠起来的合并
 转发消息而不是七条独立消息。
