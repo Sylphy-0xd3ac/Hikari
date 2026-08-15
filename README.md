@@ -122,7 +122,10 @@ set -a && source .env && set +a
    - 管理员发 `✨ 手动补录测试`（路径 3）；
    - 管理员引用其中一条候选，只回 `💦`（作废）。
 4. 等定时触发，确认群里收到七行运行日志（横幅三行 + `Processing...` + `Will process N messages.` +
-   `Added/skipped` + 每群一份）且计数合理。
+   `Added X messages, skipped Y messages.` + `Successfully.`，每群一份）且计数合理。
+   这一轮出过岔子时最后一行不是 `Successfully.` 而是 `Failed: ...`，原因串里会分别列出
+   作废失败、入库失败、群归属信息拿不到各多少条——三者任一发生都会压掉 `Successfully.`，
+   也会跳过 `hikari:lastrun` 的更新，好让下一次启动补跑。
 5. 用 curl 核对 HTTP 接口：
    ```bash
    curl 'http://127.0.0.1:8080/'
@@ -134,15 +137,28 @@ set -a && source .env && set +a
 
 ### 四个仓库内验证不了、只能靠实跑核对的 NapCat 线上假设
 
+核对全靠进程自己的 stderr 日志。**按上面推荐的 `-Doptimize=ReleaseSafe` 构建时 `std.log` 的默认
+级别恰好是 `info`**，下面用到的 `info` 行开箱即可见；用 `ReleaseFast` / `ReleaseSmall` 构建则只剩
+`err`，这些行会全部消失，联调期间不要用那两档。
+
 1. **翻页用的是 `message_id` 还是独立序列。** 本项目把上一页最老一条的 `message_id` 作为下一页
    `get_group_msg_history` 的 `message_seq` 入参。如果 NapCat 把 `message_seq` 当成一个跟
-   `message_id` 无关的独立序号，翻页会在第二页就跑偏。核对方法：观察日志里连续两页返回的消息是否
-   时间连续、没有跳跃或重复大段。
+   `message_id` 无关的独立序号，翻页会在第二页就跑偏。核对方法：扫描时每翻一页都会打一行
+
+   ```
+   group 123456: history page 0: 200 message(s); oldest message_id=... time=...; newest message_id=... time=...
+   ```
+
+   `grep 'history page'` 拿到全部页，看相邻两页的 `time` 是否首尾相接、没有跳跃或重复大段。
+   另外，如果翻页没能一直翻到窗口起点就停了，会额外打一行 `history window NOT fully covered`
+   的**警告**，里面带着翻了几页、共多少条、以及停下来的具体原因（翻到群历史开头 / 响应不是对象 /
+   一条都没解析出来 / 翻页锚点不再前进 / 200 页保护耗尽）。看到这行就说明这一轮只覆盖了窗口的
+   一部分，且漏掉的那一段不会被重扫——**包括漏掉的 💦 作废指令**，它只会被看到一次。
 
 2. **`message_seq` 边界是否是闭区间。** 如果是，每一页（除第一页外）都会把上一页最后一条消息重复
    收进来，`Will process N messages.` 会比实际值多报最多「页数 − 1」条。这不会污染数据（`message_id`
-   去重会挡住重复），但看日志容易以为哪里错了。核对方法：把每页首尾消息的 `message_id` 记下来，看
-   相邻两页有没有重叠。
+   去重会挡住重复），但看日志容易以为哪里错了。核对方法：同样看上面那些 `history page` 行，
+   相邻两页的 `oldest message_id` 与 `newest message_id` 有没有重叠。
 
 3. **`get_msg` 是否返回顶层 `user_id`。** `onebot.parseMessage` 解析 `get_msg` 的返回时，如果找不到
    顶层 `user_id` 会直接返回 null，导致所有需要单独 `get_msg` 才能解析出发送者的引用目标（窗口外、
@@ -151,10 +167,17 @@ set -a && source .env && set +a
 
 4. **✨ 的 `emoji_id` 是否真的是 `"10024"`。** 定义在 `src/napcat.zig` 的 `star_emoji_id` 常量，全仓库
    只这一处。**如果这个值不对，扫描器会一条都收不到，而且现象跟"今天真的没人贴 ✨"完全一样，不会报任何
-   错误。** 核对方法：找一条消息贴上 ✨，手动调用 `get_msg`（可以直接对 NapCat HTTP 接口发请求，也可以
-   看 Hikari 进程处理这条消息时打的日志），读 `emoji_likes_list` 里实际的 `emoji_id` 字段值。如果跟
-   `"10024"` 不一致，把 `src/napcat.zig` 里的 `star_emoji_id` 改成实际值——它同时驱动字符串和数值两种
-   比较，改这一处即可。
+   错误。** 核对方法：找一条被观察者发的消息贴上 ✨，等这一轮扫描跑过去。只要这条消息上有表情回应而
+   一个都没匹配上 `star_emoji_id`，进程就会打一行
+
+   ```
+   group 123456: message 78901 carries emoji reactions but none matched star_emoji_id=10024: 128x2, 9999x1
+   ```
+
+   冒号后面是这条消息上**实际出现过的全部** `emoji_id`（`id×次数`）。贴了 ✨ 却看到这行，说明 ✨ 的真实
+   id 就在那串里；把 `src/napcat.zig` 的 `star_emoji_id` 改成它即可——该常量同时驱动字符串和数值两种
+   比较，改这一处就够。反过来，贴了 ✨ 而这行**没出现**，说明 `10024` 匹配上了，假设成立。
+   （也可以直接对 NapCat HTTP 接口手工发一次 `get_msg` 读 `emoji_likes_list` 交叉验证。）
 
 ## 本仓库中实际验证过的部分
 

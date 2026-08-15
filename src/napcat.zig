@@ -41,6 +41,51 @@ pub fn hasStarReaction(data: std.json.Value) bool {
     return false;
 }
 
+/// 把 get_msg 的 data 里出现过的**全部** emoji_id 收成一行 `id×次数` 文本
+/// （用传入的 allocator 分配，扫描里传的是每个群一份的 arena）。
+///
+/// design.md §3.3 要求"扫描时把所有未匹配的 emoji_id 打进日志，便于首次实跑时
+/// 核对真实值"，README 线上假设 #4 也指着这条日志。hasStarReaction 只回 bool，
+/// 在里面直接打日志会让每个调用点（包括单元测试）都往 stderr 刷字，所以改成
+/// 把看到的 id 交回给调用方，由扫描器决定什么时候打——纯函数，可单测，测试输出
+/// 也保持干净。
+///
+/// 没有任何表情回应时返回空串：调用方用它来判断该不该打这一行，避免给绝大多数
+/// 压根没有回应的消息刷屏。
+pub fn emojiIdsSummary(gpa: std.mem.Allocator, data: std.json.Value) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var w = out.writer(gpa);
+
+    const obj = switch (data) {
+        .object => |o| o,
+        else => return out.toOwnedSlice(gpa),
+    };
+    const list = switch (obj.get("emoji_likes_list") orelse return out.toOwnedSlice(gpa)) {
+        .array => |a| a,
+        else => return out.toOwnedSlice(gpa),
+    };
+    for (list.items) |item| {
+        const io = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const idv = io.get("emoji_id") orelse continue;
+        if (out.items.len > 0) try w.writeAll(", ");
+        switch (idv) {
+            .string => |s| try w.print("{s}", .{s}),
+            else => if (onebot.asInt(idv)) |n| {
+                try w.print("{d}", .{n});
+            } else {
+                try w.writeAll("?");
+            },
+        }
+        const cnt = if (io.get("likes_cnt")) |cv| (onebot.asInt(cv) orelse 1) else 1;
+        try w.print("x{d}", .{cnt});
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 /// 校验 OneBot 统一响应壳，返回 data 字段。
 ///
 /// 信封本身不合法（status 缺失/非字符串，或 retcode 缺失/不可解析为整数）→ BadResponse。
@@ -167,6 +212,63 @@ test "hasStarReaction 缺省 likes_cnt 按 1 计（视为存在但未计数）" 
     const a = ar.allocator();
     const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"10024\"}]}");
     try std.testing.expect(hasStarReaction(v));
+}
+
+test "emojiIdsSummary 列出全部 emoji_id 与计数（首次实跑核对 star_emoji_id 用）" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const v = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"128","emoji_type":"1","likes_cnt":2},
+        \\                     {"emoji_id":"9999","emoji_type":"2"}]}
+    );
+    try std.testing.expectEqualStrings("128x2, 9999x1", try emojiIdsSummary(a, v));
+}
+
+test "emojiIdsSummary 接受数字形式的 emoji_id" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":76,\"likes_cnt\":3}]}");
+    try std.testing.expectEqualStrings("76x3", try emojiIdsSummary(a, v));
+}
+
+test "emojiIdsSummary 没有任何表情回应时返回空串（调用方据此不打日志）" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    try std.testing.expectEqualStrings("", try emojiIdsSummary(a, try parseVal(a, "{}")));
+    try std.testing.expectEqualStrings("", try emojiIdsSummary(a, try parseVal(a, "{\"emoji_likes_list\":[]}")));
+    try std.testing.expectEqualStrings("", try emojiIdsSummary(a, try parseVal(a, "{\"emoji_likes_list\":\"nope\"}")));
+    try std.testing.expectEqualStrings("", try emojiIdsSummary(a, try parseVal(a, "[]")));
+}
+
+test "emojiIdsSummary 也会列出已匹配的 ✨——调用方只在没匹配上时才打这行" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}");
+    try std.testing.expectEqualStrings("10024x1", try emojiIdsSummary(a, v));
+}
+
+fn emojiIdsSummaryUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const v = try parseVal(ar.allocator(),
+        \\{"emoji_likes_list":[{"emoji_id":"128","likes_cnt":2},{"emoji_id":9999}]}
+    );
+    const s = try emojiIdsSummary(gpa, v);
+    gpa.free(s);
+}
+
+test "OOM 回归：emojiIdsSummary 在任意分配点失败都不泄漏" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        emojiIdsSummaryUnderFailingAllocator,
+        .{},
+    );
 }
 
 test "extractData 校验 status 与 retcode" {

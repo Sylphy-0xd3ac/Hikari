@@ -239,12 +239,45 @@ fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8
     return "";
 }
 
+/// 一页历史的拉取结果。
+///
+/// `stop` 非空表示这一页没能提供继续翻页的依据，同时**说明是哪种情况**。
+/// 原先 fetchPage 对"翻到群历史开头了"（正常）和"NapCat 回了个看不懂的东西"
+/// （README 线上假设 #1 正在失效）都返回同一个 `&.{}`，两者在日志里完全无法
+/// 分辨；而后者意味着窗口没被完整覆盖，漏掉的不只是语录，还有作废指令——
+/// 作废指令漏掉就永远不会被重看一次。
+pub const Page = struct {
+    msgs: []onebot.Message,
+    stop: ?[]const u8,
+};
+
+/// 从 get_group_msg_history 的 data 与解析出的条数，判断"这一页为什么不能再往前翻"。
+/// null 表示这一页正常。抽成纯函数是为了能单测：翻页截断的可见性正是 I3 的全部内容，
+/// 而 fetchPage 本身要发 HTTP，测不了。
+pub fn pageStopReason(data: std.json.Value, parsed_len: usize) ?[]const u8 {
+    const obj = switch (data) {
+        .object => |o| o,
+        else => return "get_group_msg_history reply was not an object",
+    };
+    const arr = obj.get("messages") orelse
+        return "get_group_msg_history reply has no messages field";
+    if (parsed_len > 0) return null;
+    const raw_len: usize = switch (arr) {
+        .array => |items| items.items.len,
+        else => return "get_group_msg_history messages field is not an array",
+    };
+    return if (raw_len == 0)
+        "empty page (reached the start of the group's history)"
+    else
+        "page carried messages but none of them could be parsed";
+}
+
 fn fetchPage(
     deps: Deps,
     arena: std.mem.Allocator,
     group_id: u64,
     before_id: ?i64,
-) ![]onebot.Message {
+) !Page {
     var aw: std.Io.Writer.Allocating = .init(arena);
     if (before_id) |bid| {
         try std.json.Stringify.value(.{
@@ -261,12 +294,33 @@ fn fetchPage(
         }, .{}, &aw.writer);
     }
     const data = try deps.nap.callData(arena, "get_group_msg_history", aw.written());
-    const obj = switch (data) {
-        .object => |o| o,
-        else => return &.{},
+    const arr: std.json.Value = switch (data) {
+        .object => |o| o.get("messages") orelse .{ .null = {} },
+        else => .{ .null = {} },
     };
-    const arr = obj.get("messages") orelse return &.{};
-    return onebot.parseMessages(arena, arr);
+    // parseMessages 对 null / 非数组一律返回空切片，形状判断统一交给
+    // pageStopReason，这里不重复判一遍。
+    const msgs = try onebot.parseMessages(arena, arr);
+    return .{ .msgs = msgs, .stop = pageStopReason(data, msgs.len) };
+}
+
+/// 每页打一行 info：页序号、条数、最老/最新一条的 message_id 与 time。
+/// README 的两条线上假设都靠这行核对——#1（`message_seq` 是不是 `message_id`）
+/// 看相邻两页的时间是否连续、有没有大段跳跃；#2（`message_seq` 边界是否闭区间）
+/// 看相邻两页的首尾 message_id 有没有重叠。ReleaseSafe 下 std.log 的默认级别
+/// 就是 info，所以按 README 的推荐构建方式跑起来就能直接看到。
+fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
+    if (msgs.len == 0) return;
+    var oldest = msgs[0];
+    var newest = msgs[0];
+    for (msgs[1..]) |m| {
+        if (m.time < oldest.time or (m.time == oldest.time and m.message_id < oldest.message_id)) oldest = m;
+        if (m.time > newest.time or (m.time == newest.time and m.message_id > newest.message_id)) newest = m;
+    }
+    std.log.info(
+        "group {d}: history page {d}: {d} message(s); oldest message_id={d} time={d}; newest message_id={d} time={d}",
+        .{ gid, page_index, msgs.len, oldest.message_id, oldest.time, newest.message_id, newest.time },
+    );
 }
 
 fn getMsg(deps: Deps, arena: std.mem.Allocator, message_id: i64) ?std.json.Value {
@@ -331,21 +385,48 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     var before: ?i64 = null;
     var reached_start = false;
     var guard: usize = 0;
+    // 循环跑满 200 页而没走到任何一个 break 时留下的原因；下面每个 break
+    // 之前都会覆盖它。
+    var stop_reason: []const u8 = "page guard exhausted (200 pages)";
 
     while (guard < 200) : (guard += 1) {
         const page = try fetchPage(deps, a, gid, before);
-        if (page.len == 0) break;
-        try pool.appendSlice(a, page);
+        if (page.stop) |why| {
+            stop_reason = why;
+            break;
+        }
+        try pool.appendSlice(a, page.msgs);
+        logPage(gid, guard, page.msgs);
 
-        const oldest = oldestTime(page) orelse break;
-        const next_before = oldestId(page) orelse break;
-        if (before != null and next_before == before.?) break; // 不再前进，防死循环
+        const oldest = oldestTime(page.msgs) orelse {
+            stop_reason = "page carried no usable timestamp";
+            break;
+        };
+        const next_before = oldestId(page.msgs) orelse {
+            stop_reason = "page carried no usable message_id";
+            break;
+        };
+        if (before != null and next_before == before.?) { // 不再前进，防死循环
+            stop_reason = "pagination anchor stopped advancing (NapCat returned the same page again)";
+            break;
+        }
         before = next_before;
 
         // reached_start 单独一个标志就足以实现"再多拉一页"：本次迭代刚拉到的
         // 这一页就是缓冲页——上一轮已经看到过窗口外的消息了，这里再 break 出去。
         if (reached_start) break;
         if (oldest < win_start) reached_start = true;
+    }
+
+    // 翻页没走到窗口起点 = 这一轮只看到了窗口的一部分，而 runOnce 之后照样会
+    // setLastRun，漏掉的那一段永远不会被重扫。漏掉的不只是语录（那还有明天的
+    // 窗口兜一次），还有作废指令——💦 只会被看到一次，漏了就是永久漏了。
+    // 所以这里必须留下可见的痕迹，而不是安静地按截断后的结果报 Successfully.。
+    if (!reached_start) {
+        std.log.warn(
+            "group {d}: history window NOT fully covered — stopped after {d} page(s) with {d} message(s) pooled, before reaching window start {d}; reason: {s}. Messages and 💦 revocations older than this run's oldest page were never examined and will not be revisited.",
+            .{ gid, guard, pool.items.len, win_start, stop_reason },
+        );
     }
 
     // ---- 2. 切出判定集 ----
@@ -390,7 +471,19 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
             std.log.warn("group {d}: star-reaction probe for message {d} failed", .{ gid, m.message_id });
             continue;
         };
-        if (napcat.hasStarReaction(data)) try star_ids.append(a, m.message_id);
+        if (napcat.hasStarReaction(data)) {
+            try star_ids.append(a, m.message_id);
+            continue;
+        }
+        // design.md §3.3 要求把未匹配的 emoji_id 打进日志，README 线上假设 #4
+        // 靠它核对 ✨ 的真实 emoji_id：这个常量要是错了，扫描器一条都收不到，
+        // 现象跟"今天真的没人贴 ✨"一模一样，不会报任何错。只在这条消息确实有
+        // 表情回应、且一个都没匹配上时打，避免给没有任何回应的消息刷屏。
+        const seen = napcat.emojiIdsSummary(a, data) catch continue;
+        if (seen.len > 0) std.log.info(
+            "group {d}: message {d} carries emoji reactions but none matched star_emoji_id={s}: {s}",
+            .{ gid, m.message_id, napcat.star_emoji_id, seen },
+        );
     }
 
     // ---- 5. 判定 ----
@@ -687,6 +780,48 @@ fn buildQuoteUnderFailingAllocator(gpa: std.mem.Allocator) !void {
 
 test "OOM 回归：buildQuote 在任意分配点失败都不能泄漏之前已分配的字段" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, buildQuoteUnderFailingAllocator, .{});
+}
+
+fn jsonVal(arena: std.mem.Allocator, src: []const u8) !std.json.Value {
+    const p = try std.json.parseFromSlice(std.json.Value, arena, src, .{});
+    return p.value;
+}
+
+test "pageStopReason 区分「翻到头了」与「响应看不懂」" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // 正常页：能继续翻
+    try std.testing.expectEqual(
+        @as(?[]const u8, null),
+        pageStopReason(try jsonVal(a, "{\"messages\":[{}]}"), 1),
+    );
+
+    // 空数组 = 群历史到头了，属于正常收尾
+    try std.testing.expectEqualStrings(
+        "empty page (reached the start of the group's history)",
+        pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0).?,
+    );
+
+    // 下面三种都是"响应看不懂"，跟到头了必须能分辨——原先它们全都退化成同一个
+    // `&.{}`，日志里看不出区别，而这三种意味着窗口没被完整覆盖。
+    try std.testing.expectEqualStrings(
+        "page carried messages but none of them could be parsed",
+        pageStopReason(try jsonVal(a, "{\"messages\":[{\"nope\":1},{\"nope\":2}]}"), 0).?,
+    );
+    try std.testing.expectEqualStrings(
+        "get_group_msg_history reply has no messages field",
+        pageStopReason(try jsonVal(a, "{\"data\":[]}"), 0).?,
+    );
+    try std.testing.expectEqualStrings(
+        "get_group_msg_history reply was not an object",
+        pageStopReason(try jsonVal(a, "[]"), 0).?,
+    );
+    try std.testing.expectEqualStrings(
+        "get_group_msg_history messages field is not an array",
+        pageStopReason(try jsonVal(a, "{\"messages\":\"nope\"}"), 0).?,
+    );
 }
 
 test "inWindow 判定左闭右开区间" {
