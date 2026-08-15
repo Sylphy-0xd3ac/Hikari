@@ -289,11 +289,19 @@ fn fetchPage(
 ) !Page {
     var aw: std.Io.Writer.Allocating = .init(arena);
     if (before_id) |bid| {
+        // 线上探针实测：NapCat 把 reverse_order 解成"从锚点往哪个方向走"，
+        // 不是"结果要不要倒序"。reverse_order=false 从锚点往新的方向走，
+        // 拿 before_id（上一页最老的 message_id）当锚点时会原地把上一页
+        // 整页原样再拿一遍——生产上第一轮就是这么卡死在第 2 页的（同一页
+        // message_id/time 完全重复）。往回翻必须传 reverse_order=true。
+        // 另外 message_seq 是闭区间：锚点消息本身会再出现在这一页里，
+        // 这是刻意接受的重复（见 rules.appendCandidate 的去重与
+        // README 线上假设 #2），不在这里处理。
         try std.json.Stringify.value(.{
             .group_id = group_id,
             .message_seq = bid,
             .count = page_size,
-            .reverse_order = false,
+            .reverse_order = true,
         }, .{}, &aw.writer);
     } else {
         try std.json.Stringify.value(.{
@@ -874,6 +882,122 @@ test "pageStopReason 区分「翻到头了」与「响应看不懂」" {
     try std.testing.expectEqualStrings(
         "get_group_msg_history messages field is not an array",
         pageStopReason(try jsonVal(a, "{\"messages\":\"nope\"}"), 0).?,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// fetchPage 发出的 get_group_msg_history 请求体：线上曾经把 reverse_order 传
+// 反过（锚点翻页传了 false，NapCat 把 false 解成"从锚点往新的方向走"，于是
+// 原地把上一页整页重复拿一遍，生产上第一轮就卡在第 2 页）。这里直接起一个
+// 假 HTTP 服务器接住 fetchPage 真正发出的请求体，逐字段锁死——尤其是
+// reverse_order 的值——不满足于"JSON 能解析"这种弱断言，避免同类参数写反
+// 再次不被测试挡住。Fake 服务器沿用 napcat.zig「call 发出带 Bearer token
+// 的 POST 请求」那个测试的写法。
+
+const FetchPageFake = struct {
+    listener: std.net.Server,
+    gpa: std.mem.Allocator,
+    body: ?[]u8 = null,
+
+    fn serve(self: *@This()) void {
+        const conn = self.listener.accept() catch return;
+        defer conn.stream.close();
+        var rbuf: [8192]u8 = undefined;
+        var wbuf: [8192]u8 = undefined;
+        var sr = conn.stream.reader(&rbuf);
+        var sw = conn.stream.writer(&wbuf);
+        var hs = std.http.Server.init(sr.interface(), &sw.interface);
+        var req = hs.receiveHead() catch return;
+
+        var body_buf: [4096]u8 = undefined;
+        const body_reader = req.readerExpectNone(&body_buf);
+        self.body = body_reader.allocRemaining(self.gpa, .unlimited) catch null;
+
+        req.respond("{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}", .{
+            .status = .ok,
+            .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+        }) catch return;
+    }
+
+    fn start(gpa: std.mem.Allocator) !struct { fake: *FetchPageFake, thread: std.Thread, base: []u8 } {
+        const self = try gpa.create(FetchPageFake);
+        const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+        self.* = .{
+            .listener = try addr.listen(.{ .reuse_address = true }),
+            .gpa = gpa,
+        };
+        const th = try std.Thread.spawn(.{}, serve, .{self});
+        const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{self.listener.listen_address.getPort()});
+        return .{ .fake = self, .thread = th, .base = base };
+    }
+
+    fn finish(self: *FetchPageFake, gpa: std.mem.Allocator, th: std.Thread) void {
+        th.join();
+        if (self.body) |b| gpa.free(b);
+        self.listener.deinit();
+        gpa.destroy(self);
+    }
+};
+
+test "fetchPage 翻页锚点：reverse_order=true（往回翻），message_seq 传 before_id" {
+    const gpa = std.testing.allocator;
+    const started = try FetchPageFake.start(gpa);
+    defer gpa.free(started.base);
+    defer started.fake.finish(gpa, started.thread);
+
+    var nap = napcat.Client.init(gpa, started.base, "t");
+    defer nap.deinit();
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined, // fetchPage 不碰 deps.st
+        .observed_qq = 1,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+    };
+
+    _ = try fetchPage(deps, ar.allocator(), 999, 555);
+
+    try std.testing.expect(started.fake.body != null);
+    // 锁死整个请求体，而不是只查子串——查子串挡不住 reverse_order 那个 bool
+    // 被写反（"reverse_order":false 也会命中 "reverse_order" 子串匹配）。
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":999,\"message_seq\":555,\"count\":200,\"reverse_order\":true}",
+        started.fake.body.?,
+    );
+}
+
+test "fetchPage 首页（没有锚点）：不带 message_seq，reverse_order 仍是 false" {
+    const gpa = std.testing.allocator;
+    const started = try FetchPageFake.start(gpa);
+    defer gpa.free(started.base);
+    defer started.fake.finish(gpa, started.thread);
+
+    var nap = napcat.Client.init(gpa, started.base, "t");
+    defer nap.deinit();
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qq = 1,
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+    };
+
+    _ = try fetchPage(deps, ar.allocator(), 999, null);
+
+    try std.testing.expect(started.fake.body != null);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":999,\"count\":200,\"reverse_order\":false}",
+        started.fake.body.?,
     );
 }
 

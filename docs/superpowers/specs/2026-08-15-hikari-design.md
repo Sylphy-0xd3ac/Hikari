@@ -34,7 +34,7 @@ Hikari 是一个常驻进程，做两件事：
 
 | 接口 | 用途 | 关键点 |
 |---|---|---|
-| `get_group_msg_history` | 翻页拉取群历史 | 入参 `group_id`, `message_seq`, `count`, `reverse_order`。**返回的消息不含 `emoji_likes_list`** |
+| `get_group_msg_history` | 翻页拉取群历史 | 入参 `group_id`, `message_seq`, `count`, `reverse_order`。**返回的消息不含 `emoji_likes_list`**。`message_seq` 吃的是 `message_id`（两者同一值域），`reverse_order` 是"从锚点朝哪个方向走"——`false` = 往新（更晚）走，`true` = 往旧（更早）走；不带 `message_seq` 时该字段被忽略（走 `getAioFirstViewLatestMsgs`）。`message_seq` 是闭区间：带锚点的一页会把锚点消息本身包含在内（`reverse_order: true` 时锚点是那一页里最新的一条）。2026-08-15 首次生产运行 + 针对真实 NapCat 的 `count=5` 手工探测已确认以上语义 |
 | `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]` |
 | `get_group_info` | 取群名 | 填充 hitokoto 的 `from` |
 | `get_group_member_info` | 取被观察者群名片 | 填充 hitokoto 的 `from_who` |
@@ -103,10 +103,11 @@ QQ 表情回应有两类：`emoji_type=1` 是 QQ 系统表情（id 为两三位�
 
 ### 4.2 拉取
 
-1. 首次调用 `get_group_msg_history`（不带 `message_seq`）取最新一批，`count = 200`。
-2. 取批内最老一条的 `message_id` 作为下一次的 `message_seq`，继续往前翻。
-3. 终止条件：本批最老消息的 `time` 早于窗口起点**且已额外多拉一页**（3.2 节的解析缓冲），或返回空列表，或 `message_seq` 不再前进（防死循环）。
-4. 结果按 `time` 升序排列。落在窗口内的部分是**判定集**；窗口之外的缓冲页只用于解析 `reply` 目标，自身不参与 Pass A / Pass B 的判定。
+1. 首次调用 `get_group_msg_history`（不带 `message_seq`，`reverse_order: false`——该字段被忽略）取最新一批，`count = 200`。
+2. 取批内最老一条的 `message_id` 作为下一次的 `message_seq`，**并把 `reverse_order` 设为 `true`**（往更早的方向走）继续往前翻；`reverse_order: false` 会让 NapCat 原样返回同一页，永远翻不动（首次生产运行踩到过这个坑，见 3 节表格与 README 的线上假设记录）。
+3. `message_seq` 是闭区间，锚点消息本身会重复出现在下一页里（作为那一页最新的一条），所以每一页（除第一页外）都会把上一页最老的一条重复拉一遍；`Will process N messages.` 据此会比实际值多报最多「页数 − 1」条，不影响落库（按 `message_id` 去重）。
+4. 终止条件：本批最老消息的 `time` 早于窗口起点**且已额外多拉一页**（3.2 节的解析缓冲），或返回空列表，或 `message_seq` 不再前进（防死循环——含合法情形：本页只剩锚点自己一条，说明已经翻到群历史的最开头）。
+5. 结果按 `time` 升序排列。落在窗口内的部分是**判定集**；窗口之外的缓冲页只用于解析 `reply` 目标，自身不参与 Pass A / Pass B 的判定。
 
 ### 4.3 Pass A —— 收集作废指令
 

@@ -137,8 +137,11 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 
 ## 联调 Runbook
 
-首次针对真实 NapCat + Redis 联调时按这个顺序走。这里有四处 NapCat 线上行为，仓库内没有真实环境验证
-不了，第一次实跑正是检验它们的时机——按下面的方法逐一核对，出问题时照着改代码。
+首次针对真实 NapCat + Redis 联调时按这个顺序走。这里原本有四处 NapCat 线上行为仓库内验证不了，
+2026-08-15 首次生产运行 + 一次针对真实 NapCat 的手工探测（对 `get_group_msg_history` 用 `count=5`
+分别探测不带锚点 / `reverse_order=false` / `reverse_order=true` 三种调用）已经把其中三条坐实，
+详见下面小节；只剩 #3 还要等真的走到 `get_msg` 反查那条路才能核对，仍按下面的方法核对，出问题时
+照着改代码。
 
 ### 步骤
 
@@ -164,51 +167,61 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
    curl 'http://127.0.0.1:8080/?min_length=1&max_length=5'
    curl -i 'http://127.0.0.1:8080/?charset=gbk'   # 应为 400
    ```
-6. 记录联调结果，尤其是第 4 点里 ✨ 的 `emoji_id` 是否真的是 `10024`。
+6. 记录联调结果，尤其是第 3 点里 `get_msg` 的顶层 `user_id`——这是四条线上假设里唯一还没被
+   坐实的一条（见下）。
 
-### 四个仓库内验证不了、只能靠实跑核对的 NapCat 线上假设
+### 四个 NapCat 线上假设：三个已被 2026-08-15 首次生产运行坐实，一个仍待核对
 
 核对全靠进程自己的 stderr 日志。**按上面推荐的 `-Doptimize=ReleaseSafe` 构建时 `std.log` 的默认
 级别恰好是 `info`**，下面用到的 `info` 行开箱即可见；用 `ReleaseFast` / `ReleaseSmall` 构建则只剩
 `err`，这些行会全部消失，联调期间不要用那两档。
 
-1. **翻页用的是 `message_id` 还是独立序列。** 本项目把上一页最老一条的 `message_id` 作为下一页
-   `get_group_msg_history` 的 `message_seq` 入参。如果 NapCat 把 `message_seq` 当成一个跟
-   `message_id` 无关的独立序号，翻页会在第二页就跑偏。核对方法：扫描时每翻一页都会打一行
+1. **翻页锚点吃的确实是 `message_id`，但方向必须是 `reverse_order: true`——已确认，且已修复。**
+   本项目把上一页最老一条的 `message_id` 作为下一页 `get_group_msg_history` 的 `message_seq`
+   入参，这部分假设成立：手工探测证实 `get_msg` 返回的 `id`/`seq` 是同一个值。但首次生产运行的
+   日志暴露了另一个问题——第 1 页和第 2 页完全相同：
 
    ```
-   group 123456: history page 0: 200 message(s); oldest message_id=... time=...; newest message_id=... time=...
+   info: group ...: history page 0: 194 message(s); oldest message_id=1809600761 time=1786785467; newest message_id=1344602200 time=1786790521
+   info: group ...: history page 1: 194 message(s); oldest message_id=1809600761 time=1786785467; newest message_id=1344602200 time=1786790521
+   warning: group ...: history window NOT fully covered — stopped after 2 page(s) ... reason: pagination anchor stopped advancing (NapCat returned the same page again).
    ```
 
-   `grep 'history page'` 拿到全部页，看相邻两页的 `time` 是否首尾相接、没有跳跃或重复大段。
-   另外，如果翻页没能一直翻到窗口起点就停了，会额外打一行 `history window NOT fully covered`
-   的**警告**，里面带着翻了几页、共多少条、以及停下来的具体原因（翻到群历史开头 / 响应不是对象 /
-   一条都没解析出来 / 翻页锚点不再前进 / 200 页保护耗尽）。看到这行就说明这一轮只覆盖了窗口的
-   一部分，且漏掉的那一段不会被重扫——**包括漏掉的 💦 作废指令**，它只会被看到一次。
+   针对真实 NapCat 用 `count=5` 手工探测（不带锚点 / 带锚点 `reverse_order=false` / 带锚点
+   `reverse_order=true`）确认了原因：`reverse_order` 的语义是"从锚点朝哪个方向走"，不是"结果要不要
+   倒序"——`reverse_order: false` 是"从锚点往新（更晚）的方向走"，拿上一页最老一条的 `message_id`
+   当锚点配 `false` 传给 NapCat，等于让 NapCat 把上一页原样再吐一遍，翻页永远卡在窗口最新的那一段。
+   往回（更早）翻必须传 `reverse_order: true`。`src/scan/runner.zig` 的 `fetchPage` 已经改过来：
+   带锚点的分支现在传 `reverse_order: true`；没有锚点的首页调用仍是 `reverse_order: false`——NapCat
+   对不带 `message_seq` 的请求走的是 `getAioFirstViewLatestMsgs`，不看这个字段，不受这次修复影响。
+   `grep 'history page'` 仍然是核对相邻两页有没有正常往更早的方向推进的办法：现在应看到相邻两页
+   `time` 依次变旧、首尾相接，不应再出现两页完全相同。
 
-2. **`message_seq` 边界是否是闭区间。** 如果是，每一页（除第一页外）都会把上一页最后一条消息重复
-   收进来，`Will process N messages.` 会比实际值多报最多「页数 − 1」条。这不会污染数据（`message_id`
-   去重会挡住重复），但看日志容易以为哪里错了。核对方法：同样看上面那些 `history page` 行，
-   相邻两页的 `oldest message_id` 与 `newest message_id` 有没有重叠。
+2. **`message_seq` 边界是闭区间——已确认。** 手工探测证实：带锚点、`reverse_order: true` 时，
+   返回的一页里锚点消息本身会作为**最新**的一条出现（其余是比它更早的消息）。后果：每一页（除第
+   一页外）都会把上一页最老的一条重复收进 `pool`，`Will process N messages.` 会比实际值多报最多
+   「页数 − 1」条。这不会污染数据——`rules.appendCandidate` 按 `message_id` 去重会挡住重复——是
+   刻意接受的行为，**不需要**在 `fetchPage` / 翻页循环里另外去重，看日志时知道这个数会偏高即可。
 
-3. **`get_msg` 是否返回顶层 `user_id`。** `onebot.parseMessage` 解析 `get_msg` 的返回时，如果找不到
-   顶层 `user_id` 会直接返回 null，导致所有需要单独 `get_msg` 才能解析出发送者的引用目标（窗口外、
-   走 LRU 反查那条路）都无法解析，日志会看到大量「unresolvable」警告。核对方法：手动引用一条窗口外
-   的旧消息触发这条路径，看警告是否符合预期（应该是偶发，不应该是全部）。
+3. **`get_msg` 是否返回顶层 `user_id`——仍未验证。** `onebot.parseMessage` 解析 `get_msg` 的返回时，
+   如果找不到顶层 `user_id` 会直接返回 null，导致所有需要单独 `get_msg` 才能解析出发送者的引用目标
+   （窗口外、走 LRU 反查那条路）都无法解析，日志会看到大量「unresolvable」警告。首次生产运行没有
+   触发这条路径（窗口内的引用都能直接从池子里解出发送者）。核对方法：手动引用一条窗口外的旧消息
+   触发这条路径，看警告是否符合预期（应该是偶发，不应该是全部）。
 
-4. **✨ 的 `emoji_id` 是否真的是 `"10024"`。** 定义在 `src/napcat.zig` 的 `star_emoji_id` 常量，全仓库
-   只这一处。**如果这个值不对，扫描器会一条都收不到，而且现象跟"今天真的没人贴 ✨"完全一样，不会报任何
-   错误。** 核对方法：找一条被观察者发的消息贴上 ✨，等这一轮扫描跑过去。只要这条消息上有表情回应而
-   一个都没匹配上 `star_emoji_id`，进程就会打一行
+4. **✨ 的 `emoji_id` 是 `"10024"`——已确认，由生产数据坐实。** 定义在 `src/napcat.zig` 的
+   `star_emoji_id` 常量，全仓库只这一处。首次生产运行通过 ✨ 收到了 6 条真实语录（`10024` 匹配
+   成功），同一轮里另有一条消息被贴了 😰，日志打出
 
    ```
-   group 123456: message 78901 carries emoji reactions but none matched star_emoji_id=10024: 128x2, 9999x1
+   none matched star_emoji_id=10024: 128560x1
    ```
 
-   冒号后面是这条消息上**实际出现过的全部** `emoji_id`（`id×次数`）。贴了 ✨ 却看到这行，说明 ✨ 的真实
-   id 就在那串里；把 `src/napcat.zig` 的 `star_emoji_id` 改成它即可——该常量同时驱动字符串和数值两种
-   比较，改这一处就够。反过来，贴了 ✨ 而这行**没出现**，说明 `10024` 匹配上了，假设成立。
-   （也可以直接对 NapCat HTTP 接口手工发一次 `get_msg` 读 `emoji_likes_list` 交叉验证。）
+   128560 = 0x1F630（😰 的 Unicode 码点），证实 NapCat 把 emoji 表情回应上报为十进制码点，
+   `star_emoji_id = "10024"`（✨ = U+2728 的十进制形式）是对的，不需要改。核对方法（供以后接入
+   新群/新环境时复查）：找一条被观察者发的消息贴上 ✨，等这一轮扫描跑过去，确认没有打出
+   `none matched star_emoji_id=10024: ...` 这一行；若打出了，冒号后面是这条消息上实际出现过的
+   全部 `emoji_id`（`id×次数`），✨ 的真实 id 会在那串里。
 
 ## 本仓库中实际验证过的部分
 
@@ -219,4 +232,5 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
   发请求返回 404 JSON 错误体。
 
 **没有验证过的部分**：需要真实 NapCat 实例、真实 QQ 账号与群权限的联调（上面 Runbook 的步骤 3、4、
-以及四个 NapCat 线上假设）——这需要人工执行，见上面的 Runbook。
+以及「四个 NapCat 线上假设」小节里第 3 条——`get_msg` 是否返回顶层 `user_id`，四条里唯一还没被
+2026-08-15 首次生产运行坐实的一条）——这需要人工执行，见上面的 Runbook。
