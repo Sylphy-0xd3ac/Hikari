@@ -9,4 +9,5 @@ test {
     _ = @import("onebot.zig");
     _ = @import("scan/rules.zig");
     _ = @import("redis/resp.zig");
+    _ = @import("redis/client.zig");
 }
