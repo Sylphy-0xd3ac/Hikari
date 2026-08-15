@@ -3,6 +3,8 @@ const onebot = @import("onebot.zig");
 
 /// ✨ = U+2728，QQ 的 Unicode 表情回应用十进制码点做 emoji_id。
 pub const star_emoji_id = "10024";
+/// 数值形式由字符串形式在 comptime 推导，两者不可能漂移。
+const star_emoji_id_num: i64 = std.fmt.parseInt(i64, star_emoji_id, 10) catch unreachable;
 
 pub const Error = error{
     NapCatError,
@@ -30,7 +32,7 @@ pub fn hasStarReaction(data: std.json.Value) bool {
         const idv = io.get("emoji_id") orelse continue;
         const matches = switch (idv) {
             .string => |s| std.mem.eql(u8, s, star_emoji_id),
-            else => if (onebot.asInt(idv)) |n| n == 10024 else false,
+            else => if (onebot.asInt(idv)) |n| n == star_emoji_id_num else false,
         };
         if (!matches) continue;
         const cnt = if (io.get("likes_cnt")) |cv| (onebot.asInt(cv) orelse 1) else 1;
@@ -40,19 +42,23 @@ pub fn hasStarReaction(data: std.json.Value) bool {
 }
 
 /// 校验 OneBot 统一响应壳，返回 data 字段。
+///
+/// 信封本身不合法（status 缺失/非字符串，或 retcode 缺失/不可解析为整数）→ BadResponse。
+/// 信封合法但请求失败（status 不是 "ok"，或 retcode 非 0）→ NapCatError。
+/// 两种失败模式故意区分开，方便调用方分辨"响应格式不对"和"NapCat 拒绝了这次调用"。
 pub fn extractData(v: std.json.Value) Error!std.json.Value {
     const obj = switch (v) {
         .object => |o| o,
         else => return error.BadResponse,
     };
-    if (obj.get("status")) |s| {
-        if (s == .string and !std.mem.eql(u8, s.string, "ok")) return error.NapCatError;
-    }
-    if (obj.get("retcode")) |r| {
-        if (onebot.asInt(r)) |n| {
-            if (n != 0) return error.NapCatError;
-        }
-    }
+    const status = switch (obj.get("status") orelse return error.BadResponse) {
+        .string => |s| s,
+        else => return error.BadResponse,
+    };
+    const retcode = onebot.asInt(obj.get("retcode") orelse return error.BadResponse) orelse
+        return error.BadResponse;
+
+    if (!std.mem.eql(u8, status, "ok") or retcode != 0) return error.NapCatError;
     return obj.get("data") orelse std.json.Value{ .null = {} };
 }
 
@@ -155,6 +161,14 @@ test "hasStarReaction 忽略 likes_cnt 为 0 的条目" {
     try std.testing.expect(!hasStarReaction(v));
 }
 
+test "hasStarReaction 缺省 likes_cnt 按 1 计（视为存在但未计数）" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"10024\"}]}");
+    try std.testing.expect(hasStarReaction(v));
+}
+
 test "extractData 校验 status 与 retcode" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
@@ -177,6 +191,29 @@ test "extractData 允许 data 为 null 时返回 null 值" {
     try std.testing.expect(v == .null);
 }
 
+test "extractData 拒绝信封缺失或类型不对的响应" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    // status 整体缺失。
+    try std.testing.expectError(error.BadResponse, extractData(
+        try parseVal(a, "{\"retcode\":0,\"data\":{}}"),
+    ));
+    // status 存在但不是字符串。
+    try std.testing.expectError(error.BadResponse, extractData(
+        try parseVal(a, "{\"status\":123,\"retcode\":0,\"data\":{}}"),
+    ));
+    // retcode 整体缺失。
+    try std.testing.expectError(error.BadResponse, extractData(
+        try parseVal(a, "{\"status\":\"ok\",\"data\":{}}"),
+    ));
+    // retcode 存在但无法解析为整数。
+    try std.testing.expectError(error.BadResponse, extractData(
+        try parseVal(a, "{\"status\":\"ok\",\"retcode\":\"oops\",\"data\":{}}"),
+    ));
+}
+
 test "call 发出带 Bearer token 的 POST 请求" {
     const gpa = std.testing.allocator;
 
@@ -184,6 +221,8 @@ test "call 发出带 Bearer token 的 POST 请求" {
         listener: std.net.Server,
         got: std.ArrayList(u8),
         gpa: std.mem.Allocator,
+        method: std.http.Method = undefined,
+        body: ?[]u8 = null,
 
         fn serve(self: *@This()) void {
             const conn = self.listener.accept() catch return;
@@ -195,6 +234,8 @@ test "call 发出带 Bearer token 的 POST 请求" {
             var hs = std.http.Server.init(sr.interface(), &sw.interface);
             var req = hs.receiveHead() catch return;
 
+            self.method = req.head.method;
+
             var it = req.iterateHeaders();
             while (it.next()) |h| {
                 self.got.appendSlice(self.gpa, h.name) catch return;
@@ -203,6 +244,10 @@ test "call 发出带 Bearer token 的 POST 请求" {
                 self.got.append(self.gpa, '\n') catch return;
             }
             self.got.appendSlice(self.gpa, req.head.target) catch return;
+
+            var body_buf: [4096]u8 = undefined;
+            const body_reader = req.readerExpectNone(&body_buf);
+            self.body = body_reader.allocRemaining(self.gpa, .unlimited) catch null;
 
             req.respond("{\"status\":\"ok\",\"retcode\":0,\"data\":{\"ok\":true}}", .{
                 .status = .ok,
@@ -219,9 +264,15 @@ test "call 发出带 Bearer token 的 POST 请求" {
     };
     defer {
         fake.got.deinit(gpa);
+        if (fake.body) |b| gpa.free(b);
         fake.listener.deinit();
     }
     const th = try std.Thread.spawn(.{}, Fake.serve, .{&fake});
+    var joined = false;
+    // 兜底：如果下面的 try 提前失败，也不能把线程句柄扔掉不 join。
+    // 正常路径里显式 join 发生在读取 fake.got/fake.body 之前（见下），
+    // 所以这里不会造成对同一线程 join 两次。
+    defer if (!joined) th.join();
 
     const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.listener.listen_address.getPort()});
     defer gpa.free(base);
@@ -233,8 +284,12 @@ test "call 发出带 Bearer token 的 POST 请求" {
     defer c.deinit();
     const data = try c.callData(ar.allocator(), "get_msg", "{\"message_id\":1}");
     th.join();
+    joined = true;
 
     try std.testing.expect(data.object.get("ok").?.bool);
     try std.testing.expect(std.mem.indexOf(u8, fake.got.items, "Bearer secret-token") != null);
     try std.testing.expect(std.mem.indexOf(u8, fake.got.items, "/get_msg") != null);
+    try std.testing.expectEqual(std.http.Method.POST, fake.method);
+    try std.testing.expect(fake.body != null);
+    try std.testing.expectEqualStrings("{\"message_id\":1}", fake.body.?);
 }
