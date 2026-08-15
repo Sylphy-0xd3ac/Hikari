@@ -14,4 +14,5 @@ test {
     _ = @import("store.zig");
     _ = @import("http/hitokoto.zig");
     _ = @import("http/server.zig");
+    _ = @import("napcat.zig");
 }
