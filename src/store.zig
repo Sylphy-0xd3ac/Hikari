@@ -1,7 +1,6 @@
 const std = @import("std");
 const redis = @import("redis/client.zig");
 const resp = @import("redis/resp.zig");
-const uuid = @import("uuid.zig");
 
 pub const Error = redis.Error || error{OutOfMemory};
 
@@ -198,6 +197,13 @@ pub const Store = struct {
     client: *redis.Client,
     mutex: std.Thread.Mutex,
 
+    /// `gpa` is used for the caller-visible allocations this type makes
+    /// (`hashFields` buffers, `Quote` string fields returned to the caller).
+    /// It is a distinct parameter from `client.gpa` on purpose: `client.gpa`
+    /// is the allocator `redis.Client.command` used to build its `resp.Value`
+    /// reply, and that reply must be freed with the *same* allocator it was
+    /// allocated with (`client.gpa`), not with `self.gpa`. `Store` never
+    /// calls `v.deinit(self.gpa)` for that reason — always `v.deinit(self.client.gpa)`.
     pub fn init(gpa: std.mem.Allocator, client: *redis.Client) Store {
         return .{ .gpa = gpa, .client = client, .mutex = .{} };
     }
@@ -267,7 +273,7 @@ pub const Store = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const v = try self.client.command(&.{ "GET", key_lastrun });
-        defer v.deinit(self.gpa);
+        defer v.deinit(self.client.gpa);
         return switch (v) {
             .bulk => |b| if (b) |s| (std.fmt.parseInt(i64, s, 10) catch null) else null,
             else => null,
@@ -280,7 +286,7 @@ pub const Store = struct {
         const mid = std.fmt.parseInt(i64, id_str, 10) catch return null;
         var kb: [64]u8 = undefined;
         const v = try self.client.command(&.{ "HGETALL", quoteKey(&kb, mid) });
-        defer v.deinit(self.gpa);
+        defer v.deinit(self.client.gpa);
         const items = switch (v) {
             .array => |a| a orelse return null,
             else => return null,
@@ -292,7 +298,7 @@ pub const Store = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const v = try self.client.command(&.{ "SRANDMEMBER", key_index });
-        defer v.deinit(self.gpa);
+        defer v.deinit(self.client.gpa);
         const id_str = switch (v) {
             .bulk => |b| b orelse return null,
             else => return null,
@@ -309,7 +315,7 @@ pub const Store = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         const v = try self.client.command(&.{ "ZRANGEBYSCORE", key_bylen, mins, maxs });
-        defer v.deinit(self.gpa);
+        defer v.deinit(self.client.gpa);
         const items = switch (v) {
             .array => |a| a orelse return null,
             else => return null,
@@ -378,6 +384,36 @@ test "hashFields 产出 HSET 命令的完整参数，键值成对" {
     try std.testing.expect(seen_length);
 }
 
+test "hashFields 产出的 32 个参数与字面量逐一匹配（钉住字段名与顺序，尤其是 type）" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+
+    // 这是线上协议：字段名（含 kind -> "type" 的翻译）、顺序、取值都钉死在这里，
+    // 防止 quoteFromPairs 的 orelse 默认值把字段名写错这类改动悄悄溜过测试——
+    // round-trip 测试只抽查了 7/15 个字段，剩下 8 个（包括 type 本身）全靠这里守住。
+    const expected = [_][]const u8{
+        "HSET",        "hikari:quote:12345",
+        "id",          "7",
+        "uuid",        "550e8400-e29b-41d4-a716-446655440000",
+        "hitokoto",    "今天也是好天气",
+        "type",        "g",
+        "from",        "测试群",
+        "from_who",    "小明",
+        "creator",     "Hikari",
+        "creator_uid", "0",
+        "reviewer",    "0",
+        "commit_from", "hikari",
+        "created_at",  "1700000000",
+        "length",      "7",
+        "message_id",  "12345",
+        "group_id",    "999",
+        "user_id",     "10001",
+    };
+    try std.testing.expectEqual(expected.len, args.len);
+    for (expected, args) |e, a| try std.testing.expectEqualStrings(e, a);
+}
+
 test "quoteFromPairs 还原 HGETALL 的扁平回复" {
     const gpa = std.testing.allocator;
     const args = try hashFields(gpa, sampleQuote());
@@ -415,6 +451,34 @@ test "quoteFromPairs 缺少 hitokoto 字段时返回 null" {
         .{ .bulk = @constCast("1") },
     };
     try std.testing.expectEqual(@as(?Quote, null), try quoteFromPairs(gpa, &pairs));
+}
+
+test "quoteFromPairs 只有 hitokoto 时其余字段全部落到默认值" {
+    const gpa = std.testing.allocator;
+    const pairs = [_]resp.Value{
+        .{ .bulk = @constCast("hitokoto") },
+        .{ .bulk = @constCast("你好") },
+    };
+    var q = (try quoteFromPairs(gpa, &pairs)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("你好", q.hitokoto);
+    try std.testing.expectEqualStrings("g", q.kind);
+    try std.testing.expectEqualStrings("", q.from);
+    try std.testing.expectEqualStrings("", q.from_who);
+    try std.testing.expectEqualStrings("Hikari", q.creator);
+    try std.testing.expectEqualStrings("hikari", q.commit_from);
+    try std.testing.expectEqualStrings("0", q.created_at);
+    for (q.uuid) |ch| try std.testing.expectEqual(@as(u8, '0'), ch);
+    try std.testing.expectEqual(@as(u64, 0), q.id);
+    try std.testing.expectEqual(@as(u64, 0), q.creator_uid);
+    try std.testing.expectEqual(@as(u64, 0), q.reviewer);
+    // 没有 length 字段时退化成对 hitokoto 按码点数计算的长度，Task 7 的
+    // min_length/max_length 就是靠这条兜底路径处理没写 length 的旧数据。
+    try std.testing.expectEqual(utf8Length("你好"), q.length);
+    try std.testing.expectEqual(@as(i64, 0), q.message_id);
+    try std.testing.expectEqual(@as(u64, 0), q.group_id);
+    try std.testing.expectEqual(@as(u64, 0), q.user_id);
 }
 
 test "utf8Length 按码点数算长度" {
@@ -768,8 +832,11 @@ test "randomByLength 用 ZRANGEBYSCORE 拿候选再 HGETALL 取回整条语录" 
     srv.stop();
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "ZRANGEBYSCORE") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_bylen) != null);
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "5") != null);
-    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "10") != null);
+    // 不能只查子串 "5" / "10"：那两个数字前缀恰好也出现在流里到处都是的
+    // "$5\r\n" bulk 长度头里，查子串永远为真，测不出 min/max 是否真的被发送。
+    // 改成匹配 RESP 里 min/max 各自的完整 bulk 编码。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "$1\r\n5\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "$2\r\n10\r\n") != null);
 }
 
 test "randomByLength 候选为空数组时返回 null" {
