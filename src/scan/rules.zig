@@ -16,8 +16,26 @@ const chain_max_gap: usize = 4;
 pub const Candidate = struct {
     message_id: i64,
     path: Path,
-    /// 路径3专用：已剥掉 ✨ 前缀的正文。路径1、2 为 null，表示按 renderText 从目标消息提取。
+    /// 路径3、路径4专用：已经算好、不需要再从目标消息提取的正文。路径3是剥掉
+    /// ✨ 前缀后的内容；路径4是链上各成员依次取正文（同样剥过各自的 ✨ 前缀，
+    /// 见 finalizeChain）后用空格拼接的结果。路径1、2 为 null，表示按
+    /// renderText 从目标消息提取。
     text_override: ?[]u8,
+    /// 路径4专用：这条链的**全部**成员 message_id（时间升序，
+    /// `chain_members[0] == message_id`，即主键）。路径1/2/3 为 null。
+    ///
+    /// 这份数据是从 Chain.members dupe 出来的独立分配（不是转移所有权）：
+    /// Chain.members 在整个 classify() 执行期间还要继续被 chainOf 用来判定
+    /// "某个 window 里的消息是不是链成员"（Pass B 主循环、Pass A 的 💦 展开），
+    /// 不能在插入 fire_chain 候选时就被掏空。
+    ///
+    /// runner.zig 靠这个字段把整条链的成员列表持久化进 Redis
+    /// （`store.Store.addChain`）：rules.classify 只能在当次扫描窗口里重建出
+    /// 链，💦 撤稿一条早先已经入库的链语录时，引用目标很可能落在窗口外
+    /// （缓冲池 / get_msg 回补），chainOf 在那种情况下必然返回 null——没有这份
+    /// 持久化，非主键成员就永远等不到被跨窗口撤稿。见 store.zig 顶部
+    /// key_chainmember_prefix 的注释。
+    chain_members: ?[]i64,
 };
 
 pub const Params = struct {
@@ -31,7 +49,10 @@ pub const Outcome = struct {
     unresolved: []i64,
 
     pub fn deinit(self: *Outcome, gpa: std.mem.Allocator) void {
-        for (self.candidates) |c| if (c.text_override) |t| gpa.free(t);
+        for (self.candidates) |c| {
+            if (c.text_override) |t| gpa.free(t);
+            if (c.chain_members) |cm| gpa.free(cm);
+        }
         gpa.free(self.candidates);
         gpa.free(self.revoked);
         gpa.free(self.unresolved);
@@ -204,7 +225,10 @@ pub fn classify(
     errdefer unresolved.deinit(gpa);
     var cands: std.ArrayList(Candidate) = .empty;
     errdefer {
-        for (cands.items) |c| if (c.text_override) |t| gpa.free(t);
+        for (cands.items) |c| {
+            if (c.text_override) |t| gpa.free(t);
+            if (c.chain_members) |cm| gpa.free(cm);
+        }
         cands.deinit(gpa);
     }
 
@@ -250,10 +274,18 @@ pub fn classify(
     // 转移（c.text = null）尽早发生，逻辑上更直接。
     for (chains) |*c| {
         if (c.text) |t| {
+            // chain_members 是从 c.members dupe 出来的独立分配，不是转移
+            // 所有权：c.members 在下面 Pass B 主循环、以及上面已经跑过的
+            // Pass A 里都还要靠 chainOf 反复查——转移所有权（置 c.members
+            // 为空切片）会让本函数剩下的全部 chainOf 调用当场失效。c.text
+            // 那次是可以转移的，因为 joined 正文只在这里用一次。
+            const members_dup = try gpa.dupe(i64, c.members);
+            errdefer gpa.free(members_dup);
             try appendCandidate(gpa, &cands, .{
                 .message_id = c.members[0],
                 .path = .fire_chain,
                 .text_override = t,
+                .chain_members = members_dup,
             });
             c.text = null; // 所有权转移给 cands 了；防止函数末尾 chains 的 defer 重复释放
         }
@@ -282,6 +314,7 @@ pub fn classify(
                     .message_id = m.message_id,
                     .path = .admin_manual,
                     .text_override = body,
+                    .chain_members = null,
                 });
                 continue;
             }
@@ -295,6 +328,7 @@ pub fn classify(
                 .message_id = m.message_id,
                 .path = .emoji_reaction,
                 .text_override = null,
+                .chain_members = null,
             });
             continue;
         }
@@ -316,27 +350,35 @@ pub fn classify(
             .message_id = rid,
             .path = .quoted_star,
             .text_override = null,
+            .chain_members = null,
         });
     }
 
     // 剔除已作废的候选
     var kept: std.ArrayList(Candidate) = .empty;
     errdefer {
-        // 存活候选的 text_override 所有权在下面的循环里从 cands 转移到了 kept
-        // （cands 随后被 clearAndFree，不再持有它们）；若这里只 kept.deinit 而不
-        // 遍历释放，一旦后面任何一次 toOwnedSlice 触发 OOM，这些字符串就会泄漏
-        // ——本文件加的 checkAllAllocationFailures 回归测试正是靠这条路径抓到的。
-        for (kept.items) |c| if (c.text_override) |t| gpa.free(t);
+        // 存活候选的 text_override / chain_members 所有权在下面的循环里从
+        // cands 转移到了 kept（cands 随后被 clearAndFree，不再持有它们）；
+        // 若这里只 kept.deinit 而不遍历释放，一旦后面任何一次 toOwnedSlice
+        // 触发 OOM，这些内存就会泄漏——本文件加的 checkAllAllocationFailures
+        // 回归测试正是靠这条路径抓到的。
+        for (kept.items) |c| {
+            if (c.text_override) |t| gpa.free(t);
+            if (c.chain_members) |cm| gpa.free(cm);
+        }
         kept.deinit(gpa);
     }
     for (cands.items) |*c| {
         if (contains(revoked.items, c.message_id)) {
             if (c.text_override) |t| gpa.free(t);
+            if (c.chain_members) |cm| gpa.free(cm);
             c.text_override = null; // 防止上方 errdefer 在后续 OOM 时对同一指针重复 free
+            c.chain_members = null; // 同理
             continue;
         }
         try kept.append(gpa, c.*);
         c.text_override = null; // 所有权转移给 kept 了；同理防止 cands 的 errdefer 在后续 OOM 时重复 free
+        c.chain_members = null; // 同理
     }
     // 用 clearAndFree 而非 deinit：deinit 会把 cands 设为 undefined，
     // 若下面 toOwnedSlice 触发 OOM，函数作用域的 errdefer 会遍历 cands.items
@@ -354,7 +396,10 @@ pub fn classify(
 
     const candidates_owned = try kept.toOwnedSlice(gpa);
     errdefer {
-        for (candidates_owned) |c| if (c.text_override) |t| gpa.free(t);
+        for (candidates_owned) |c| {
+            if (c.text_override) |t| gpa.free(t);
+            if (c.chain_members) |cm| gpa.free(cm);
+        }
         gpa.free(candidates_owned);
     }
 
@@ -369,26 +414,44 @@ pub fn classify(
 
 /// 按 message_id 去重。已存在时：只有新来的是 admin_manual 而旧的不是，才替换。
 ///
-/// 两个分支里的 free 都不能删——尤其是 else 分支那个，它不是死代码：
+/// 两个分支里的 free 都不能删——但注意它们的写法本身不依赖"哪个路径今天
+/// 带不带 text_override/chain_members"这类判断：`if (optional) |x| gpa.free(x)`
+/// 只看这个候选自己的字段是不是 null，不看 `path`。这不是巧合，是刻意的写法：
+/// 一旦要靠"某个路径的 text_override 恒为 null"这种断言来判断该不该 free，
+/// 断言本身就必须永远正确——而这类断言天生跟着新路径的增加而变质。这个模块
+/// 已经有过两次因为这类假设过期而产生的 double free；本次改动新增的 fire_chain
+/// （非 admin_manual 路径）就正好把"只有 admin_manual 带 text_override"这条
+/// 旧断言变成了假话，同时它还带上了 chain_members——两个可选字段都必须无
+/// 条件按"非 null 就 free"来处理，不看 c.path/existing.path 是谁。
 ///
-///   - else 分支（丢弃新来的 c）：**今天就会被走到**。c 是 admin_manual、
-///     existing 也是 admin_manual 时落到这里，而 admin_manual 是唯一带
-///     text_override 的路径，所以这个 free 真的在释放东西。触发条件是同一条
-///     管理员消息在 window 里出现了两次——README 线上假设 #2 正说明这很可能
-///     是 NapCat 的常态行为（`message_seq` 若是闭区间，相邻两页会重叠）。
-///     删掉它就是在团队已经预料会走到的路径上引入泄漏。
-///   - if 分支（替换掉 existing）：今天 existing.path != .admin_manual 意味着
-///     它是 star_reaction / quoted_star，两者的 text_override 恒为 null，所以
-///     这个 free 目前不会真的释放什么。保留它是为了将来新增带 text_override 的
-///     路径时不必回头补一次——代价只有一次 null 判断。
+///   - else 分支（丢弃新来的 c）：**今天就会被走到**，且不止一种触发方式。
+///     一是同一条管理员消息在 window 里出现了两次（c 与 existing 都是
+///     admin_manual）——README 线上假设 #2 说明这很可能是 NapCat 的常态行为
+///     （`message_seq` 若是闭区间，相邻两页会重叠）。二是理论上若 fire_chain
+///     与另一个候选发生 message_id 碰撞也会落到这里（today 不会真的发生，
+///     见下一条），c.chain_members 就会在这个分支被释放。删掉这个 free 就是
+///     在团队已经预料会走到的路径上引入泄漏。
+///   - if 分支（替换掉 existing）：**today**，走到这个分支时 `existing` 只可能
+///     是 star_reaction / quoted_star（text_override/chain_members 恒为
+///     null），因为 fire_chain 候选在 Pass B 主循环之前就已经全部插入，而
+///     Pass B 主循环对任何链成员的 message_id 都不会再产生 admin_manual/
+///     emoji_reaction/quoted_star 候选（见 classify 里 `is_chain_member` 那个
+///     判断）——appendCandidate 自己看不到这个约束，它活在调用方（classify
+///     的 Pass B 循环结构）里，是一处"距离较远"的不变量，不是本函数能强制的
+///     局部条件。正因为不能强制，这里的 free 才特意不依赖它：不管这条不变量
+///     将来是否被打破，`if (existing.text_override) |t| gpa.free(t)` 和对
+///     chain_members 的同款处理都会正确地释放 existing 身上真正持有的东西，
+///     不会因为"理论上不该发生"就漏释放。
 fn appendCandidate(gpa: std.mem.Allocator, list: *std.ArrayList(Candidate), c: Candidate) !void {
     for (list.items) |*existing| {
         if (existing.message_id != c.message_id) continue;
         if (c.path == .admin_manual and existing.path != .admin_manual) {
             if (existing.text_override) |t| gpa.free(t);
+            if (existing.chain_members) |cm| gpa.free(cm);
             existing.* = c;
         } else {
             if (c.text_override) |t| gpa.free(t);
+            if (c.chain_members) |cm| gpa.free(cm);
         }
         return;
     }
@@ -441,6 +504,7 @@ test "路径1：被观察者的消息带 ✨ 表情回应则入选" {
     try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
     try std.testing.expectEqual(Path.emoji_reaction, out.candidates[0].path);
     try std.testing.expectEqual(@as(?[]u8, null), out.candidates[0].text_override);
+    try std.testing.expectEqual(@as(?[]i64, null), out.candidates[0].chain_members);
 }
 
 test "路径1：非被观察者的消息即使带 ✨ 也不入选" {
@@ -718,6 +782,10 @@ test "🔥链：两条相邻合格消息合并为一条候选，正文空格拼�
     try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
     try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
     try std.testing.expectEqualStrings("你们有钱 你们潇洒", out.candidates[0].text_override.?);
+    // chain_members 是 runner.zig 用来调用 store.Store.addChain 的关键：必须
+    // 带上全部成员（含主键自己），顺序与时间升序一致，这样非主键成员才能被
+    // 持久化映射到主键，跨窗口撤稿才有依据（见 store.zig key_chainmember_prefix）。
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, out.candidates[0].chain_members.?);
 }
 
 test "🔥链：三条依次相连的消息合并成一条（不设两条的上限）" {
@@ -734,6 +802,7 @@ test "🔥链：三条依次相连的消息合并成一条（不设两条的上�
     try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
     try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
     try std.testing.expectEqualStrings("第一段 第二段 第三段", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, out.candidates[0].chain_members.?);
 }
 
 test "🔥链：间隔恰好3条消息仍相连" {

@@ -838,6 +838,22 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 skipped += 1;
                 continue;
             }
+            // 第三道关卡：这个 id 是不是某条早先已经入库的 🔥 链的成员——不管
+            // 是不是主键。非主键成员从未被单独写进 hikari:index（只有主键会），
+            // 单靠 exists() 拦不住它们。这不是理论风险：一个群这一轮若因为
+            // 其它候选 add 失败而判失败，lastrun 不会前移，下一次触发时窗口
+            // 会原样重扫这批消息（受 7 天回看上限约束）——若这中间群里的 🔥
+            // 被加/减，链的组成可能跟第一次算出来的不一样，导致同一个非主键
+            // 成员这次被算成独立候选（或另一条不同的链）。isChainMember 挡住
+            // 这种情形：一条消息一旦被某条链吸收，就永远不再被当成独立语录或
+            // 另一条不同的链重新收录，除非这条链本身先被 💦 撤稿（撤稿会清理
+            // 映射，见 store.zig revokeChainLocked）。这跟"不做语录编辑接口"
+            // 是同一个哲学：语录一旦入库，形态就固定了，改主意只能先撤再等
+            // 它作为新候选重新出现。
+            if (try deps.st.isChainMember(cand.message_id)) {
+                skipped += 1;
+                continue;
+            }
 
             var target: ?onebot.Message = null;
             for (pool.items) |p| {
@@ -874,12 +890,29 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
 
             // store.add 失败与"被关卡拦下"是两码事（spec §7 的 skipped 特指后者），
             // 单独计数，不混进 skipped。
-            deps.st.add(q) catch |e| {
-                std.log.warn("group {d}: add {d} failed: {s}", .{ gid, cand.message_id, @errorName(e) });
-                trouble.add_failed += 1;
-                trouble.last_err = @errorName(e);
-                continue;
-            };
+            //
+            // 路径4（fire_chain）的候选带 chain_members，走 addChain：除了
+            // 落一条语录，还把"成员 → 链主键"的映射持久化进 Redis（见
+            // store.zig key_chainmember_prefix 的注释）——这是让 💦 撤稿脱离
+            // "当次窗口能不能重建出链"这个约束的关键，没有这份持久化，💦
+            // 引用一条早先已入库的链的非主键成员时，revoke() 只会删掉一个
+            // 从未被索引过的 id，真正被索引的那份语录不会被删除。其它三条
+            // 路径没有 chain_members，走原来的 add()。
+            if (cand.chain_members) |members| {
+                deps.st.addChain(q, members) catch |e| {
+                    std.log.warn("group {d}: addChain {d} failed: {s}", .{ gid, cand.message_id, @errorName(e) });
+                    trouble.add_failed += 1;
+                    trouble.last_err = @errorName(e);
+                    continue;
+                };
+            } else {
+                deps.st.add(q) catch |e| {
+                    std.log.warn("group {d}: add {d} failed: {s}", .{ gid, cand.message_id, @errorName(e) });
+                    trouble.add_failed += 1;
+                    trouble.last_err = @errorName(e);
+                    continue;
+                };
+            }
             added += 1;
         }
     } else {
@@ -1903,6 +1936,164 @@ test "runOnce：正常收尾（没有 Trouble）时第七个 node 是 Successful
             "]}",
         nap_srv.bodies.items[4],
     );
+}
+
+// ---------------------------------------------------------------------------
+// 🔥链端到端：rules.classify 把两条相邻消息并成一条 fire_chain 候选之后，
+// scanGroup 必须走 store.Store.addChain（不是普通 add），把"成员 → 链主键"
+// 的映射持久化进 Redis——这是本次改动要补的 gap 本身：只靠内存里的 chains
+// 数组撤不了跨窗口的 💦，必须落盘。
+
+test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成员集，不是普通 add()" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // hikari:lastrun 未命中 → 固定 24h 窗口，win_start = 1_700_013_600。
+    // 之后依次是这个群这一轮真正发出的 Redis 命令：isTombstoned / exists /
+    // isChainMember 三道关卡（都放行）、nextId、addChain 的六条命令
+    // （两个成员各一条 SET 映射、一条 SADD chain 集、HSET/ZADD/SADD 原有三条），
+    // 最后是 applyLastRun 的 SET（这个群判成功才会补）。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n:0\r\n:0\r\n:0\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 8 次 NapCat 调用：get_login_info → 两页历史（第一页两条相邻消息，
+    // 均带 ✨+🔥；第二页空页收尾）→ 两次 get_msg 探测（各自命中 ✨ 与 🔥）→
+    // get_group_info → get_group_member_info → send_group_forward_msg。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"你们有钱\"}}]}," ++
+            "{\"message_id\":2,\"user_id\":10001,\"time\":1700050001,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"你们潇洒\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1},{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1},{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"晴\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{77},
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    // 这个群这一轮判成功：applyLastRun 补了一次 SET。
+    const received = redis_srv.received.items;
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:lastrun:77") != null);
+
+    // 两个成员各有一条持久化映射，主键（message_id=1）指向自己。
+    try std.testing.expect(std.mem.indexOf(u8, received, "SET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chainmember:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chainmember:2") != null);
+    // chain 成员集用链主键做 key。
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chain:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "SADD") != null);
+    // 语录本身仍然以主键为 key（跟普通 add() 的落盘目标一致）。
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:quote:1") != null);
+
+    try std.testing.expectEqual(@as(usize, 8), nap_srv.bodies.items.len);
+    const forward = nap_srv.bodies.items[7];
+    // joined 正文（"你们有钱 你们潇洒"）作为一条候选被收录，不是两条碎句。
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 2 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
+}
+
+test "runOnce：isChainMember 拦下一个已属于其它链的候选——即便它这次单独满足路径1格式" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // 场景对应 §4.5.1 之外新增的守卫：message_id=5 曾经被某条链吸收（这里
+    // 用脚本直接让 isChainMember(5) 返回 1，模拟"上一轮已经把它写进
+    // hikari:chainmember:5"），这一轮窗口里它落单、单靠 ✨ 满足路径1格式，
+    // 但不应该被当成一条全新的独立语录再收一遍——isChainMember 是
+    // tombstone/exists 之后的第三道关卡，必须拦下它，计入 skipped。
+    // 四条判定回复（GET lastrun / SISMEMBER tomb / SISMEMBER index / EXISTS
+    // chainmember）之后还有一条：这个群这一轮仍然判成功（isChainMember 拦下
+    // 候选只影响 skipped 计数，不算失败），applyLastRun 照常补一次 SET，
+    // 脚本必须给够这第五条回复——少一条会让 setLastRun 的读卡在
+    // ReadFailed 上（连接被这条失败的往返拆掉），而不是显式测试失败。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n:0\r\n:0\r\n:1\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":5,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"落单的一句\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"晴\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qq = 10001,
+        .admin_qqs = &.{},
+        .group_ids = &.{78},
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    // 没有发出任何 addChain/add 相关的写命令（脚本本身也只准备了四条只读/
+    // 判定用的回复，多发一条就会因为脚本耗尽而挂起——这本身就是一种断言）。
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:78") != null);
+
+    try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
+    const forward = nap_srv.bodies.items[6];
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
 }
 
 test "fetchBotQq：get_login_info 失败时退回 OBSERVED_QQ" {

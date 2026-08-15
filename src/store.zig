@@ -9,6 +9,17 @@ pub const key_bylen = "hikari:bylen";
 pub const key_tomb = "hikari:tomb";
 pub const key_seq = "hikari:seq";
 pub const key_lastrun_prefix = "hikari:lastrun";
+/// `hikari:chainmember:{message_id}` STRING，value 是这条 🔥 链主键（第一个
+/// 成员）的 message_id。链的**每一个**成员——包括主键自己——都写一份，值都是
+/// 同一个主键。这是 revoke() 用来跨扫描窗口解析"这个 id 属不属于某条链"的
+/// 持久映射：rules.classify 的 chainOf 只能在当次窗口重建出的链里查找，💦
+/// 引用的目标若来自缓冲池或 get_msg 回补（窗口外），chainOf 必然返回 null；
+/// 这份映射把"成员 → 链主键"这件事写进 Redis，脱离窗口也能查。
+pub const key_chainmember_prefix = "hikari:chainmember";
+/// `hikari:chain:{primary_message_id}` SET，成员是这条链的全部 message_id
+/// （含主键自己）。revoke() 撤一条链时先靠 chainmember 映射拿到主键，再靠
+/// 这个 SET 拿到全部成员，逐个 tombstone。
+pub const key_chain_prefix = "hikari:chain";
 
 pub const Quote = struct {
     id: u64,
@@ -55,6 +66,14 @@ pub fn quoteKey(buf: *[64]u8, message_id: i64) []const u8 {
 /// 全局键做不到这一点（见 runner.zig runOnce 的调用点）。
 pub fn lastRunKey(buf: *[64]u8, group_id: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_lastrun_prefix, group_id }) catch unreachable;
+}
+
+pub fn chainMemberKey(buf: *[64]u8, message_id: i64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_chainmember_prefix, message_id }) catch unreachable;
+}
+
+pub fn chainKey(buf: *[64]u8, message_id: i64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_chain_prefix, message_id }) catch unreachable;
 }
 
 fn dupInt(gpa: std.mem.Allocator, v: anytype) ![]const u8 {
@@ -135,6 +154,41 @@ pub fn hashFields(gpa: std.mem.Allocator, q: Quote) ![][]const u8 {
 pub fn freeHashFields(gpa: std.mem.Allocator, args: [][]const u8) void {
     for (args) |s| gpa.free(s);
     gpa.free(args);
+}
+
+/// 把一组 i64 id 格式化成新分配的十进制字符串数组，用来拼进变长的 Redis 命令
+/// （链的 SADD/SREM/ZREM 需要一次性带上全部成员）。用 freeIdStrings 释放。
+///
+/// 清理纪律跟 hashFields 同一套：`out` 本身与已经成功格式化的每个元素都有
+/// errdefer 兜底，任何一步 allocPrint/alloc 失败都不会孤儿化前面已经分配好
+/// 的字符串。
+fn formatIds(gpa: std.mem.Allocator, ids: []const i64) ![][]const u8 {
+    const out = try gpa.alloc([]const u8, ids.len);
+    errdefer gpa.free(out);
+    var filled: usize = 0;
+    errdefer for (out[0..filled]) |s| gpa.free(s);
+    for (ids, 0..) |id, i| {
+        out[i] = try std.fmt.allocPrint(gpa, "{d}", .{id});
+        filled = i + 1;
+    }
+    return out;
+}
+
+fn freeIdStrings(gpa: std.mem.Allocator, strs: [][]const u8) void {
+    for (strs) |s| gpa.free(s);
+    gpa.free(strs);
+}
+
+/// 拼一条 `<cmd> <key> <member...>` 命令的完整参数数组。`cmd`/`key` 是借用的
+/// 字符串字面量或调用方持有的缓冲区，`members` 是调用方已经拥有的字符串——
+/// 这个函数只分配容纳指针的外层数组，不复制/不接管任何字符串本身的所有权，
+/// 所以只需要 `gpa.free(返回值)`，不需要遍历释放元素。
+fn buildMultiArgs(gpa: std.mem.Allocator, cmd: []const u8, key: []const u8, members: []const []const u8) ![][]const u8 {
+    const args = try gpa.alloc([]const u8, 2 + members.len);
+    args[0] = cmd;
+    args[1] = key;
+    for (members, 0..) |m, i| args[2 + i] = m;
+    return args;
 }
 
 fn pairLookup(pairs: []const resp.Value, name: []const u8) ?[]const u8 {
@@ -261,14 +315,100 @@ pub const Store = struct {
         try self.client.commandOk(&.{ "SADD", key_index, ids });
     }
 
+    /// 跟 add() 一样落一条语录，另外把"成员 → 链主键"的映射持久化进 Redis：
+    /// `member_ids` 是这条 🔥 链的**全部**成员（时间升序，member_ids[0] ==
+    /// q.message_id，即主键），至少应有 2 个（buildChains 只并成 ≥2 个成员的
+    /// 链）；调用 add() 时用 1 个成员数组也能正常工作（只是多写一份主键到
+    /// 自己的映射），不专门拒绝。
+    ///
+    /// 为什么需要这份映射：rules.classify 只能在**当次扫描窗口**重建出的链里
+    /// 判定 "id 是不是某条链的成员"（chainOf 吃的是 window 里的 ✨/🔥 数据）。
+    /// 一条链语录一旦入库，往后任何一次扫描都可能再次窗口内看到它、也可能
+    /// 完全看不到它（已经翻过去了）；💦 撤稿这条链时引用的目标可能来自
+    /// get_msg 回补或缓冲池，落在窗口外——chainOf 在那种情况下必然返回
+    /// null，链无法在内存里重建。只有把"这个 id 属于哪条链"这件事在**收录
+    /// 当时**写进 Redis，才能让 revoke() 在任何一次未来的扫描里、不依赖窗口
+    /// 就查到答案，见 revoke() 与 revokeChainLocked 的实现。
+    ///
+    /// 写入顺序：chainmember 映射与 chain 成员集**先于** HSET/ZADD/SADD 落盘，
+    /// 理由跟 add() 内部 SADD 必须最后发一致，但方向反过来更要紧：如果映射
+    /// 写在 `SADD hikari:index`（提交点）之后，"index 提交成功、映射写失败"
+    /// 会让 exists(主键) == true（今后重扫时被跳过、永不重试），但非主键成员
+    /// 逃过了 isChainMember 守卫——往后一次窗口若单独判定到它，会被当成一条
+    /// 全新的独立语录再收一遍，造出碎句与整句同时入库的重复。映射写在提交点
+    /// 之前，任何一步失败都仍然满足 exists(主键) == false，下一次扫描原样
+    /// 重做（SET/SADD/HSET/ZADD 全部幂等），不会有"半成品映射 + 已提交语录"
+    /// 这种不一致状态。
+    pub fn addChain(self: *Store, q: Quote, member_ids: []const i64) Error!void {
+        const args = try hashFields(self.gpa, q);
+        defer freeHashFields(self.gpa, args);
+
+        var idb: [32]u8 = undefined;
+        const primary_s = std.fmt.bufPrint(&idb, "{d}", .{q.message_id}) catch unreachable;
+        var lenb: [32]u8 = undefined;
+        const lens = std.fmt.bufPrint(&lenb, "{d}", .{q.length}) catch unreachable;
+        var ckb: [64]u8 = undefined;
+        const chain_key = chainKey(&ckb, q.message_id);
+
+        const member_strs = try formatIds(self.gpa, member_ids);
+        defer freeIdStrings(self.gpa, member_strs);
+
+        const sadd_chain_args = try buildMultiArgs(self.gpa, "SADD", chain_key, member_strs);
+        defer self.gpa.free(sadd_chain_args);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        for (member_ids) |mid| {
+            var kb: [64]u8 = undefined;
+            const key = chainMemberKey(&kb, mid);
+            try self.client.commandOk(&.{ "SET", key, primary_s });
+        }
+        try self.client.commandOk(sadd_chain_args);
+
+        try self.client.commandOk(args);
+        try self.client.commandOk(&.{ "ZADD", key_bylen, lens, primary_s });
+        try self.client.commandOk(&.{ "SADD", key_index, primary_s });
+    }
+
+    /// 撤一条语录。`message_id` 先按 `hikari:chainmember:{message_id}` 查它是
+    /// 不是某条 🔥 链的成员——不管是不是主键——查到就走 revokeChainLocked
+    /// 撤整条链；查不到（GET 回 nil，最常见的情形：路径1/2/3 收录的普通语录，
+    /// 或者压根没被 tombstone 过的任意 id）就走原来的单条撤稿逻辑。
+    ///
+    /// 这个 GET 是 revoke() 唯一新增的往返：它是让撤稿脱离"当次窗口能不能
+    /// 重建出链"这个约束的关键——4.4 节承诺"跨扫描窗口的 💦 也能作废前几天
+    /// 已入库的语录"对链语录同样成立，靠的就是这里查 Redis 而不是查内存里的
+    /// chains 数组。
     pub fn revoke(self: *Store, message_id: i64) Error!void {
+        var cmkb: [64]u8 = undefined;
+        const chainmember_key = chainMemberKey(&cmkb, message_id);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const primary_v = try self.client.command(&.{ "GET", chainmember_key });
+        defer primary_v.deinit(self.client.gpa);
+        const primary_id: ?i64 = switch (primary_v) {
+            .bulk => |b| if (b) |s| (std.fmt.parseInt(i64, s, 10) catch null) else null,
+            else => null,
+        };
+
+        if (primary_id) |pid| {
+            try self.revokeChainLocked(pid, message_id);
+        } else {
+            try self.revokeSingleLocked(message_id);
+        }
+    }
+
+    /// 原来 revoke() 的全部内容，改名后专门处理"这个 id 不属于任何链"的情形。
+    /// 假定调用方已经持有 self.mutex。
+    fn revokeSingleLocked(self: *Store, message_id: i64) Error!void {
         var kb: [64]u8 = undefined;
         const qk = quoteKey(&kb, message_id);
         var idb: [32]u8 = undefined;
         const ids = std.fmt.bufPrint(&idb, "{d}", .{message_id}) catch unreachable;
 
-        self.mutex.lock();
-        defer self.mutex.unlock();
         // tombstone 先落盘：它是这次作废唯一持久的事实（"这条消息永远不再入库"），
         // 而删索引、删 hash 都只是它的后果。这样任何一次部分失败最坏留下一个
         // 孤儿 hash（没人索引得到它，只占空间），而不是 hikari:index 里一个
@@ -279,6 +419,93 @@ pub const Store = struct {
         try self.client.commandOk(&.{ "SREM", key_index, ids });
         try self.client.commandOk(&.{ "ZREM", key_bylen, ids });
         try self.client.commandOk(&.{ "DEL", qk });
+    }
+
+    /// 撤一整条 🔥 链：`pid` 是链主键（revoke() 从 chainmember 映射里查到的），
+    /// `fallback_id` 是 revoke() 最初收到的那个 id（当 `hikari:chain:{pid}`
+    /// 意外为空——比如上一次撤稿已经清理过、这次映射尚未清理的半成品状态——
+    /// 时用来兜底，保证这次撤稿至少不是彻底的空操作）。假定调用方已经持有
+    /// self.mutex。
+    ///
+    /// 命令顺序：SMEMBERS 读出全部成员 → SADD tomb（全部成员，tombstone 先
+    /// 落盘，理由同 revokeSingleLocked）→ SREM index / ZREM bylen（对非主键
+    /// 成员是无害空操作，它们从未被单独索引过）→ DEL 主键的 hash → 最后一步
+    /// 清理映射本身（每个成员的 chainmember 键 + chain 成员集），不清理的话
+    /// 撤过的链会在 Redis 里留下一份不再对应任何真实语录的映射，永久占位。
+    fn revokeChainLocked(self: *Store, pid: i64, fallback_id: i64) Error!void {
+        var pkb: [64]u8 = undefined;
+        const chain_key = chainKey(&pkb, pid);
+        const members_v = try self.client.command(&.{ "SMEMBERS", chain_key });
+        defer members_v.deinit(self.client.gpa);
+        const items: []const resp.Value = switch (members_v) {
+            .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+            else => &[_]resp.Value{},
+        };
+
+        var members: std.ArrayList(i64) = .empty;
+        defer members.deinit(self.gpa);
+        for (items) |it| {
+            const s = switch (it) {
+                .bulk => |b| b orelse continue,
+                else => continue,
+            };
+            const mid = std.fmt.parseInt(i64, s, 10) catch continue;
+            try members.append(self.gpa, mid);
+        }
+        if (members.items.len == 0) {
+            // 兜底：hikari:chain:{pid} 缺失或损坏时，至少把 revoke() 原始收到
+            // 的 id 纳入清理，不让这一步彻底什么都不做——这个 id 本身仍然是
+            // 一个真实的、需要被 tombstone 的 message_id。
+            try members.append(self.gpa, fallback_id);
+        }
+
+        const member_strs = try formatIds(self.gpa, members.items);
+        defer freeIdStrings(self.gpa, member_strs);
+
+        {
+            const args = try buildMultiArgs(self.gpa, "SADD", key_tomb, member_strs);
+            defer self.gpa.free(args);
+            try self.client.commandOk(args);
+        }
+        {
+            const args = try buildMultiArgs(self.gpa, "SREM", key_index, member_strs);
+            defer self.gpa.free(args);
+            try self.client.commandOk(args);
+        }
+        {
+            const args = try buildMultiArgs(self.gpa, "ZREM", key_bylen, member_strs);
+            defer self.gpa.free(args);
+            try self.client.commandOk(args);
+        }
+
+        var qkb: [64]u8 = undefined;
+        try self.client.commandOk(&.{ "DEL", quoteKey(&qkb, pid) });
+
+        {
+            const del_args = try self.gpa.alloc([]const u8, 1 + members.items.len + 1);
+            defer self.gpa.free(del_args);
+            del_args[0] = "DEL";
+            const key_bufs = try self.gpa.alloc([64]u8, members.items.len);
+            defer self.gpa.free(key_bufs);
+            for (members.items, 0..) |mid, i| {
+                del_args[1 + i] = chainMemberKey(&key_bufs[i], mid);
+            }
+            del_args[del_args.len - 1] = chain_key;
+            try self.client.commandOk(del_args);
+        }
+    }
+
+    /// `message_id` 是否是某条已入库 🔥 链的成员（不管是不是主键）。runner.zig
+    /// 在把候选写库之前用这个作第三道关卡（tombstone、exists 之后）：一条链
+    /// 一旦成功入库，它的非主键成员永远不会出现在 `hikari:index` 里（只有主键
+    /// 会），单靠 exists() 拦不住它们被后续某次扫描当成独立消息重新收录——
+    /// 见本文件顶部 key_chainmember_prefix 的注释与 addChain 的写入顺序说明。
+    pub fn isChainMember(self: *Store, message_id: i64) Error!bool {
+        var kb: [64]u8 = undefined;
+        const key = chainMemberKey(&kb, message_id);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        return (try self.client.commandInt(&.{ "EXISTS", key })) == 1;
     }
 
     pub fn setLastRun(self: *Store, group_id: u64, ts: i64) Error!void {
@@ -799,9 +1026,12 @@ test "add 依次发 HSET / ZADD / SADD —— hikari:index 是提交点" {
     });
 }
 
-test "revoke 依次发 SADD tomb / SREM / ZREM / DEL —— tombstone 先落盘" {
+test "revoke（非链成员）先 GET chainmember 查不到，再依次发 SADD tomb / SREM / ZREM / DEL —— tombstone 先落盘" {
     const gpa = std.testing.allocator;
-    const srv = try FakeServer.start(gpa, ":1\r\n:1\r\n:1\r\n:1\r\n");
+    // 第一条回复是 GET hikari:chainmember:12345 的结果：nil，表示这个 id
+    // 不属于任何链，revoke() 据此走 revokeSingleLocked，后面四条回复跟改动前
+    // 完全一样。
+    const srv = try FakeServer.start(gpa, "$-1\r\n:1\r\n:1\r\n:1\r\n:1\r\n");
     defer {
         srv.stop();
         srv.received.deinit(gpa);
@@ -822,10 +1052,225 @@ test "revoke 依次发 SADD tomb / SREM / ZREM / DEL —— tombstone 先落盘"
     // SREM 失败会在 hikari:index 里留下一个没有 hash 的悬空 id：randomAny
     // 抽中它，HGETALL 回空，非空库对外返回 404，而且永远不会自愈。
     try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$24\r\nhikari:chainmember:12345\r\n",
         "*3\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n",
         "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
+    });
+}
+
+// ---------------------------------------------------------------------------
+// addChain / 🔥 链撤稿：见 store.zig 顶部 key_chainmember_prefix / key_chain_prefix
+// 的注释。这组测试覆盖"跨扫描窗口撤稿"这个 gap 本身——rules.classify 的
+// chainOf 只能在当次窗口重建出的链里查找，💦 引用的目标若来自缓冲池或
+// get_msg 回补（窗口外），chainOf 必然返回 null；这里验证的是 Store 层
+// 不依赖窗口、单靠 Redis 里持久化的映射就能把同样的作废展开到全部成员。
+
+test "addChain 依次发每个成员的 SET 映射 / SADD chain 集 / HSET / ZADD / SADD —— 映射先于 index 提交点落盘" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    // sampleQuote() 的 message_id 是 12345（链主键）；999 是链的第二个成员。
+    try store.addChain(sampleQuote(), &.{ 12345, 999 });
+
+    c.deinit();
+    srv.stop();
+
+    // 顺序原则跟 add() 反过来：映射（每个成员一条 SET，外加 chain 成员集的
+    // SADD）必须先于 HSET/ZADD/SADD 落盘，理由见 addChain 的文档注释——
+    // "index 提交成功、映射写失败" 会让非主键成员逃过 isChainMember 守卫。
+    try expectFrameSequence(srv.received.items, &.{
+        "*3\r\n$3\r\nSET\r\n$24\r\nhikari:chainmember:12345\r\n$5\r\n12345\r\n",
+        "*3\r\n$3\r\nSET\r\n$22\r\nhikari:chainmember:999\r\n$5\r\n12345\r\n",
+        "*4\r\n$4\r\nSADD\r\n$18\r\nhikari:chain:12345\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*32\r\n$4\r\nHSET\r\n$18\r\nhikari:quote:12345\r\n",
+        "*4\r\n$4\r\nZADD\r\n$12\r\nhikari:bylen\r\n$1\r\n7\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nSADD\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
+    });
+}
+
+fn checkAddChainAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+    const srv = try FakeServer.start(net_gpa, "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(gpa, &c);
+    try st.addChain(sampleQuote(), &.{ 12345, 999 });
+}
+
+test "addChain 在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAddChainAlloc, .{});
+}
+
+test "revoke：💦 引用一条跨窗口链的非主键成员——GET 查到主键，SMEMBERS 展开全部成员，全部 tombstone 且映射被清理" {
+    const gpa = std.testing.allocator;
+    // 场景：链 {12345, 999}（主键 12345）是之前某次扫描收录的，这次扫描的
+    // 窗口里已经看不到 12345/999 本身了（chainOf 在内存里重建不出这条链），
+    // 💦 引用的是非主键成员 999——revoke(999) 必须只靠 Redis 里的映射就能
+    // 解析出整条链并作废，这正是本次改动要补的 gap。
+    const script = "$5\r\n12345\r\n" ++ // GET hikari:chainmember:999 -> "12345"
+        "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n" ++ // SMEMBERS hikari:chain:12345 -> {12345, 999}
+        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n"; // SADD tomb / SREM index / ZREM bylen / DEL quote / DEL 映射清理
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try store.revoke(999);
+
+    c.deinit();
+    srv.stop();
+
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$22\r\nhikari:chainmember:999\r\n",
+        "*2\r\n$8\r\nSMEMBERS\r\n$18\r\nhikari:chain:12345\r\n",
+        "*4\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*4\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*4\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
+        // 映射清理不能省：这一步删掉两个成员各自的 chainmember 键与 chain
+        // 成员集本身，"mapping 必须不泄漏" 靠这一帧钉死——只查子串存在性会让
+        // 参数换位/漏删悄悄通过，见 store.zig 别处同类注释。
+        "*4\r\n$3\r\nDEL\r\n$24\r\nhikari:chainmember:12345\r\n$22\r\nhikari:chainmember:999\r\n$18\r\nhikari:chain:12345\r\n",
+    });
+}
+
+test "revoke：💦 引用链的主键本身——同样走 GET/SMEMBERS 展开，与引用非主键成员时行为一致" {
+    const gpa = std.testing.allocator;
+    const script = "$5\r\n12345\r\n" ++ // GET hikari:chainmember:12345 -> "12345"（主键映射到自己）
+        "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n" ++
+        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try store.revoke(12345);
+
+    c.deinit();
+    srv.stop();
+
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$24\r\nhikari:chainmember:12345\r\n",
+        "*2\r\n$8\r\nSMEMBERS\r\n$18\r\nhikari:chain:12345\r\n",
+        "*4\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*4\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*4\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
+        "*4\r\n$3\r\nDEL\r\n$24\r\nhikari:chainmember:12345\r\n$22\r\nhikari:chainmember:999\r\n$18\r\nhikari:chain:12345\r\n",
+    });
+}
+
+fn checkRevokeChainAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+    const script = "$5\r\n12345\r\n" ++
+        "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n" ++
+        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(gpa, &c);
+    try st.revoke(999);
+}
+
+test "revoke 撤链路径（revokeChainLocked）在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRevokeChainAlloc, .{});
+}
+
+test "isChainMember 发 EXISTS hikari:chainmember:{id} 并解读结果" {
+    const gpa = std.testing.allocator;
+    {
+        const srv = try FakeServer.start(gpa, ":1\r\n");
+        defer {
+            srv.stop();
+            srv.received.deinit(gpa);
+            gpa.destroy(srv);
+        }
+        var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+        defer c.deinit();
+        var store = Store.init(gpa, &c);
+        try std.testing.expect(try store.isChainMember(999));
+        c.deinit();
+        srv.stop();
+        try expectFrameSequence(srv.received.items, &.{
+            "*2\r\n$6\r\nEXISTS\r\n$22\r\nhikari:chainmember:999\r\n",
+        });
+    }
+    {
+        const srv = try FakeServer.start(gpa, ":0\r\n");
+        defer {
+            srv.stop();
+            srv.received.deinit(gpa);
+            gpa.destroy(srv);
+        }
+        var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+        defer c.deinit();
+        var store = Store.init(gpa, &c);
+        try std.testing.expect(!try store.isChainMember(999));
+    }
+}
+
+test "revoke：hikari:chain 集合意外为空时兜底用原始 id 完成撤稿（不是彻底空操作）" {
+    const gpa = std.testing.allocator;
+    // GET 查到主键 12345，但 SMEMBERS hikari:chain:12345 回一个空数组——
+    // 模拟数据异常/上一次撤稿留下的半成品状态。revokeChainLocked 的兜底
+    // 应该退回用 revoke() 最初收到的 id（这里是 12345 自己）继续走完
+    // tombstone/清理，而不是对着空 members 发出参数个数为 0 的非法 SADD。
+    const script = "$5\r\n12345\r\n" ++ "*0\r\n" ++ ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try store.revoke(12345);
+
+    c.deinit();
+    srv.stop();
+
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$24\r\nhikari:chainmember:12345\r\n",
+        "*2\r\n$8\r\nSMEMBERS\r\n$18\r\nhikari:chain:12345\r\n",
+        "*3\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n",
+        "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
+        // 兜底只把 fallback_id（12345 自己）纳入清理，所以最后这条 DEL 只有
+        // 两个 key：它自己的 chainmember 键 + chain 集合本身，不是三个成员。
+        "*3\r\n$3\r\nDEL\r\n$24\r\nhikari:chainmember:12345\r\n$18\r\nhikari:chain:12345\r\n",
     });
 }
 

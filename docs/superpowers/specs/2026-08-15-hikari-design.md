@@ -131,16 +131,20 @@ QQ 表情回应有两类：`emoji_type=1` 是 QQ 系统表情（id 为两三位�
 
 **`R` 是路径4（🔥 链，见 4.5 节）成员时的展开**：`R` 的发送者恒为 `OBSERVED_QQ`，所以第一个分支必定成立，`R` 本身总是可作废的目标。但若 `R` 落在某条已并链（≥2 个成员）的链上，作废集里记入的不是 `R` 自己，而是**这条链的全部成员**——不管 💦 引用的是链的第一个成员（主键）还是后面任意一个。这是必须的：这条链存的语录只有一份、主键是第一个成员的 `message_id`；💦 引用非第一个成员时，若只把那个成员记入作废集，4.4 节的删库操作会去删一个从未被索引过的 id，真正被索引的那份语录反而不会被删除。判定"`R` 属不属于某条链"依赖窗口内的 ✨/🔥 表情回应数据（4.5 节路径4 同一份输入），因此链的划分必须先于 Pass A 算好——`rules.classify` 在函数最前面先把窗口内的全部链一次性建好，Pass A 与 Pass B 共用这份结果，判定仍然是纯函数、不发起任何调用。
 
+**这条展开只覆盖 `R` 落在当次窗口能重建出的链上的情形，是一条"窗口内快路径"，不是撤稿正确性的唯一保障。** `R` 完全可能来自 3.2 节所述的缓冲池、或者 `get_msg` 回补——也就是落在**窗口外**：一条链语录一旦入库，往后任何一次扫描既可能重新看到它、也可能完全翻不到它；💦 引用的是几天前已经入库的一条链语录时，这是**常态**而不是边界情形——一条链语录只有在收录它的那次扫描**之后**才会出现在 `GET /` 里，管理员看到它、回去 💦 它，天然就是在一个后续的、无法重建出这条链的窗口里操作。`chainOf(chains, rid)` 在这种情况下必然返回 `null`，`rules.classify` 只能把裸的 `rid` 记入作废集，展开不出"这条链的全部成员"。若这就是撤稿正确性的全部依据，非第一个成员时 4.4 节的删库操作会去删一个从未被索引过的 id，真正被索引的那份语录不会被删除——这正是本设计要在 Store 层堵住的缺口，见 4.4 节与第 5 节 `hikari:chainmember:{message_id}` / `hikari:chain:{message_id}` 的说明：链的成员→主键映射在**收录当时**就持久化进 Redis，`Store.revoke` 据此在任何一次未来的扫描里、不依赖窗口重建就能查到"这个 id 属于哪条链"，把这条展开从"只在窗口内可靠"变成"任何时候都可靠"。两条路径都保留：`rules.zig` 这里的窗口内展开仍然照常运行（它不需要额外的 Redis 往返，`outcome.revoked` 已经带全了链的全部成员），`Store.revoke` 的持久化映射再兜底一遍——`runner.zig` 对 `outcome.revoked` 里的每个 id 各自单独调用一次 `Store.revoke`，两条路径都命中同一条链时，第二次以及之后的调用落在已经清理过的成员上，退化成一串幂等的空操作（tombstone 已经在、索引本来就没有、hash 本来就没有），不会出错，也不会重复计费出任何看得见的副作用。
+
 ### 4.4 作废落盘
 
-Pass A 结束后立即执行，先于 Pass B：
+Pass A 结束后立即执行，先于 Pass B。`runner.zig` 对 `outcome.revoked` 里的每一个 `message_id` 各自调用一次 `Store.revoke(id)`，落到 Redis 的实际命令序列见第 5 节；概念上每次调用做的事是：
 
-- 从 Redis 删除 `R` 对应的语录记录（若已入库）
-- 把 `R` 写入 `hikari:tomb`
+- 从 Redis 删除对应的语录记录（若已入库）
+- 把这个 id（以及，若它是链成员，链上其余全部成员）写入 `hikari:tomb`
 
-tombstone 是永久的：以后任何一次扫描再次看到这条消息，无论有没有 ✨，都不会入库。这满足"跨扫描窗口的 💦 也能作废前几天已入库的语录"。
+tombstone 是永久的：以后任何一次扫描再次看到这条消息，无论有没有 ✨，都不会入库。这满足"跨扫描窗口的 💦 也能作废前几天已入库的语录"——但这句话对**链语录**成立，靠的不是 tombstone 本身（tombstone 只解释了"这个 id 以后不会再入库"，不解释"💦 引用非主键成员时，怎么找到那份真正存在 `hikari:quote:{主键}` 里的语录并删掉它"），而是第 5 节 `hikari:chainmember:{message_id}` 这份收录时就写好的持久映射：`Store.revoke` 拿它在任何窗口之外都能查到"这个 id 属于哪条链、主键是谁"，见 4.3 节新增的那段说明。
 
-**路径4（🔥 链）的作废对象是整条链的每一个成员**，不只是链的主键：Pass A 展开后的作废集包含链上全部 `message_id`，4.4 节的这两步对其中每一个都执行一遍。第一个成员（主键）那一步会真正命中 `hikari:quote:{key}` 并删掉；其余成员从未被单独索引过，`SADD hikari:tomb` 之后的删索引/删 hash 对它们是无害的空操作，但 `hikari:tomb` 里确实多了它们的 `message_id`。这一步不能省：往后某次扫描如果这条链的 🔥 被撤掉、链散架成单条消息，幸存成员会退回路径1的单独候选资格——若它没有被单独 tombstone 过，已经被撤掉的内容就会绕过撤稿重新入库。撤稿是这个系统里唯一不允许静默失效的方向，所以宁可在 `hikari:tomb` 里多存几个从未真正用得上的 id，也不能少存。
+**路径4（🔥 链）的作废对象是整条链的每一个成员**，不只是链的主键。第一个成员（主键）那一步会真正命中 `hikari:quote:{主键}` 并删掉；其余成员从未被单独索引进 `hikari:index`/`hikari:bylen`，对它们的删索引/删 hash 是无害的空操作，但 `hikari:tomb` 里确实多了它们的 `message_id`，`hikari:chainmember:{它们自己}` 与 `hikari:chain:{主键}` 也会被一并清理（第 5 节）。这一步不能省：往后某次扫描如果这条链的 🔥 被撤掉、链散架成单条消息，幸存成员会退回路径1的单独候选资格——若它没有被单独 tombstone 过，已经被撤掉的内容就会绕过撤稿重新入库。撤稿是这个系统里唯一不允许静默失效的方向，所以宁可在 `hikari:tomb` 里多存几个从未真正用得上的 id，也不能少存。
+
+`rules.zig` 的窗口内展开（4.3 节）与 `Store.revoke` 的持久映射解析是**两条独立、都保留的路径**，不是互相替代的关系：前者在当次窗口能重建出链时不需要额外的 Redis 往返就把 `outcome.revoked` 填满，是常见情形下的快路径；后者是撤稿正确性的最终保障，覆盖前者天然覆盖不到的跨窗口情形（4.3 节新增段落）。两者同时命中同一条链时（`outcome.revoked` 已经带着全部成员，`runner.zig` 逐个调用 `Store.revoke`），第一次调用完成整条链的清理，后续几次调用会各自落在已经不属于任何链（映射已清理）的 id 上，退化成一串幂等的单条撤稿操作（tombstone 已经在、索引本来就没有、hash 本来就没有），不产生错误，也不产生额外可见的副作用——只是多花几次无害的 Redis 往返。
 
 ### 4.5 Pass B —— 收集候选
 
@@ -237,19 +241,34 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 | 键 | 类型 | 内容 |
 |---|---|---|
 | `hikari:quote:{message_id}` | HASH | 第 4.7 节全部字段，外加 `message_id` / `group_id` / `user_id` |
-| `hikari:index` | SET | 全部已入库的 `message_id` |
-| `hikari:bylen` | ZSET | score = `length`（码点数），member = `message_id` |
-| `hikari:tomb` | SET | 被作废的 `message_id` |
+| `hikari:index` | SET | 全部已入库的 `message_id`（🔥 链只有第一个成员的 `message_id` 在这里） |
+| `hikari:bylen` | ZSET | score = `length`（码点数），member = `message_id`（同上，只有链主键） |
+| `hikari:tomb` | SET | 被作废的 `message_id`（🔥 链的全部成员都在这里，不只是主键） |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` |
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次扫描窗口终点的 Unix 秒，逐群独立 |
+| `hikari:chainmember:{message_id}` | STRING | 仅 🔥 链使用：value 是这条链**主键**（第一个成员）的 `message_id`。链的每一个成员——包括主键自己——都写一份，value 都是同一个主键 |
+| `hikari:chain:{message_id}` | SET | 仅 🔥 链使用，key 里的 `{message_id}` 是链**主键**：成员是这条链的全部 `message_id`（含主键自己） |
 
-**写入**（单条语录，按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `SADD hikari:index {id}`
+**写入（普通语录，路径1/2/3）**（按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `SADD hikari:index {id}`
 
 顺序即事务语义。`exists()` 查的是 `hikari:index`，所以 `SADD` 是提交点、必须最后发：任何一次部分失败留下的状态都满足 `exists() == false`，下一次扫描原样重做一遍就修好了（三条命令都幂等）。反过来若 `SADD` 先于 `ZADD`，"`HSET`+`SADD` 成功、`ZADD` 失败" 会让这条语录 `exists() == true` 却永远不在 `hikari:bylen` 里——`GET /` 能随机到，任何带 `min_length`/`max_length` 的查询都永远看不见，且不会自愈。
 
-**删除**（同样按此顺序）：`SADD hikari:tomb {id}` → `SREM hikari:index {id}` → `ZREM hikari:bylen {id}` → `DEL hikari:quote:{id}`
+**写入（🔥 链语录，路径4，`Store.addChain`）**（按此顺序逐条发送）：对链的每个成员 `m`（含主键）依次发 `SET hikari:chainmember:{m} {主键}` → `SADD hikari:chain:{主键} {member1} {member2} ...`（一条命令带全部成员）→ 接下来跟普通语录写入完全一样的三步：`HSET hikari:quote:{主键} ...` → `ZADD hikari:bylen {length} {主键}` → `SADD hikari:index {主键}`。
+
+映射（`chainmember`/`chain`）先于 `hikari:index` 的提交点落盘，方向刻意跟"`SADD` 必须最后发"这条原则保持一致但理由不同：若映射写在提交点**之后**，"`hikari:index` 提交成功、映射写失败"会让 `exists(主键) == true`（今后重扫时被跳过、永不重试），但非主键成员逃过了下面 `isChainMember` 那道关卡——往后一次窗口若把它单独判定成候选，会被当成一条全新的独立语录再收一遍，制造碎句与整句同时入库的重复。映射写在提交点之前，任何一步失败都仍然满足 `exists(主键) == false`，下一次扫描原样重做（`SET`/`SADD`/`HSET`/`ZADD` 全部幂等）。
+
+**入库前的第三道关卡**：候选按 4.6 节过了 `hikari:tomb`（tombstone）、`hikari:index`（`exists`）两道关之后，还要再查一次 `EXISTS hikari:chainmember:{message_id}`（`Store.isChainMember`）——一条 🔥 链的非主键成员永远不会出现在 `hikari:index` 里，单靠 `exists()` 拦不住它们被后续某次扫描（比如因为其它候选写入失败导致这个群这一轮判失败、`lastrun` 没有前移，下一次触发时窗口原样重扫，而中间群里的 🔥 被增减，链的组成算出来跟第一次不一样）当成独立消息、或者另一条不同的链重新收录。这份映射一旦写下就是这条消息最终的归属：它不会因为后续扫描把它算进另一种链的组合而改变，除非这条链先被 💦 撤稿（下面段落）。
+
+**删除（普通语录）**（同样按此顺序）：`SADD hikari:tomb {id}` → `SREM hikari:index {id}` → `ZREM hikari:bylen {id}` → `DEL hikari:quote:{id}`
 
 tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 hash 都只是它的后果。这样最坏留下一个孤儿 hash（没人索引得到，只占空间），而不是 `hikari:index` 里一个没有 hash 的悬空 id——后者会被 `SRANDMEMBER` 抽中、`HGETALL` 回空，让一个非空的库对外返回 404，且永远不会自愈。
+
+**删除（`Store.revoke` 的完整逻辑，覆盖普通语录与 🔥 链）**：先 `GET hikari:chainmember:{id}`。
+
+- 查不到（nil，最常见：路径1/2/3 的语录，或压根没被这份映射记录过的任意 id）→ 走上面"删除（普通语录）"那四步，原样不变。
+- 查到（value 是链主键 `p`）→ 说明 `id` 是某条 🔥 链的成员（不论是不是主键自己）：`SMEMBERS hikari:chain:{p}` 拿到全部成员 → `SADD hikari:tomb {member1} {member2} ...`（一条命令，全部成员一起 tombstone，tombstone 仍然先落盘）→ `SREM hikari:index {member1} ...` / `ZREM hikari:bylen {member1} ...`（对非主键成员是无害空操作）→ `DEL hikari:quote:{p}`（只有主键有 hash）→ 最后 `DEL hikari:chainmember:{member1} hikari:chainmember:{member2} ... hikari:chain:{p}`，把这条链的映射连同 chain 成员集本身一并清理——不清理的话，一条已经撤稿的链会在 Redis 里永久留下一份不再对应任何真实语录的映射。
+
+`rules.zig` 的窗口内展开（4.3 节）与这里靠 `hikari:chainmember` 解析的路径是两条独立、都保留的路径：前者是当次窗口能重建出链时的快路径（`outcome.revoked` 已经带全了链的全部成员，不需要额外 Redis 往返）；后者是撤稿正确性的最终保障，覆盖前者天然覆盖不到的跨窗口情形。`runner.zig` 对 `outcome.revoked` 里的每个 id 各自单独调用一次 `Store.revoke`，两条路径同时命中同一条链时，第一次调用完成整条链的清理，之后几次调用落在已经不属于任何链（映射已清理）的 id 上，退化成一串幂等的空操作，不产生错误。
 
 **随机取一条**：
 
