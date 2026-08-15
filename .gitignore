@@ -141,3 +141,10 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# Claude Code local state and worktrees
+.claude/
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
