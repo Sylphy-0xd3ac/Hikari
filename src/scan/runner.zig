@@ -28,6 +28,47 @@ pub fn failedLine(gpa: std.mem.Allocator, reason: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "Failed: {s}", .{reason});
 }
 
+/// 一个群这一轮里出的岔子。三类分开计数，因为它们的后果不一样，运营方需要
+/// 从群里那一行 `Failed:` 直接看出是哪一类：
+///   - revoke_failed：撤稿没落盘。**最严重的一类**——那条 💦 明天就滑出窗口，
+///     永远不会被重新看到，而语录还在公网上可以被随机到。
+///   - add_failed：语录没写进库。下一次扫描窗口还包含它的话会重试。
+///   - unattributed：群名/群名片没问出来，这一批候选整批没写（见 scanGroup）。
+pub const Trouble = struct {
+    revoke_failed: usize = 0,
+    add_failed: usize = 0,
+    unattributed: usize = 0,
+    last_err: []const u8 = "",
+
+    pub fn any(self: Trouble) bool {
+        return self.revoke_failed > 0 or self.add_failed > 0 or self.unattributed > 0;
+    }
+};
+
+/// 把 Trouble 组装成 `Failed:` 后面那段原因串。多类同时发生时用 "; " 串起来，
+/// 一行说清楚，不发多行——群里那几行日志是运营方唯一的运行信号，行数固定才好核对。
+pub fn troubleReason(gpa: std.mem.Allocator, t: Trouble) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    var w = out.writer(gpa);
+
+    if (t.revoke_failed > 0) {
+        try w.print("{d} revocation(s) failed", .{t.revoke_failed});
+    }
+    if (t.add_failed > 0) {
+        if (out.items.len > 0) try w.writeAll("; ");
+        try w.print("{d} quote(s) failed to save", .{t.add_failed});
+    }
+    if (t.unattributed > 0) {
+        if (out.items.len > 0) try w.writeAll("; ");
+        try w.print("{d} quote(s) not written: group attribution unavailable", .{t.unattributed});
+    }
+    if (t.last_err.len > 0) {
+        try w.print(" (last error: {s})", .{t.last_err});
+    }
+    return out.toOwnedSlice(gpa);
+}
+
 pub const BuildArgs = struct {
     id: u64,
     text: []const u8,
@@ -125,28 +166,45 @@ fn sendLine(deps: Deps, group_id: u64, text: []const u8) void {
     };
 }
 
-fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) []const u8 {
+/// 取群名。**null 与空串是两回事**：空串表示"问到了，这个群就是没名字"，
+/// null 表示"这次没问出来"（请求失败 / 响应不是对象 / 没有 group_name 字段 /
+/// 值不是字符串）。调用方靠这个区分要不要把这批语录写进库——buildQuote 会把
+/// from 原样烧进每一条语录，而设计里没有任何事后编辑的路径，一次 API 抖动
+/// 就会让这一批语录永远带着空归属对外服务。
+fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{ .group_id = group_id }, .{}, &aw.writer) catch |e| {
         std.log.warn("group {d}: building get_group_info request failed: {s}", .{ group_id, @errorName(e) });
-        return "";
+        return null;
     };
     const data = deps.nap.callData(arena, "get_group_info", aw.written()) catch |e| {
         std.log.warn("group {d}: get_group_info failed: {s}", .{ group_id, @errorName(e) });
-        return "";
+        return null;
     };
     const obj = switch (data) {
         .object => |o| o,
-        else => return "",
+        else => {
+            std.log.warn("group {d}: get_group_info returned a non-object", .{group_id});
+            return null;
+        },
     };
-    const v = obj.get("group_name") orelse return "";
+    const v = obj.get("group_name") orelse {
+        std.log.warn("group {d}: get_group_info reply has no group_name field", .{group_id});
+        return null;
+    };
     return switch (v) {
         .string => |s| s,
-        else => "",
+        else => {
+            std.log.warn("group {d}: get_group_info group_name is not a string", .{group_id});
+            return null;
+        },
     };
 }
 
-fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) []const u8 {
+/// 取被观察者在这个群里的名片（群名片优先，其次昵称）。null / 空串的区分同
+/// groupName：两个字段都缺是"没问出来"，两个字段都在但都是空是"这人确实
+/// 没设名片也没有昵称"。
+fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{
         .group_id = group_id,
@@ -154,20 +212,29 @@ fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) []const u8 
         .no_cache = true,
     }, .{}, &aw.writer) catch |e| {
         std.log.warn("group {d}: building get_group_member_info request failed: {s}", .{ group_id, @errorName(e) });
-        return "";
+        return null;
     };
     const data = deps.nap.callData(arena, "get_group_member_info", aw.written()) catch |e| {
         std.log.warn("group {d}: get_group_member_info failed: {s}", .{ group_id, @errorName(e) });
-        return "";
+        return null;
     };
     const obj = switch (data) {
         .object => |o| o,
-        else => return "",
+        else => {
+            std.log.warn("group {d}: get_group_member_info returned a non-object", .{group_id});
+            return null;
+        },
     };
+    var seen_any = false;
     for ([_][]const u8{ "card", "nickname" }) |k| {
         if (obj.get(k)) |v| {
+            seen_any = true;
             if (v == .string and v.string.len > 0) return v.string;
         }
+    }
+    if (!seen_any) {
+        std.log.warn("group {d}: get_group_member_info reply has neither card nor nickname", .{group_id});
+        return null;
     }
     return "";
 }
@@ -338,87 +405,98 @@ fn scanGroup(deps: Deps, gid: u64, win_start: i64, win_end: i64) !bool {
     }
 
     // ---- 6. 作废先落盘 ----
+    var trouble: Trouble = .{};
     for (outcome.revoked) |rid| {
         deps.st.revoke(rid) catch |e| {
-            std.log.warn("revoke {d} failed: {s}", .{ rid, @errorName(e) });
+            // 作废失败必须跟入库失败一样压掉 Successfully. 与 setLastRun。
+            // 它其实更严重：这条 💦 明天就滑出 24h 窗口，之后任何一次扫描都
+            // 不会再看到它，撤稿请求就此永久丢失，而那条语录仍然公开可查。
+            // 只打一条 warn 然后照常报 Successfully. 是这个产品里最坏的失败模式。
+            std.log.warn("group {d}: revoke {d} failed: {s}", .{ gid, rid, @errorName(e) });
+            trouble.revoke_failed += 1;
+            trouble.last_err = @errorName(e);
         };
     }
 
     // ---- 7. 过滤并入库 ----
     const from = groupName(deps, a, gid);
     const from_who = observedCard(deps, a, gid);
+    // 归属信息没问出来就一条都不写：buildQuote 把 from/from_who 原样烧进每一条
+    // 语录，而设计里没有任何事后编辑的路径——一次 get_group_info 抖动会让这一批
+    // 语录永远带着空的 from/from_who 对外服务。宁可整批不写、这个群算失败、
+    // 不 setLastRun，等重启补跑或者下一次扫描重来：候选仍在窗口里，
+    // isTombstoned/exists 保证重扫是幂等的。
+    const attributed = from != null and from_who != null;
 
     var added: usize = 0;
     var skipped: usize = 0;
-    // store.add 失败与"被关卡拦下"是两码事（spec §7 的 skipped 特指后者），
-    // 单独计数，不混进 skipped。
-    var failed: usize = 0;
-    var last_add_err: []const u8 = "";
 
-    for (outcome.candidates) |cand| {
-        if (try deps.st.isTombstoned(cand.message_id)) {
-            skipped += 1;
-            continue;
-        }
-        if (try deps.st.exists(cand.message_id)) {
-            skipped += 1;
-            continue;
-        }
-
-        var target: ?onebot.Message = null;
-        for (pool.items) |p| {
-            if (p.message_id == cand.message_id) {
-                target = p;
-                break;
-            }
-        }
-
-        const text: []const u8 = if (cand.text_override) |t| t else blk: {
-            const tm = target orelse {
+    if (attributed) {
+        for (outcome.candidates) |cand| {
+            if (try deps.st.isTombstoned(cand.message_id)) {
                 skipped += 1;
                 continue;
+            }
+            if (try deps.st.exists(cand.message_id)) {
+                skipped += 1;
+                continue;
+            }
+
+            var target: ?onebot.Message = null;
+            for (pool.items) |p| {
+                if (p.message_id == cand.message_id) {
+                    target = p;
+                    break;
+                }
+            }
+
+            const text: []const u8 = if (cand.text_override) |t| t else blk: {
+                const tm = target orelse {
+                    skipped += 1;
+                    continue;
+                };
+                break :blk try tm.renderText(a);
             };
-            break :blk try tm.renderText(a);
-        };
-        if (text.len == 0) {
-            skipped += 1;
-            continue;
+            if (text.len == 0) {
+                skipped += 1;
+                continue;
+            }
+
+            const id = try deps.st.nextId();
+            const q = try buildQuote(deps.gpa, .{
+                .id = id,
+                .text = text,
+                .from = from.?,
+                .from_who = from_who.?,
+                .created_at = if (target) |t| t.time else win_end,
+                .message_id = cand.message_id,
+                .group_id = gid,
+                .user_id = if (target) |t| t.user_id else deps.observed_qq,
+            });
+            defer freeQuote(deps.gpa, q);
+
+            // store.add 失败与"被关卡拦下"是两码事（spec §7 的 skipped 特指后者），
+            // 单独计数，不混进 skipped。
+            deps.st.add(q) catch |e| {
+                std.log.warn("group {d}: add {d} failed: {s}", .{ gid, cand.message_id, @errorName(e) });
+                trouble.add_failed += 1;
+                trouble.last_err = @errorName(e);
+                continue;
+            };
+            added += 1;
         }
-
-        const id = try deps.st.nextId();
-        const q = try buildQuote(deps.gpa, .{
-            .id = id,
-            .text = text,
-            .from = from,
-            .from_who = from_who,
-            .created_at = if (target) |t| t.time else win_end,
-            .message_id = cand.message_id,
-            .group_id = gid,
-            .user_id = if (target) |t| t.user_id else deps.observed_qq,
-        });
-        defer freeQuote(deps.gpa, q);
-
-        deps.st.add(q) catch |e| {
-            std.log.warn("add {d} failed: {s}", .{ cand.message_id, @errorName(e) });
-            failed += 1;
-            last_add_err = @errorName(e);
-            continue;
-        };
-        added += 1;
+    } else {
+        trouble.unattributed = outcome.candidates.len;
     }
 
     const result = try resultLine(deps.gpa, added, skipped);
     defer deps.gpa.free(result);
     sendLine(deps, gid, result);
 
-    // 写库失败不能用 Successfully. 收尾——那是运营方唯一的"这次跑成功了"信号。
-    // 改发 Failed 行，带上丢了几条、最后一次的错误原因，让人知道有东西没存住。
-    if (failed > 0) {
-        const reason = try std.fmt.allocPrint(
-            deps.gpa,
-            "{d} quote(s) failed to save (last error: {s})",
-            .{ failed, last_add_err },
-        );
+    // 出过岔子就不能用 Successfully. 收尾——那是运营方唯一的"这次跑成功了"信号。
+    // 改发 Failed 行，带上各类失败的条数与最后一次的错误原因。
+    if (trouble.any()) {
+        const reason = try troubleReason(deps.gpa, trouble);
         defer deps.gpa.free(reason);
         const msg = try failedLine(deps.gpa, reason);
         defer deps.gpa.free(msg);
@@ -475,6 +553,60 @@ test "failedLine 格式" {
     const a = try failedLine(gpa, "ConnectionFailed");
     defer gpa.free(a);
     try std.testing.expectEqualStrings("Failed: ConnectionFailed", a);
+}
+
+test "Trouble.any 只在真出过岔子时为真" {
+    try std.testing.expect(!(Trouble{}).any());
+    try std.testing.expect((Trouble{ .revoke_failed = 1 }).any());
+    try std.testing.expect((Trouble{ .add_failed = 1 }).any());
+    try std.testing.expect((Trouble{ .unattributed = 1 }).any());
+    // last_err 单独存在不算岔子（它只是给上面三类计数配的说明）
+    try std.testing.expect(!(Trouble{ .last_err = "ReadFailed" }).any());
+}
+
+test "troubleReason：作废失败单独成句，且一定出现在 Failed 行里" {
+    const gpa = std.testing.allocator;
+    const r = try troubleReason(gpa, .{ .revoke_failed = 2, .last_err = "ConnectionFailed" });
+    defer gpa.free(r);
+    try std.testing.expectEqualStrings("2 revocation(s) failed (last error: ConnectionFailed)", r);
+}
+
+test "troubleReason：入库失败沿用原来的措辞" {
+    const gpa = std.testing.allocator;
+    const r = try troubleReason(gpa, .{ .add_failed = 3, .last_err = "RedisError" });
+    defer gpa.free(r);
+    try std.testing.expectEqualStrings("3 quote(s) failed to save (last error: RedisError)", r);
+}
+
+test "troubleReason：多类同时发生时串成一行，顺序固定" {
+    const gpa = std.testing.allocator;
+    const r = try troubleReason(gpa, .{
+        .revoke_failed = 1,
+        .add_failed = 2,
+        .unattributed = 4,
+        .last_err = "WriteFailed",
+    });
+    defer gpa.free(r);
+    try std.testing.expectEqualStrings(
+        "1 revocation(s) failed; 2 quote(s) failed to save; 4 quote(s) not written: group attribution unavailable (last error: WriteFailed)",
+        r,
+    );
+}
+
+test "troubleReason：归属拿不到时没有 last_err，不带尾巴" {
+    const gpa = std.testing.allocator;
+    const r = try troubleReason(gpa, .{ .unattributed = 5 });
+    defer gpa.free(r);
+    try std.testing.expectEqualStrings("5 quote(s) not written: group attribution unavailable", r);
+}
+
+fn troubleReasonUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    const r = try troubleReason(gpa, .{ .revoke_failed = 1, .add_failed = 1, .unattributed = 1, .last_err = "X" });
+    gpa.free(r);
+}
+
+test "OOM 回归：troubleReason 在任意分配点失败都不泄漏" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, troubleReasonUnderFailingAllocator, .{});
 }
 
 test "buildQuote 填齐 hitokoto 字段" {
