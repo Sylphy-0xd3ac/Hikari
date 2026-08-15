@@ -144,3 +144,7 @@ vite.config.ts.timestamp-*
 
 # Claude Code local state and worktrees
 .claude/
+
+# Zig build artifacts
+.zig-cache/
+zig-out/
