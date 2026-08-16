@@ -538,6 +538,29 @@ pub const Store = struct {
         return (try self.client.commandInt(&.{ "EXISTS", key })) == 1;
     }
 
+    /// `chainMemberKey(message_id)` 映射到的主键，nil（没有映射）时返回
+    /// null——跟 isChainMember 的区别是它交回**原始的 GET 结果**而不是一个
+    /// 布尔值，因为调用方（runner.zig，🔥 链候选自己的写前守卫）需要区分
+    /// "这个 id 完全没有映射" 与 "这个 id 映射到它自己" 两种情况：addChain
+    /// 把每个成员（含主键自己）的映射写在 HSET/ZADD/SADD 提交点**之前**
+    /// （见 addChain 的说明），所以主键那条候选如果上一次 addChain 在映射
+    /// 写完、HSET 还没提交前失败，chainPrimaryOf(主键) 会返回主键自己——
+    /// 这不是"已经被别的链吸收"，是"上一次没提交完，这次该原样重试"，
+    /// isChainMember 单纯判 EXISTS 分不清这两种情况，会把后一种也当成前
+    /// 一种拦下，导致这条链永远卡住、永远重试不了。
+    pub fn chainPrimaryOf(self: *Store, message_id: i64) Error!?i64 {
+        var kb: [64]u8 = undefined;
+        const key = chainMemberKey(&kb, message_id);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = try self.client.command(&.{ "GET", key });
+        defer v.deinit(self.client.gpa);
+        return switch (v) {
+            .bulk => |b| if (b) |s| (std.fmt.parseInt(i64, s, 10) catch null) else null,
+            else => null,
+        };
+    }
+
     /// 刷新这个用户当前的群名片快照（`hikari:username:{user_id}`）。调用方
     /// （`scan/runner.zig` 的 `authorCard`）只在这一轮真的问到
     /// `get_group_member_info` 的结果时才调用；问不到（网络失败、这个人已经
@@ -619,10 +642,24 @@ pub const Store = struct {
     /// 所以 MGET 对它们必然回 nil、直接落回 hash 里的旧值——不需要任何迁移
     /// 脚本去补写这两个键。
     ///
-    /// MGET 本身失败（Redis I/O/协议错误）直接 `try` 向上传播，不在这里单独
-    /// 吞掉：这条连接若真的坏了，静默吞掉这一次失败不会让后续调用更可靠，
-    /// 只会把问题从"GET / 返回 500"降级成"GET / 返回一条归属信息不可信的
-    /// 200"，后者更难被运营方发现。
+    /// MGET 失败统一走同一条策略：任何不是"成功拿到一个数组"的结果都向上
+    /// 传播成一个真正的 Error，不在这里为任何一种分支静默 return——早期
+    /// 版本只让传输层/协议层错误（`self.client.command` 本身 `try` 失败）
+    /// 经过传播，但 Redis 对 MGET 回一个合法的 `-ERR ...`（`resp.Value` 的
+    /// `.err` 分支）时 `command()` 并不会把它转成 Zig error（那是
+    /// commandOk/commandInt 自己做的转换，见 redis/client.zig），直接查
+    /// `.array` 会落进 `else` 分支被悄悄吞掉，跟"这个键不存在"混成同一种
+    /// 结果——这是本方法此前不一致的地方，已按 review 意见改成两种情况都
+    /// 显式返回 Error。
+    ///
+    /// 为什么不能吞：这是一条单连接、请求/响应严格配对的协议，Store 层没有
+    /// 重新对齐帧边界的机制。MGET 一旦在读到一半时失败（不管是传输层错误、
+    /// 协议解析错误，还是服务端合法返回的 `-ERR`），这条连接接下来读到的
+    /// 字节是不是下一条命令真正的回复，已经没有任何保证——真正的风险不是
+    /// "这次渲染用了旧名字"，是"连接的帧对齐从这里起就不可信，后面所有
+    /// 命令都可能读到错位的回复"。把这类失败原样 try 出去，让上层（HTTP
+    /// 500 / scanGroup 的 Failed 行）看见，才对得上"连接可能已经不可信"
+    /// 这个事实；静默吞掉只会把一个连接层面的问题伪装成一次内容层面的巧合。
     fn resolveDisplayNames(self: *Store, gpa: std.mem.Allocator, q: *Quote) Error!void {
         var ukb: [64]u8 = undefined;
         var gkb: [64]u8 = undefined;
@@ -631,8 +668,9 @@ pub const Store = struct {
         const v = try self.client.command(&.{ "MGET", ukey, gkey });
         defer v.deinit(self.client.gpa);
         const items: []const resp.Value = switch (v) {
-            .array => |a| a orelse return,
-            else => return,
+            .array => |a| a orelse return error.ProtocolError,
+            .err => return error.RedisError,
+            else => return error.ProtocolError,
         };
         if (items.len >= 1) {
             if (bulkOrNull(items[0])) |name| {
@@ -1351,6 +1389,45 @@ test "isChainMember 发 EXISTS hikari:chainmember:{id} 并解读结果" {
     }
 }
 
+test "chainPrimaryOf 发 GET hikari:chainmember:{id}，nil 返回 null，命中时解析出主键" {
+    const gpa = std.testing.allocator;
+    {
+        const srv = try FakeServer.start(gpa, "$-1\r\n");
+        defer {
+            srv.stop();
+            srv.received.deinit(gpa);
+            gpa.destroy(srv);
+        }
+        var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+        defer c.deinit();
+        var store = Store.init(gpa, &c);
+        try std.testing.expectEqual(@as(?i64, null), try store.chainPrimaryOf(999));
+        c.deinit();
+        srv.stop();
+        try expectFrameSequence(srv.received.items, &.{
+            "*2\r\n$3\r\nGET\r\n$22\r\nhikari:chainmember:999\r\n",
+        });
+    }
+    {
+        // 命中：映射存在，指向主键 1——这条测试同时覆盖"指向别的主键"
+        // （runner.zig 据此拦下这条候选）与"指向自己"（1 GET
+        // hikari:chainmember:1 -> "1"，runner.zig 据此允许 addChain
+        // 重试）这两种在 runner.zig 里语义完全不同、但在这个方法这一层
+        // 都只是"原样交回 GET 到的整数"的情形；两种语义的区分留给
+        // 调用方，这个方法本身不做判断。
+        const srv = try FakeServer.start(gpa, "$1\r\n1\r\n");
+        defer {
+            srv.stop();
+            srv.received.deinit(gpa);
+            gpa.destroy(srv);
+        }
+        var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+        defer c.deinit();
+        var store = Store.init(gpa, &c);
+        try std.testing.expectEqual(@as(?i64, 1), try store.chainPrimaryOf(1));
+    }
+}
+
 test "revoke：hikari:chain 集合意外为空时兜底用原始 id 完成撤稿（不是彻底空操作）" {
     const gpa = std.testing.allocator;
     // GET 查到主键 12345，但 SMEMBERS hikari:chain:12345 回一个空数组——
@@ -1674,6 +1751,36 @@ test "randomAny：hikari:username/hikari:groupname 缺失（nil）时落回 hash
 
     try std.testing.expectEqualStrings("小明", q.from_who);
     try std.testing.expectEqualStrings("测试群", q.from);
+}
+
+test "randomAny：resolveDisplayNames 的 MGET 收到 -ERR 回复时向上传播 error.RedisError，不是静默落回 hash 的旧值" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // MGET 回一个合法的 RESP error（"-ERR ...\r\n"）——这不是传输层/协议层
+    // 失败（`self.client.command` 本身不会因为收到 `.err` 而 `try` 失败，
+    // 那是 commandOk/commandInt 自己转换的），是服务端明确拒绝了这条命令。
+    // resolveDisplayNames 必须把它当成一个真正的 Error 传播出去，不能落进
+    // "当作没找到、退回 hash 旧值"这条分支——见该方法文档注释：这是单连接
+    // 协议，一条读到一半的失败意味着后续帧对齐都不再可信，不能被静默吞掉
+    // 伪装成一次内容层面的巧合。
+    const script = try std.mem.concat(gpa, u8, &.{ "$5\r\n12345\r\n", hgetall_reply, "-ERR unknown command 'MGET'\r\n" });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try std.testing.expectError(error.RedisError, store.randomAny(gpa));
 }
 
 test "randomAny：作者已经离群——hikari:username 从未刷新成功过时同样落回旧值（fallback 的另一种成因，不是另一条代码路径）" {

@@ -212,11 +212,9 @@ pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
 
     // 观察全员时没有"那一个被观察者"可以把这批语录记在名下。与其静默挑一个
     // 或者写个空归属（入库后没有编辑路径，写错就是永久的），不如直接拒绝，
-    // 等 --user 参数落地后由操作者显式指定。
-    const attribution_qq = if (deps.observed_qqs.len == 0)
-        return error.AttributionUnavailable
-    else
-        deps.observed_qqs[0];
+    // 等 --user 参数落地后由操作者显式指定。复用 runner.soleObserved 而不是
+    // 在这里另开一份等价的 if/else——"空集合怎么办"这个判断只应该有一处。
+    const attribution_qq = runner.soleObserved(deps) orelse return error.AttributionUnavailable;
 
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
     const from_who = runner.memberCard(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
