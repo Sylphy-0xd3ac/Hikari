@@ -376,6 +376,13 @@ fn hgetallReply() []const u8 {
         "$7\r\nuser_id\r\n$5\r\n10001\r\n";
 }
 
+/// store.zig 的 fetchById 现在在每次 HGETALL 之后紧跟着发一条 `MGET
+/// hikari:username:{id} hikari:groupname:{id}`（resolveDisplayNames，改名
+/// 覆盖/回退旧值）。这里的测试只关心 HTTP 层的路由/状态码/响应体，不关心
+/// 改名覆盖本身（那在 store.zig 单独测），所以统一喂一对 nil，让内容退回
+/// hash 里的值，测试原有的断言不用跟着改。
+const mget_nil_reply = "*2\r\n$-1\r\n$-1\r\n";
+
 const Harness = struct {
     fake: *FakeRedis,
     client: redis.Client,
@@ -444,7 +451,7 @@ fn rawRequest(gpa: std.mem.Allocator, port: u16, request_text: []const u8) ![]u8
 
 test "200 响应带 connection: close —— 宣称的行为跟真的会关连接一致" {
     const gpa = std.testing.allocator;
-    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply() };
+    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply(), mget_nil_reply };
     const h = try startHarness(gpa, &replies);
     defer stopHarness(h);
 
@@ -495,7 +502,7 @@ test "静默客户端撞上接收超时，serveOnce 出错返回而不是永久�
 
 test "GET / 返回 hitokoto JSON" {
     const gpa = std.testing.allocator;
-    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply() };
+    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply(), mget_nil_reply };
     const h = try startHarness(gpa, &replies);
     defer stopHarness(h);
 
@@ -511,7 +518,7 @@ test "GET / 返回 hitokoto JSON" {
 
 test "GET /?encode=text 返回纯文本" {
     const gpa = std.testing.allocator;
-    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply() };
+    const replies = [_][]const u8{ "$5\r\n12345\r\n", hgetallReply(), mget_nil_reply };
     const h = try startHarness(gpa, &replies);
     defer stopHarness(h);
 
@@ -618,7 +625,7 @@ test "min_length/max_length 过滤后为空时返回 404（区别于「库整体
 
 test "min_length/max_length 命中时返回 200，且发给 Redis 的 min/max 顺序正确" {
     const gpa = std.testing.allocator;
-    const replies = [_][]const u8{ "*1\r\n$5\r\n12345\r\n", hgetallReply() };
+    const replies = [_][]const u8{ "*1\r\n$5\r\n12345\r\n", hgetallReply(), mget_nil_reply };
     const fake = try FakeRedis.start(gpa, &replies);
     defer {
         fake.stop();
@@ -711,7 +718,7 @@ fn hgetallReply2() []const u8 {
 test "GET /extra/all 返回全部语录的 JSON 数组" {
     const gpa = std.testing.allocator;
     const smembers = "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n";
-    const replies = [_][]const u8{ smembers, hgetallReply(), hgetallReply2() };
+    const replies = [_][]const u8{ smembers, hgetallReply(), mget_nil_reply, hgetallReply2(), mget_nil_reply };
     const h = try startHarness(gpa, &replies);
     defer stopHarness(h);
 
@@ -774,7 +781,7 @@ test "GET /extra/batch/:count 用 SRANDMEMBER 的负数形式取样（允许重�
     // 同一个 id 出现两次：真实 Redis 的负数形式允许重复，这里直接在脚本层
     // 模拟"抽中了同一条两次"，顺带验证 handleExtraBatch 不会偷偷去重。
     const srandmember = "*2\r\n$5\r\n12345\r\n$5\r\n12345\r\n";
-    const replies = [_][]const u8{ srandmember, hgetallReply(), hgetallReply() };
+    const replies = [_][]const u8{ srandmember, hgetallReply(), mget_nil_reply, hgetallReply(), mget_nil_reply };
     const fake = try FakeRedis.start(gpa, &replies);
     defer {
         fake.stop();

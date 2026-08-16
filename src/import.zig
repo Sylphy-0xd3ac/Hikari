@@ -219,7 +219,7 @@ pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
         deps.observed_qqs[0];
 
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
-    const from_who = runner.observedCard(deps, a, group_id) orelse return error.AttributionUnavailable;
+    const from_who = runner.memberCard(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
 
     for (parsed.lines) |line| {
         try importLine(deps, line, from, from_who, group_id, attribution_qq, now, &summary);
@@ -410,7 +410,7 @@ const FakeRedisServer = struct {
 /// 接受一条连接，在这条连接上依次收 `replies.len` 个 HTTP 请求、按顺序各
 /// 回一个预先写好的 JSON body——跟 napcat.zig「call 发出带 Bearer token
 /// 的 POST 请求」测试用的是同一套 std.http.Server 搭法，只是把单次请求-响应
-/// 循环了 replies.len 次，好覆盖 groupName + observedCard 两次调用。
+/// 循环了 replies.len 次，好覆盖 groupName + memberCard 两次调用。
 const FakeNapcatServer = struct {
     listener: std.net.Server,
     thread: std.Thread,

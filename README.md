@@ -48,6 +48,17 @@ curl 'http://127.0.0.1:8080/'
 语录从 Redis 删除并永久 tombstone——之后任何一次扫描再次看到这条消息都不会重新入库。💦 引用到
 🔥 链上任意一个成员都会作废整条链，链的全部成员都会被 tombstone，不只是被引用的那一条。
 
+**归属（`from` / `from_who`）**：`from` 是群名，`from_who` 是**语录作者自己**的群名片
+（不是固定的某一个人）——`OBSERVED_QQS` 允许留空表示"观察所有人"，一个群不再有唯一的"那个
+被观察者"可以整群问一次名片，改成按候选各自的作者查、每次扫描内按作者缓存（同一个人一天说好
+几句只问一次）。这两者都是**渲染时解析**的：语录入库时把当时问到的名字写进 hash 当快照，同时
+把最新值刷新进 `hikari:username:{user_id}` / `hikari:groupname:{group_id}`；下次有人改名或群改
+名，只要这个人 / 这个群后续还被扫描到，`GET /` 之类的接口会优先用这两个键的实时值覆盖 hash 里
+的旧快照，一次改名就能反映到这个人说过的全部历史语录，不需要逐条改写。这两个键缺失时（导入的
+语录、从未被扫描到过的作者、已经离群且从未刷新成功过）落回 hash 里存的快照。管理员手动收录
+（路径 3）额外把 `creator`/`creator_uid` 覆盖成那位管理员自己的信息，而不是其余三条路径固定的
+`"Hikari"`/`0`。
+
 ## 环境变量
 
 复制 `.env.example` 为 `.env` 并填入真实值。
@@ -121,6 +132,8 @@ curl 'http://127.0.0.1:8080/extra/batch/5'
 | `hikari:tomb` | SET | 被作废的 `message_id`（永久） |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` 生成 `id` 字段 |
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立 |
+| `hikari:username:{user_id}` | STRING | 这个人当前的群名片（或昵称），每次扫描按遇到的候选作者刷新；渲染时覆盖语录 hash 里冻结的 `from_who` 快照 |
+| `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，每次扫描刷新；渲染时覆盖语录 hash 里冻结的 `from` 快照 |
 
 ## 构建
 
@@ -165,7 +178,7 @@ journalctl -u hikari -f
 ## 开发
 
 ```bash
-zig build test          # 单元测试，约 242 个
+zig build test          # 单元测试，281 个
 ```
 
 跑一次真实扫描不需要等到定时触发，也不需要临时改 `SCAN_TIME` 再改回去：`hikari run` 用跟常驻路径

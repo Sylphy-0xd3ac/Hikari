@@ -20,6 +20,18 @@ pub const key_chainmember_prefix = "hikari:chainmember";
 /// （含主键自己）。revoke() 撤一条链时先靠 chainmember 映射拿到主键，再靠
 /// 这个 SET 拿到全部成员，逐个 tombstone。
 pub const key_chain_prefix = "hikari:chain";
+/// `hikari:username:{user_id}` STRING，这个人当前的群名片（群名片优先，
+/// 否则昵称）快照。`scan/runner.zig` 的 `authorCard` 在每次扫描里按**遇到的
+/// 作者**（不是固定的被观察者）刷新它——群名片会改，语录 hash 里冻结的
+/// `from_who` 不会。渲染语录时（`fetchById`/`resolveDisplayNames`）用这个键
+/// 覆盖 hash 里的旧值，让一次改名同时反映到这个人说过的全部历史语录上；
+/// 这个键缺失（GET/MGET 回 nil）——从未被某次扫描当过候选作者、这个人已经
+/// 离群且从来没成功刷新过、或者语录是 `import` 写进来的——渲染时落回 hash
+/// 里存的旧值，见 `resolveDisplayNames` 顶部的完整说明。
+pub const key_username_prefix = "hikari:username";
+/// `hikari:groupname:{group_id}` STRING，这个群当前的群名快照，用法和理由
+/// 跟 `key_username_prefix` 对称，只是覆盖的字段是 `from` 而不是 `from_who`。
+pub const key_groupname_prefix = "hikari:groupname";
 
 pub const Quote = struct {
     id: u64,
@@ -74,6 +86,14 @@ pub fn chainMemberKey(buf: *[64]u8, message_id: i64) []const u8 {
 
 pub fn chainKey(buf: *[64]u8, message_id: i64) []const u8 {
     return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_chain_prefix, message_id }) catch unreachable;
+}
+
+pub fn usernameKey(buf: *[64]u8, user_id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_username_prefix, user_id }) catch unreachable;
+}
+
+pub fn groupNameKey(buf: *[64]u8, group_id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_groupname_prefix, group_id }) catch unreachable;
 }
 
 fn dupInt(gpa: std.mem.Allocator, v: anytype) ![]const u8 {
@@ -189,6 +209,16 @@ fn buildMultiArgs(gpa: std.mem.Allocator, cmd: []const u8, key: []const u8, memb
     args[1] = key;
     for (members, 0..) |m, i| args[2 + i] = m;
     return args;
+}
+
+/// MGET 回复里一个元素的 bulk string，nil 与非 bulk 类型统一折叠成 null——
+/// `resolveDisplayNames` 靠这个区分"这个键真的存在（哪怕值是空串）"与
+/// "这个键压根没写过"。
+fn bulkOrNull(v: resp.Value) ?[]const u8 {
+    return switch (v) {
+        .bulk => |b| b,
+        else => null,
+    };
 }
 
 fn pairLookup(pairs: []const resp.Value, name: []const u8) ?[]const u8 {
@@ -508,6 +538,29 @@ pub const Store = struct {
         return (try self.client.commandInt(&.{ "EXISTS", key })) == 1;
     }
 
+    /// 刷新这个用户当前的群名片快照（`hikari:username:{user_id}`）。调用方
+    /// （`scan/runner.zig` 的 `authorCard`）只在这一轮真的问到
+    /// `get_group_member_info` 的结果时才调用；问不到（网络失败、这个人已经
+    /// 离群）就完全不碰这个键，保留上一次成功写入的值——这正是"作者离群"
+    /// 这种情形下渲染时仍然拿得到"最后已知的名字"而不是被空白覆盖掉的原因。
+    pub fn setUsername(self: *Store, user_id: u64, name: []const u8) Error!void {
+        var kb: [64]u8 = undefined;
+        const key = usernameKey(&kb, user_id);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.client.commandOk(&.{ "SET", key, name });
+    }
+
+    /// 刷新这个群当前的群名快照（`hikari:groupname:{group_id}`），用法和理由
+    /// 跟 setUsername 对称。
+    pub fn setGroupName(self: *Store, group_id: u64, name: []const u8) Error!void {
+        var kb: [64]u8 = undefined;
+        const key = groupNameKey(&kb, group_id);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        try self.client.commandOk(&.{ "SET", key, name });
+    }
+
     pub fn setLastRun(self: *Store, group_id: u64, ts: i64) Error!void {
         var kb: [64]u8 = undefined;
         const key = lastRunKey(&kb, group_id);
@@ -542,7 +595,59 @@ pub const Store = struct {
             .array => |a| a orelse return null,
             else => return null,
         };
-        return quoteFromPairs(gpa, items);
+        var q = (try quoteFromPairs(gpa, items)) orelse return null;
+        errdefer q.deinit(gpa);
+        try self.resolveDisplayNames(gpa, &q);
+        return q;
+    }
+
+    /// 渲染前用当前的 `hikari:username:{user_id}` / `hikari:groupname:{group_id}`
+    /// 覆盖 hash 里冻结的 `from_who` / `from` 快照——这是"改名一次性反映到这个人
+    /// 说过的全部历史语录"的落点。只在 fetchById 内部调用，此时锁已经被持有
+    /// （同 fetchById 本身的纪律），这里不再加锁。
+    ///
+    /// **哪个赢，为什么**：MGET 命中（哪怕命中的值本身是空串）就覆盖，因为
+    /// 命中代表"这个 user_id / group_id 最近一次被成功刷新过"，是比收录当时
+    /// 冻结进 hash 的快照更新的事实——这正是这次改动要解决的问题本身（改名
+    /// 之后旧语录不该继续挂着旧名字）。MGET 未命中（nil）则退回 hash 里存的
+    /// 旧值：可能是这条语录是 `import` 写进来的（`import.zig` 不刷新这两个
+    /// 键，见 import.zig 的说明）、这个人从没在任何一次扫描里当过候选作者、
+    /// 或者他已经离群且这份映射本身从来没写成功过。136 条现存生产语录全部
+    /// 落在这条 fallback 分支：它们的 hash 里已经有 `user_id`/`group_id`
+    /// （`hashFields`/`quoteFromPairs` 一直都在读写这两个字段，不是这次改动
+    /// 新增的），`hikari:username`/`hikari:groupname` 这两个键此前从未存在过，
+    /// 所以 MGET 对它们必然回 nil、直接落回 hash 里的旧值——不需要任何迁移
+    /// 脚本去补写这两个键。
+    ///
+    /// MGET 本身失败（Redis I/O/协议错误）直接 `try` 向上传播，不在这里单独
+    /// 吞掉：这条连接若真的坏了，静默吞掉这一次失败不会让后续调用更可靠，
+    /// 只会把问题从"GET / 返回 500"降级成"GET / 返回一条归属信息不可信的
+    /// 200"，后者更难被运营方发现。
+    fn resolveDisplayNames(self: *Store, gpa: std.mem.Allocator, q: *Quote) Error!void {
+        var ukb: [64]u8 = undefined;
+        var gkb: [64]u8 = undefined;
+        const ukey = usernameKey(&ukb, q.user_id);
+        const gkey = groupNameKey(&gkb, q.group_id);
+        const v = try self.client.command(&.{ "MGET", ukey, gkey });
+        defer v.deinit(self.client.gpa);
+        const items: []const resp.Value = switch (v) {
+            .array => |a| a orelse return,
+            else => return,
+        };
+        if (items.len >= 1) {
+            if (bulkOrNull(items[0])) |name| {
+                const dup = try gpa.dupe(u8, name);
+                gpa.free(q.from_who);
+                q.from_who = dup;
+            }
+        }
+        if (items.len >= 2) {
+            if (bulkOrNull(items[1])) |name| {
+                const dup = try gpa.dupe(u8, name);
+                gpa.free(q.from);
+                q.from = dup;
+            }
+        }
     }
 
     pub fn randomAny(self: *Store, gpa: std.mem.Allocator) Error!?Quote {
@@ -907,6 +1012,13 @@ const FakeServer = struct {
 fn encodeArrayReply(gpa: std.mem.Allocator, items: []const []const u8) ![]u8 {
     return resp.encodeCommand(gpa, items);
 }
+
+/// fetchById 现在在每次 HGETALL 之后紧跟着发一条 `MGET hikari:username:{id}
+/// hikari:groupname:{id}`（resolveDisplayNames）。绝大多数既有测试关心的是
+/// hash 本身的内容，不关心改名覆盖这件事，所以给它们喂一对 nil——两个键都
+/// 没写过，回退到 hash 里的旧值，测试原有的内容断言不用跟着改。改名覆盖 /
+/// fallback 本身的行为在下面单独的测试里覆盖。
+const mget_nil_reply = "*2\r\n$-1\r\n$-1\r\n";
 
 /// 按给定顺序在 `bytes` 里逐帧定位：每一帧都必须存在，且必须出现在前一帧之后。
 ///
@@ -1341,7 +1453,7 @@ test "randomAny 用 SRANDMEMBER 拿 id 再 HGETALL 取回整条语录" {
     const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
     defer gpa.free(hgetall_reply);
 
-    const script = try std.mem.concat(gpa, u8, &.{ "$5\r\n12345\r\n", hgetall_reply });
+    const script = try std.mem.concat(gpa, u8, &.{ "$5\r\n12345\r\n", hgetall_reply, mget_nil_reply });
     defer gpa.free(script);
 
     const srv = try FakeServer.start(gpa, script);
@@ -1365,6 +1477,11 @@ test "randomAny 用 SRANDMEMBER 拿 id 再 HGETALL 取回整条语录" {
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_index) != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "HGETALL") != null);
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:quote:12345") != null);
+    // resolveDisplayNames 的 MGET 也确实发出去了，key 按 hash 里的 user_id/
+    // group_id（10001/999）拼，不是随便两个 nil 键。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "MGET") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:username:10001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:groupname:999") != null);
 }
 
 test "randomAny 索引为空时返回 null，不再发 HGETALL" {
@@ -1394,7 +1511,7 @@ test "randomByLength 用 ZRANGEBYSCORE 拿候选再 HGETALL 取回整条语录" 
     const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
     defer gpa.free(hgetall_reply);
 
-    const script = try std.mem.concat(gpa, u8, &.{ "*1\r\n$5\r\n12345\r\n", hgetall_reply });
+    const script = try std.mem.concat(gpa, u8, &.{ "*1\r\n$5\r\n12345\r\n", hgetall_reply, mget_nil_reply });
     defer gpa.free(script);
 
     const srv = try FakeServer.start(gpa, script);
@@ -1444,6 +1561,185 @@ test "randomByLength 候选为空数组时返回 null" {
 }
 
 // ---------------------------------------------------------------------------
+// hikari:username / hikari:groupname —— 改名一次性反映到全部历史语录。
+// setUsername/setGroupName 是 scan/runner.zig 每次扫描按遇到的作者/群刷新
+// 这两个键的落点；resolveDisplayNames（经 fetchById，randomAny 是它最简单的
+// 入口）是渲染时读它们、决定"改名覆盖"还是"回退到 hash 里的旧快照"的落点。
+// 136 条现存生产语录全部落在 fallback 分支——见 resolveDisplayNames 顶部的
+// 说明与下面"fallback"测试的注释，不需要任何迁移脚本。
+
+test "setUsername 发 SET hikari:username:{user_id}" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "+OK\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try store.setUsername(10001, "新名字");
+
+    c.deinit();
+    srv.stop();
+    try expectFrameSequence(srv.received.items, &.{
+        "*3\r\n$3\r\nSET\r\n$21\r\nhikari:username:10001\r\n$9\r\n新名字\r\n",
+    });
+}
+
+test "setGroupName 发 SET hikari:groupname:{group_id}" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "+OK\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try store.setGroupName(999, "新群名");
+
+    c.deinit();
+    srv.stop();
+    try expectFrameSequence(srv.received.items, &.{
+        "*3\r\n$3\r\nSET\r\n$20\r\nhikari:groupname:999\r\n$9\r\n新群名\r\n",
+    });
+}
+
+test "randomAny：hikari:username/hikari:groupname 命中时覆盖 hash 里冻结的 from_who/from（改名场景）" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // sampleQuote() 收录时冻结的快照是 from_who="小明"、from="测试群"。这里
+    // 模拟"小明"改名成 NewName、群改名成 NewGroup 之后的一次渲染：MGET 命中
+    // 两个键，覆盖必须真的发生，不能停留在 hash 里的旧值上——这正是这次改动
+    // 要解决的问题本身。
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*2\r\n$7\r\nNewName\r\n$8\r\nNewGroup\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("NewName", q.from_who);
+    try std.testing.expectEqualStrings("NewGroup", q.from);
+    // 其余字段不受影响，改名覆盖只碰这两个字段。
+    try std.testing.expectEqualStrings("今天也是好天气", q.hitokoto);
+}
+
+test "randomAny：hikari:username/hikari:groupname 缺失（nil）时落回 hash 里存的旧值——fallback，覆盖 import 语录与从未被刷新过的作者" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // 两个键都没写过（MGET 回两个 nil）：136 条现存生产语录的处境完全一样
+    // ——它们的 hash 早就带着 user_id/group_id，但 hikari:username/
+    // hikari:groupname 这两个键在这次改动之前根本不存在，MGET 对它们必然
+    // 回 nil。不需要任何迁移脚本：这条 fallback 分支本来就是为它们准备的。
+    const script = try std.mem.concat(gpa, u8, &.{ "$5\r\n12345\r\n", hgetall_reply, mget_nil_reply });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("小明", q.from_who);
+    try std.testing.expectEqualStrings("测试群", q.from);
+}
+
+test "randomAny：作者已经离群——hikari:username 从未刷新成功过时同样落回旧值（fallback 的另一种成因，不是另一条代码路径）" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // 群本身还在（hikari:groupname 命中，覆盖成 NewGroup2），但这条语录的
+    // 作者已经离群：他从这次改动上线起就再也没被任何一次扫描当过候选作者，
+    // hikari:username:10001 从来没被 setUsername 写过，MGET 对它回 nil——
+    // 跟上一条"从未刷新过"测试机制完全相同，单独起一条是为了让 brief 明确
+    // 点名的"作者离群"场景在测试列表里有名字对得上号的一条。
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*2\r\n$-1\r\n$9\r\nNewGroup2\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("小明", q.from_who); // fallback：作者已经离群
+    try std.testing.expectEqualStrings("NewGroup2", q.from); // 群名照常覆盖
+}
+
+fn checkRandomAnyDisplayNameAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+    const args = try hashFields(net_gpa, sampleQuote());
+    defer freeHashFields(net_gpa, args);
+    const hgetall_reply = try encodeArrayReply(net_gpa, args[2..]);
+    defer net_gpa.free(hgetall_reply);
+
+    const script = try std.mem.concat(net_gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*2\r\n$7\r\nNewName\r\n$8\r\nNewGroup\r\n",
+    });
+    defer net_gpa.free(script);
+
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(net_gpa, &c);
+
+    if (try st.randomAny(gpa)) |q| q.deinit(gpa);
+}
+
+test "randomAny 的 hikari:username/hikari:groupname 覆盖路径（resolveDisplayNames 的两次 gpa.dupe）在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRandomAnyDisplayNameAlloc, .{});
+}
+
+// ---------------------------------------------------------------------------
 // allQuotes / randomMany —— `/extra/all` 与 `/extra/batch/:count` 的存储层。
 
 test "allQuotes 用 SMEMBERS 拿全部 id 再逐个 HGETALL 展开" {
@@ -1464,7 +1760,7 @@ test "allQuotes 用 SMEMBERS 拿全部 id 再逐个 HGETALL 展开" {
     const smembers = try encodeArrayReply(gpa, &.{ "12345", "999" });
     defer gpa.free(smembers);
 
-    const script = try std.mem.concat(gpa, u8, &.{ smembers, h1, h2 });
+    const script = try std.mem.concat(gpa, u8, &.{ smembers, h1, mget_nil_reply, h2, mget_nil_reply });
     defer gpa.free(script);
 
     const srv = try FakeServer.start(gpa, script);
@@ -1526,7 +1822,9 @@ test "randomMany 发 SRANDMEMBER 的负数形式（允许重复），命令帧�
     // 的次数逐条 HGETALL，不会因为 id 相同就去重合并成一条。
     const srandmember = try encodeArrayReply(gpa, &.{ "12345", "12345", "12345" });
     defer gpa.free(srandmember);
-    const script = try std.mem.concat(gpa, u8, &.{ srandmember, h, h, h });
+    const script = try std.mem.concat(gpa, u8, &.{
+        srandmember, h, mget_nil_reply, h, mget_nil_reply, h, mget_nil_reply,
+    });
     defer gpa.free(script);
 
     const srv = try FakeServer.start(gpa, script);
@@ -1608,7 +1906,7 @@ fn checkAllQuotesAlloc(gpa: std.mem.Allocator) !void {
     const smembers = try encodeArrayReply(net_gpa, &.{ "12345", "999" });
     defer net_gpa.free(smembers);
 
-    const script = try std.mem.concat(net_gpa, u8, &.{ smembers, h1, h2 });
+    const script = try std.mem.concat(net_gpa, u8, &.{ smembers, h1, mget_nil_reply, h2, mget_nil_reply });
     defer net_gpa.free(script);
 
     const srv = try FakeServer.start(net_gpa, script);

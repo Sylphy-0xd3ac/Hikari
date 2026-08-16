@@ -36,16 +36,18 @@ Hikari 是一个常驻进程，做两件事：
 |---|---|---|
 | `get_group_msg_history` | 翻页拉取群历史 | 入参 `group_id`, `message_seq`, `count`, `reverse_order`。**返回的消息不含 `emoji_likes_list`**。`message_seq` 吃的是 `message_id`（两者同一值域），`reverse_order` 是"从锚点朝哪个方向走"——`false` = 往新（更晚）走，`true` = 往旧（更早）走；不带 `message_seq` 时该字段被忽略（走 `getAioFirstViewLatestMsgs`）。`message_seq` 是闭区间：带锚点的一页会把锚点消息本身包含在内（`reverse_order: true` 时锚点是那一页里最新的一条）。2026-08-15 首次生产运行 + 针对真实 NapCat 的 `count=5` 手工探测已确认以上语义 |
 | `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]`；顶层还含 `user_id`（与 `sender.user_id` 一致，`onebot.parseMessage` 依赖这个顶层字段解出发送者）。2026-08-15 针对生产 NapCat 直接探测 `get_msg` 已确认，顶层 key 为 `emoji_likes_list, font, group_id, group_name, message, message_format, message_id, message_seq, message_type, post_type, raw_message, real_id, real_seq, self_id, sender, sub_type, time, user_id` |
-| `get_group_info` | 取群名 | 填充 hitokoto 的 `from` |
-| `get_group_member_info` | 取被观察者群名片 | 填充 hitokoto 的 `from_who` |
+| `get_group_info` | 取群名 | 刷新 `hikari:groupname:{group_id}`，渲染时覆盖 hitokoto 的 `from`（见 4.7 节、5 节） |
+| `get_group_member_info` | 取**某个作者**的群名片 | 逐候选作者调用（每次扫描内按 `user_id` 缓存，同一个作者只问一次），刷新 `hikari:username:{user_id}`，渲染时覆盖 hitokoto 的 `from_who`（见 4.7 节、5 节）。2026-08-16 起不再是"每群一次、查被观察者"——`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群不再有唯一的"那个被观察者"可查，改成按窗口内每条候选**自己的作者**查 |
 | `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
 | `send_group_forward_msg` | 发送运行日志 | 每群一条合并转发消息，七行各占一个 node；见 7 节 |
 
 ### 3.1 表情回应的读取代价
 
-`get_group_msg_history` 走的是 `parseMessage`，不会带出表情回应数据；只有 `get_msg` 会从 `msg.emojiLikesList` 手工填充 `emoji_likes_list`。因此**被观察者的每一条窗口内消息都需要额外一次 `get_msg`**。一天几百条消息就是几百次调用，这是接口限制，无法规避。
+`get_group_msg_history` 走的是 `parseMessage`，不会带出表情回应数据；只有 `get_msg` 会从 `msg.emojiLikesList` 手工填充 `emoji_likes_list`。因此**被观察者的每一条窗口内消息都需要额外一次 `get_msg`**。这是接口限制，无法规避。
 
 `get_emoji_likes` / `fetch_emoji_like` 不适用：它们要求调用方预先知道 `emoji_id`，返回的是"谁点了这个表情"，而我们需要的是"这条消息上有哪些表情"。
+
+**探针量随 `OBSERVED_QQS` 的配置直接放大**：`OBSERVED_QQ` 改成 `OBSERVED_QQS`、允许空集合（观察所有人）之前，探针量是"一个人一天说的话"，实测约 431 次 `get_msg`/天；空集合是本设计的目标生产配置之后，探针量变成"窗口内几乎每一条消息一次"——这个群平均每天约 4700 条消息，扫一次群可能从两三分钟变成十几二十分钟。`scan/runner.zig` 的 `scanGroup` 因此在这一步（✨/🔥 探测循环）结束时无条件打一条 `std.log.info`（`probeSummaryLine`，见 7 节的姊妹机制——运行日志七行是产品信号，这一行是运维诊断信息，不进合并转发），报这个群这一轮探测了多少条消息、花了多久：让"扫一次群变慢了"这件事有据可查，而不是只能事后靠猜是不是这次放量导致的。
 
 ### 3.2 message_id 的性质与风险
 
@@ -223,10 +225,10 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 | `uuid` | 本地生成的 UUIDv4 |
 | `hitokoto` | 4.6 提取出的文本（路径 3 为剥掉 `✨` 前缀后的正文，路径 4 为链上各成员拼接后的正文） |
 | `type` | 固定 `"g"`（其他） |
-| `from` | 群名，来自 `get_group_info` |
-| `from_who` | 被观察者群名片，来自 `get_group_member_info` |
-| `creator` | 固定 `"Hikari"` |
-| `creator_uid` | 固定 `0` |
+| `from` | 群名。渲染时（`GET /`、`/extra/*`）优先取 `hikari:groupname:{group_id}` 的实时值；这个键缺失才落回收录当时冻结进 hash 的快照 |
+| `from_who` | 语录**作者**（不是固定的被观察者）的群名片。渲染时优先取 `hikari:username:{user_id}` 的实时值；这个键缺失（导入的语录、这个人从未被某次扫描当过候选作者、或者已经离群且从未刷新成功过）才落回 hash 里冻结的快照 |
+| `creator` | 路径1、2、4固定 `"Hikari"`；路径3（管理员手动 `✨ 内容`）是那位管理员当时的群名片/昵称——他本人在 Hitokoto 语义下就是这条语录的创建者 |
+| `creator_uid` | 路径1、2、4固定 `0`；路径3是那位管理员的 QQ |
 | `reviewer` | 固定 `0` |
 | `commit_from` | 固定 `"hikari"` |
 | `created_at` | 候选消息的 `time`，字符串形式的 Unix 秒。路径 3 取管理员那条指令消息的时间；路径 4 取链的**第一个成员**的时间 |
@@ -234,7 +236,17 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 
 路径 4 的候选 `message_id`（即存入 `hikari:quote:{message_id}` 的主键）是链的第一个成员的 `message_id`，运行器（`scan/runner.zig`）按这个 id 去 `pool` 里找到那条真实消息取其 `time` / `user_id`，字段映射不需要为路径4单独改运行器的取值逻辑——链的第一个成员本身就是一条真实的、被观察者发送的消息。
 
-`from` / `from_who` 每次扫描每个群各拉取一次后缓存，不逐条调用。
+`from` 每次扫描每个群拉取一次（`get_group_info`）。`from_who` 不再是"每群一次"：
+`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群没有唯一的"那个被观察者"可以
+整群问一次，`get_group_member_info` 按窗口内每条候选**自己的作者**（`user_id`）
+调用，同一次扫描内按 `user_id` 缓存——同一个作者名下有好几条候选时只问一次，一个
+活跃群一天几百个不同发言人，而不是几千条消息。每次成功问到的结果，连同 `from`，
+都会分别刷新进 `hikari:username:{user_id}` / `hikari:groupname:{group_id}`（5 节），
+渲染时优先读这两个键，`hash` 里存的值只是收录当时的快照与 fallback，不是渲染时的
+最终来源——这是"改名一次性反映到这个人说过的全部历史语录"的实现方式，见 5 节。
+某个候选的作者这一轮问不到名片（网络抖动、或者他已经离群）只让**那一条候选**记进
+`Trouble.unattributed`（`scan/runner.zig`），不牵连同一轮里其他候选，也不再像旧版
+`observedCard` 那样让整个群因为没有单一被观察者而判失败。
 
 ## 5. Redis 结构
 
@@ -248,6 +260,10 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次扫描窗口终点的 Unix 秒，逐群独立 |
 | `hikari:chainmember:{message_id}` | STRING | 仅 🔥 链使用：value 是这条链**主键**（第一个成员）的 `message_id`。链的每一个成员——包括主键自己——都写一份，value 都是同一个主键 |
 | `hikari:chain:{message_id}` | SET | 仅 🔥 链使用，key 里的 `{message_id}` 是链**主键**：成员是这条链的全部 `message_id`（含主键自己） |
+| `hikari:username:{user_id}` | STRING | 这个人当前的群名片（群名片优先，否则昵称）。每次扫描按窗口内**遇到的候选作者**刷新（不是固定的被观察者），同一次扫描内同一个作者只刷新一次。渲染语录时（`GET /`、`/extra/*`）覆盖 hash 里冻结的 `from_who` 快照——这是"改名一次性反映到这个人说过的全部历史语录"的落点 |
+| `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，用法和理由跟 `hikari:username` 对称，覆盖的字段是 `from` |
+
+**渲染时的名字解析（`Store.fetchById`，`randomAny`/`randomByLength`/`allQuotes`/`randomMany` 的共同入口）**：`HGETALL` 拿到 hash 之后，紧接着一次 `MGET hikari:username:{user_id} hikari:groupname:{group_id}`（key 里的 `user_id`/`group_id` 就是这条语录 hash 自己存的两个字段——136 条现存生产语录早就带着它们，不需要任何迁移）。**哪个赢**：`MGET` 命中（哪怕命中的值本身是空串）就覆盖 hash 里的旧值，因为命中代表"这个 user_id / group_id 最近一次被成功刷新过"，是比收录当时冻结进 hash 的快照更新的事实；未命中（nil）——导入的语录、这个人从没在任何一次扫描里当过候选作者、或者他已经离群且这份映射从来没写成功过——退回 hash 里存的旧值，这正是"没有映射就保底"的 fallback 语义。`MGET` 本身失败（Redis I/O/协议错误）直接向上传播成 500，跟这一层其它读路径的失败语义一致，不单独吞掉。
 
 **写入（普通语录，路径1/2/3）**（按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `SADD hikari:index {id}`
 
