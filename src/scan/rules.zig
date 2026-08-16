@@ -8,11 +8,6 @@ const ws = " \t\r\n";
 
 pub const Path = enum { emoji_reaction, quoted_star, admin_manual, fire_chain };
 
-/// 链式收录最多允许两条相邻合格消息之间隔多少条消息（不看发送者、不看是否有
-/// 表情回应，按窗口内**去重后**的消息序列数）。"最多隔 3 条" ⇔ 去重后序列里的
-/// 下标差 ≤ 4（下标差 4 时中间恰好夹 3 条）。
-const chain_max_gap: usize = 4;
-
 pub const Candidate = struct {
     message_id: i64,
     path: Path,
@@ -21,8 +16,12 @@ pub const Candidate = struct {
     /// 见 finalizeChain）后用空格拼接的结果。路径1、2 为 null，表示按
     /// renderText 从目标消息提取。
     text_override: ?[]u8,
-    /// 路径4专用：这条链的**全部**成员 message_id（时间升序，
+    /// 路径4专用：这条链的全部**内容**成员 message_id（时间升序，
     /// `chain_members[0] == message_id`，即主键）。路径1/2/3 为 null。
+    ///
+    /// 桥（只带 🔥 不带 ✨、可以是任何人发的那些消息）**不在**这里：它们的
+    /// 正文没有进这条语录，因此既不该被抑制、也不该被 tombstone，💦 一座桥
+    /// 更不该撤掉这条链。完整理由见 Chain 的文档注释。
     ///
     /// 这份数据是从 Chain.members dupe 出来的独立分配（不是转移所有权）：
     /// Chain.members 在整个 classify() 执行期间还要继续被 chainOf 用来判定
@@ -100,6 +99,22 @@ fn contains(list: []const i64, id: i64) bool {
 }
 
 /// 一条已并链的 🔥 chain：members 按时间升序，member[0] 是主键（"句子的开头"）。
+///
+/// **members 里只有内容消息，没有桥。** 桥（只带 🔥、不带 ✨ 的消息，见
+/// isBridge）的正文一个字都没有进这条语录，它只是在说"这句话还没说完"；
+/// 而且桥可以是**任何人**发的。成员资格在这个系统里恰好等价于一件事——
+/// "你的正文在这条语录里"，抑制（不再单独收录）、tombstone、持久化进
+/// `hikari:chainmember:{id}` 的映射三件事全都从这一个事实推出来：
+///
+///   - 抑制：内容成员必须让路给链，否则碎句和整句会同时入库；桥的正文
+///     不在语录里，单独收录它不产生任何重复，因此不该抑制。
+///   - tombstone：4.4 节要求链的成员全部 tombstone，理由是"往后 🔥 被撤掉、
+///     链散架时，幸存成员会退回路径1，已作废的内容会原样复活"。这条理由
+///     只对内容成员成立——桥的正文从来不在这条语录里，它复活也复活不出
+///     任何被撤掉的内容。
+///   - 💦：因此 💦 一座桥不作废这条链，退化成对桥自己的一次普通撤稿。反过来
+///     做的话，一个只是恰好被贴了 🔥 的路人的消息，会变成撤掉别人语录的开关。
+///
 /// text 是拼接后的 joined 正文，直到被并入某个 Candidate.text_override 之前
 /// 一直非 null；一旦转移所有权，置 null 防止 deinit 时重复释放——跟
 /// Candidate.text_override 是同一个套路。
@@ -113,17 +128,27 @@ const Chain = struct {
     }
 };
 
-fn isChainMember(m: onebot.Message, star_ids: []const i64, fire_ids: []const i64, p: Params) bool {
-    return p.isObserved(m.user_id) and contains(star_ids, m.message_id) and contains(fire_ids, m.message_id);
+/// 🔥 = "这条消息和下一条属于同一句话"。它是**唯一**的相邻规则：一段连续的
+/// 🔥 走到第一条没有 🔥 的消息就结束。带不带 ✨、是谁发的，都不影响这一条。
+fn carriesFire(m: onebot.Message, fire_ids: []const i64) bool {
+    return contains(fire_ids, m.message_id);
+}
+
+/// **内容**消息：同时带 ✨ 与 🔥，且作者是被观察者。它的正文会进这条语录。
+/// 调用方保证已经确认过 carriesFire。
+fn isChainContent(m: onebot.Message, star_ids: []const i64, p: Params) bool {
+    return p.isObserved(m.user_id) and contains(star_ids, m.message_id);
 }
 
 /// window 按 message_id 去重后的序列，只保留每个 id 首次出现的那条。
 ///
 /// 陷阱（本文件加的测试专门覆盖）：NapCat 分页是闭区间，相邻两页会把锚点消息
-/// 重复拉一遍，同一条消息因此可能在 window 里出现两次。链式收录的"隔多少条"
-/// 必须按这个去重后的序列算下标差，不能按 window 的原始数组下标算——否则一次
-/// 页边界重叠会让间距虚高，两条本该相连的消息在页边界附近静默连不上，且几乎
-/// 不可复现（只有页边界恰好落在两条消息之间时才会触发）。
+/// 重复拉一遍，同一条消息因此可能在 window 里出现两次。链必须走这个去重后的
+/// 序列：同一条内容消息被重复走一遍，会让它的正文在 joined 语录里出现两次
+/// （"上 中 中 下"），也会让重复的 message_id 进 chain_members——而
+/// chain_members 会被原样持久化进 `hikari:chain:{主键}`，撤稿展开跟着一起
+/// 重复。这种页边界重叠几乎不可复现（只有页边界恰好落在两条消息之间才会
+/// 触发），所以必须在这一层一次性挡掉。
 fn distinctWindow(gpa: std.mem.Allocator, window: []const onebot.Message) ![]onebot.Message {
     var out: std.ArrayList(onebot.Message) = .empty;
     errdefer out.deinit(gpa);
@@ -165,9 +190,35 @@ fn finalizeChain(gpa: std.mem.Allocator, chains: *std.ArrayList(Chain), members:
     try chains.append(gpa, .{ .members = ids_owned, .text = text_owned });
 }
 
-/// 扫出窗口内全部满足"≥2 个成员、相邻成员间隔在 chain_max_gap 内"的 🔥 chain。
-/// 只有真正合并成链（≥2 个成员）的才会出现在返回值里；孤零零一个合格消息
-/// （没有邻居能并）不产生 Chain，调用方据此让它退回普通路径1候选。
+/// 扫出窗口内全部 🔥 链：一条链是"≥2 条内容消息 + 它们之间不间断的 🔥"。
+///
+/// 走法（按去重后的窗口序列从前往后逐条走）：
+///
+///   - 这条消息**没有 🔥** → 当前这一段连续的 🔥 到此为止：手上攒够 ≥2 条
+///     内容消息就收成一条链，然后清空重来。🔥 的连续性是唯一的相邻规则，
+///     它取代了旧版那条"两条合格消息之间最多隔 3 条"的间距上限（间距上限
+///     连同 chain_max_gap 已经整个删掉）。
+///   - 有 🔥 且是**内容**（✨ + 🔥 + 作者是被观察者）→ 并进当前这条链。
+///   - 有 🔥 但不是内容 → **桥**：正文丢弃，不进 members，但连续段继续往下
+///     走。桥可以是**任何人**发的，这正是它存在的理由——它让一条链跨过别人
+///     的插话。注意"带了 ✨ 但作者不是被观察者"的消息也落在这一支：内容要求
+///     三件事同时成立，缺一件就不是内容，而它带着 🔥，所以连续段不在它这里
+///     结束。
+///
+/// 同一发送者约束：一条链的**内容**消息必须全是同一个人发的。作者 U 由这条
+/// 链的第一条内容消息确定（`OBSERVED_QQS` 为空、观察所有人时没有配置里的
+/// 唯一被观察者可以锚定，只能这样定），后面每条内容消息都要 `user_id == U`
+/// 才能并进来。中途冒出另一个被观察者的内容消息时：它不并进当前这条链，而是
+/// **就地终止当前 run、以它自己为起点另起一条**。选这个而不是"当桥跳过它"
+/// 的理由：内容消息本身就是它自己的作者在宣告"我这句话还没说完"，让 U 的链
+/// 跨过 B 自己的句子开头连下去，等于把 B 的 🔥 记在 U 头上；run 的归属在这
+/// 一刻换了人，才是这段 🔥 唯一说得通的读法。副作用也更安全：被跳过的那条
+/// 内容消息如果没能另起一条链，它会原样退回路径1单独收录，不会被静默吞掉。
+/// 桥不参与这条约束（桥没有作者要求，也不改变 U）。
+///
+/// 只有真正并成链（≥2 条内容消息）的才会出现在返回值里；一条内容消息后面
+/// 只跟着几座桥（"这句话还没说完"，但续写要么没被 ✨ 认可、要么不是这个人
+/// 发的）不产生 Chain，调用方据此让它退回普通路径1候选。
 fn buildChains(
     gpa: std.mem.Allocator,
     window: []const onebot.Message,
@@ -184,26 +235,24 @@ fn buildChains(
         chains.deinit(gpa);
     }
 
+    // 当前这一段连续 🔥 上已经攒到的**内容**消息（桥不在里面）。
     var run: std.ArrayList(onebot.Message) = .empty;
     defer run.deinit(gpa);
-    var last_pos: usize = 0;
 
-    for (distinct, 0..) |m, pos| {
-        if (!isChainMember(m, star_ids, fire_ids, p)) continue;
-        // 同一条链的全部成员必须是**同一个人**发的。观察所有人之后这不再是
-        // 理论问题：两个人各自的半句话恰好前后脚发出、又都被贴了 ✨+🔥，
-        // 不加这条约束就会被拼成一条谁也没说过的话，而这条语录的 `from_who`
-        // 也无从谈起（它只能取第一个成员的作者，另一半的作者被静默吞掉）。
-        // 发送者一变就断开当前 run，从这条消息重新起一条。
-        const same_sender = run.items.len > 0 and run.items[0].user_id == m.user_id;
-        if (same_sender and pos - last_pos <= chain_max_gap) {
-            try run.append(gpa, m);
-        } else {
+    for (distinct) |m| {
+        if (!carriesFire(m, fire_ids)) {
+            // 连续段结束。
             if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
             run.clearRetainingCapacity();
-            try run.append(gpa, m);
+            continue;
         }
-        last_pos = pos;
+        if (!isChainContent(m, star_ids, p)) continue; // 桥：不进正文，也不断链
+        if (run.items.len > 0 and run.items[0].user_id != m.user_id) {
+            // 另一个被观察者的内容消息：当前 run 到此为止，它自己另起一条。
+            if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
+            run.clearRetainingCapacity();
+        }
+        try run.append(gpa, m);
     }
     if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
 
@@ -834,34 +883,87 @@ test "🔥链：三条依次相连的消息合并成一条（不设两条的上�
     try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, out.candidates[0].chain_members.?);
 }
 
-test "🔥链：间隔恰好3条消息仍相连" {
+test "🔥链：桥接消息把整条链连起来——形状图端到端（内容/桥/桥/内容/桥/内容/断）" {
+    const gpa = std.testing.allocator;
+    // 设计文档 4.5 节路径4 的形状图逐条对应：
+    //   1 ✨🔥 被观察者 U   → 内容
+    //   2 🔥   任何人       → 桥，正文丢弃
+    //   3 🔥   任何人       → 桥，正文丢弃
+    //   4 ✨🔥 被观察者 U   → 内容，接上 1
+    //   5 🔥   任何人       → 桥
+    //   6 ✨🔥 被观察者 U   → 内容，接上
+    //   7 无🔥              → 连续段在这里结束
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "A"),
+        textMsg(2, OUTSIDER, "X"),
+        textMsg(3, OUTSIDER, "Y"),
+        textMsg(4, OBSERVED, "B"),
+        textMsg(5, OUTSIDER, "Z"),
+        textMsg(6, OBSERVED, "C"),
+        textMsg(7, OUTSIDER, "D"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 4, 6 }, &.{ 1, 2, 3, 4, 5, 6 }, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    // 桥的正文（X / Y / Z）不进语录：桥只说"这句话还没说完"。
+    try std.testing.expectEqualStrings("A B C", out.candidates[0].text_override.?);
+    // 成员只有内容消息：桥不是成员（见 buildChains 顶部关于撤稿的说明）。
+    try std.testing.expectEqualSlices(i64, &.{ 1, 4, 6 }, out.candidates[0].chain_members.?);
+}
+
+test "🔥链：桥来自另一个人——一条链可以跨过别人的插话（这正是桥存在的理由）" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{
-        textMsg(1, OBSERVED, "开头"),
-        textMsg(2, OUTSIDER, "闲聊1"),
-        textMsg(3, OUTSIDER, "闲聊2"),
-        textMsg(4, OUTSIDER, "闲聊3"),
-        textMsg(5, OBSERVED, "结尾"),
+        textMsg(1, OBSERVED, "上半句"),
+        textMsg(2, THIRD, "别人插了一嘴"),
+        textMsg(3, OBSERVED, "下半句"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 5 }, &.{ 1, 5 }, params());
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 3 }, &.{ 1, 2, 3 }, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("上半句 下半句", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, out.candidates[0].chain_members.?);
+}
+
+test "🔥链：只要 🔥 连续，中间隔多少座桥都相连——间距上限已经删掉了" {
+    const gpa = std.testing.allocator;
+    // 旧规则给"相邻"设了 3 条消息的间距上限，这里的 5 座桥会让两条内容
+    // 消息断开。新规则里 🔥 的连续性**取代**了间距上限：中间这 5 条都带
+    // 🔥，说明群里一路在说"这句话还没说完"，链就该一路连下去。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "开头"),
+        textMsg(2, OUTSIDER, "桥1"),
+        textMsg(3, OUTSIDER, "桥2"),
+        textMsg(4, OUTSIDER, "桥3"),
+        textMsg(5, OUTSIDER, "桥4"),
+        textMsg(6, OUTSIDER, "桥5"),
+        textMsg(7, OBSERVED, "结尾"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 7 }, &.{ 1, 2, 3, 4, 5, 6, 7 }, params());
     defer out.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
     try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
     try std.testing.expectEqualStrings("开头 结尾", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 7 }, out.candidates[0].chain_members.?);
 }
 
-test "🔥链：间隔4条消息不再相连，各自按路径1单独入选" {
+test "🔥链：中间一条没有🔥 → 连续段在那里断开，两侧不相连" {
     const gpa = std.testing.allocator;
+    // 🔥 的连续性是唯一的相邻规则：中间这条没有 🔥，前后两条内容消息就不是
+    // 同一句话，各自退回路径1。旧规则下"隔 1 条"是能连上的——这条测试正是
+    // 新旧规则的分界。
     const msgs = [_]onebot.Message{
         textMsg(1, OBSERVED, "开头"),
-        textMsg(2, OUTSIDER, "闲聊1"),
-        textMsg(3, OUTSIDER, "闲聊2"),
-        textMsg(4, OUTSIDER, "闲聊3"),
-        textMsg(5, OUTSIDER, "闲聊4"),
-        textMsg(6, OBSERVED, "结尾"),
+        textMsg(2, OUTSIDER, "无标记的闲聊"),
+        textMsg(3, OBSERVED, "结尾"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 6 }, &.{ 1, 6 }, params());
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 3 }, &.{ 1, 3 }, params());
     defer out.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 2), out.candidates.len);
@@ -869,6 +971,88 @@ test "🔥链：间隔4条消息不再相连，各自按路径1单独入选" {
         try std.testing.expectEqual(Path.emoji_reaction, c.path);
         try std.testing.expectEqual(@as(?[]u8, null), c.text_override);
     }
+}
+
+test "🔥链：一条内容消息 + 尾随的桥 → 不成链，退回路径1的普通语录" {
+    const gpa = std.testing.allocator;
+    // 一条链至少要两条内容消息。只有一条内容、后面跟着若干"这句话还没说完"
+    // 的桥，说明那些续写要么没被 ✨ 认可、要么根本不是这个人发的——没有第二
+    // 段正文可拼，这就是一条普通的路径1语录。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "孤零零一句"),
+        textMsg(2, OUTSIDER, "桥1"),
+        textMsg(3, OUTSIDER, "桥2"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{ 1, 2, 3 }, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.emoji_reaction, out.candidates[0].path);
+    try std.testing.expectEqual(@as(?[]u8, null), out.candidates[0].text_override);
+    try std.testing.expectEqual(@as(?[]i64, null), out.candidates[0].chain_members);
+}
+
+test "🔥链：带 ✨ 但作者不在观察集合里的消息算桥——不进正文、也不断链" {
+    const gpa = std.testing.allocator;
+    // "内容" 要求三件事同时成立：✨、🔥、作者是被观察者。这条消息 ✨🔥 都有
+    // 但作者不是被观察者，于是它不是内容；而它带着 🔥，所以连续段不在这里
+    // 结束——按 🔥 连续性这条唯一的相邻规则，它就是一座桥。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "上半句"),
+        textMsg(2, OUTSIDER, "集合外的人也被贴了星火"),
+        textMsg(3, OBSERVED, "下半句"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3 }, &.{ 1, 2, 3 }, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("上半句 下半句", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, out.candidates[0].chain_members.?);
+}
+
+test "🔥链：中途出现另一个被观察者的内容消息 → 不并入，且就地另起一条新链" {
+    const gpa = std.testing.allocator;
+    // subset 里 OBSERVED 与 OUTSIDER 都是被观察者。三条都 ✨🔥、🔥 连续，
+    // 但作者是 A B B：B 的第一条内容消息不能并进 A 的链（同一发送者约束），
+    // 它自己成为新 run 的起点，跟后面同作者的那条并成链；A 落单退回路径1。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "甲的半句"),
+        textMsg(2, OUTSIDER, "乙上"),
+        textMsg(3, OUTSIDER, "乙下"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3 }, &.{ 1, 2, 3 }, subset);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("乙上 乙下", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 2, 3 }, out.candidates[0].chain_members.?);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[1].message_id);
+    try std.testing.expectEqual(Path.emoji_reaction, out.candidates[1].path);
+}
+
+test "🔥链撤稿：💦 引用一座桥 → 不作废这条链，只 tombstone 桥自己" {
+    const gpa = std.testing.allocator;
+    // 桥不是链的成员：它的正文一个字都没进这条语录，作者也可以是任何人。
+    // 把 💦 一座桥当成"撤掉这条 joined 语录"，等于让一个只是恰好被贴了 🔥
+    // 的路人替别人的语录做撤稿决定。这里钉死相反的行为：链照常入库。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "上半句"),
+        textMsg(2, THIRD, "桥"),
+        textMsg(3, OBSERVED, "下半句"),
+        replyMsg(4, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 3 }, &.{ 1, 2, 3 }, everyone);
+    defer out.deinit(gpa);
+
+    // 只有桥自己进 revoked（它在 Redis 里没有任何语录，撤稿退化成一次
+    // tombstone），链的两个内容成员都不受影响。
+    try std.testing.expectEqualSlices(i64, &.{2}, out.revoked);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 3 }, out.candidates[0].chain_members.?);
 }
 
 test "🔥链：只有✨没有🔥的消息不参与链，仍按路径1单独入选" {
@@ -894,27 +1078,26 @@ test "🔥链：只有🔥没有✨的消息什么都不产生" {
     try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
 }
 
-test "🔥链：窗口内的重复消息（分页重叠）不会让间距虚高" {
+test "🔥链：窗口内的重复消息（分页重叠）不会让同一段正文进两遍" {
     const gpa = std.testing.allocator;
-    // 若按 window 的原始数组下标算间距：message_id=1 在下标0，message_id=5 在
-    // 下标5，差5，会被误判成"隔了4条"而不相连。NapCat 分页是闭区间，相邻两页
-    // 会把锚点消息本身重复拉一遍，这里用重复的 message_id=3 模拟这种页边界
-    // 重叠。按去重后的序列（1,2,3,4,5，位置0..4）算：1和5间距为4，应当相连。
-    const filler3 = textMsg(3, OUTSIDER, "闲聊2");
+    // NapCat 分页是闭区间，相邻两页会把锚点消息重复拉一遍，同一条消息因此
+    // 可能在 window 里出现两次。链的正文按去重后的序列拼，否则重叠一次就会
+    // 拼出"上 中 中 下"，而且 chain_members 里也会出现重复的 message_id
+    // （持久化进 hikari:chain:{主键} 之后，撤稿展开也跟着重复）。
+    const dup = textMsg(2, OBSERVED, "中");
     const msgs = [_]onebot.Message{
-        textMsg(1, OBSERVED, "开头"),
-        textMsg(2, OUTSIDER, "闲聊1"),
-        filler3,
-        filler3,
-        textMsg(4, OUTSIDER, "闲聊3"),
-        textMsg(5, OBSERVED, "结尾"),
+        textMsg(1, OBSERVED, "上"),
+        dup,
+        dup,
+        textMsg(3, OBSERVED, "下"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 5 }, &.{ 1, 5 }, params());
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3 }, &.{ 1, 2, 3 }, params());
     defer out.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
     try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
-    try std.testing.expectEqualStrings("开头 结尾", out.candidates[0].text_override.?);
+    try std.testing.expectEqualStrings("上 中 下", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2, 3 }, out.candidates[0].chain_members.?);
 }
 
 test "🔥链撤稿：💦 引用链上第二个成员，作废整条链，两个成员都进 revoked（都会被 tombstone）" {
@@ -1029,6 +1212,29 @@ fn classifyChainRevokedUnderFailingAllocator(gpa: std.mem.Allocator) !void {
 
 test "OOM 回归：🔥链被 💦 撤稿（revoked 展开为全部成员）时任意分配点失败都不能段错误或重复释放" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyChainRevokedUnderFailingAllocator, .{});
+}
+
+fn classifyBridgedChainUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    // 桥接形态的链构建：内容/桥/桥/内容/桥/内容/断——练 buildChains 新的
+    // 走法上的每一个分配点（run 的扩容、桥不入 run 时的跳过分支、连续段
+    // 结束时的 finalizeChain 里 ids 与 text 两次 ArrayList 构建、chains
+    // 扩容、Pass B 转移所有权时的 chain_members dupe），并确保桥的存在
+    // 不会在任何一个失败点上留下泄漏或重复释放。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "A"),
+        textMsg(2, OUTSIDER, "X"),
+        textMsg(3, OUTSIDER, "Y"),
+        textMsg(4, OBSERVED, "B"),
+        textMsg(5, OUTSIDER, "Z"),
+        textMsg(6, OBSERVED, "C"),
+        textMsg(7, OUTSIDER, "D"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 4, 6 }, &.{ 1, 2, 3, 4, 5, 6 }, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：带桥的🔥链构建在任意分配点失败都不能段错误或重复释放" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyBridgedChainUnderFailingAllocator, .{});
 }
 
 // ---------------------------------------------------------------------------
@@ -1180,8 +1386,9 @@ test "🔥链：A A B B → 断成两条各自成链，成员不跨作者混入"
 
 test "🔥链：A B A（中间夹一条别人的合格消息）→ 两端的 A 不会跨过 B 连起来" {
     const gpa = std.testing.allocator;
-    // 间距上 1 与 3 是能连的（下标差 2 ≤ 4），但中间那条是别人发的，
-    // run 在 B 处被打断，A 的两条各自落单，全部退回路径1。
+    // 🔥 是连续的（三条都带），所以断链的原因不是相邻规则，而是同一发送者
+    // 约束：中间那条是乙发的**内容**消息（✨+🔥+被观察者），它不并进甲的链、
+    // 而是就地另起一条 run；甲的两条各自落单，三条全部退回路径1。
     const msgs = [_]onebot.Message{
         textMsg(1, OUTSIDER, "甲上"),
         textMsg(2, THIRD, "乙插话"),

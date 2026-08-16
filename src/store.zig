@@ -53,26 +53,32 @@ pub const key_groupname_prefix = "hikari:groupname";
 /// 错误，跟 `SREM index`/`ZREM bylen` 对非主键链成员的处理一样，是无害
 /// 空操作。
 ///
-/// **136 条现存生产语录不在任何 `hikari:byuser` 里，这是本次改动刻意接受的
-/// 已知缺口，不是迁移遗漏**：这些语录早于这份索引存在，`hikari:index`/
-/// `hikari:bylen` 从收录当时就写好了，但 `hikari:byuser` 是全新的键，
-/// 历史数据当然不会自己出现在一个当初根本不存在的索引里。它们不会因为
-/// `/?user_id=` 这次改动而"迁移失败"——本仓库的原则是任何状态修复都必须
-/// 靠幂等重放自愈（`exists()==false` 触发重做），而这些语录已经
-/// `exists()==true`，不会再被任何一次扫描重新写一遍，所以自然也不会补上
-/// `hikari:byuser` 的成员资格。选择不做迁移脚本、也不做启动时自动回填，
-/// 是因为"读路径悄悄触发写"、"新增一个只在进程启动时跑一次的隐藏步骤"
-/// 都会引入这次改动范围之外的新状态机，风险和收益不成比例——这 136 条
-/// 语录本来就仍然完整地存在于 `hikari:index`/`hikari:bylen`，`GET /`、
-/// `/extra/all`、`/extra/batch/:count` 在不带 `user_id` 时行为完全不变；
-/// 唯一的、已知的、写进文档的后果是：对这 136 条语录的作者发
-/// `/?user_id={their_id}` 永远得到"这个人没有语录"（`/` 404，
-/// `/extra/*` 返回 `[]`），即使这个人明明说过话、语录也明明能被
-/// `GET /` 随机到。运营方如果需要修复，`hikari import` 之类的工具将来
-/// 可以按 `user_id` 重新收录一遍达到同样效果（`add()` 对已存在的语录是
-/// 幂等的 `exists()` 关卡挡住，不会重复；但对从来没进过 `hikari:byuser`
-/// 的旧 id，目前没有一条只回填索引、不改动语录本身的路径——这正是"不做
-/// 迁移"这条约束下留出的、需要将来专门决定要不要做的选项，本次改动不做）。
+/// **136 条现存生产语录不在任何 `hikari:byuser` 里，修复手段是
+/// `hikari reindex`（`reindexByUser`）**：这些语录早于这份索引存在，
+/// `hikari:index`/`hikari:bylen` 从收录当时就写好了，但 `hikari:byuser`
+/// 是全新的键，历史数据当然不会自己出现在一个当初根本不存在的索引里。
+///
+/// **后果是整体性的**：这 136 条同属一个作者（上线之前只观察一个人），
+/// 所以在 `reindex` 跑之前，`/?user_id=` 这个过滤器对**整个存量语录库**
+/// 都是空的——不是"有些作者查得到、有些查不到"，而是这个参数对上线前的
+/// 全部语录一律返回"这个人没有语录"（`/` 404，`/extra/*` 返回 `[]`），
+/// 即使这个人明明说过话、语录也明明能被 `GET /` 随机到。它们仍然完整地
+/// 存在于 `hikari:index`/`hikari:bylen`，`GET /`、`/extra/all`、
+/// `/extra/batch/:count` 在不带 `user_id` 时行为完全不变。
+///
+/// **"重新收录一遍就好"是一条假建议**（这里以前真的这么写过）：扫描器与
+/// `hikari import` 都在 `Store.exists()` 那道关卡上就 `return` 了，
+/// `add()`/`addChain()` 根本走不到，重放多少次都不会补上索引。本仓库
+/// "状态修复只靠幂等重放"这条原则在这里恰恰失效——幂等重放的入口本身被
+/// `exists()` 挡死了。所以必须另有一条**只回填索引、不改动语录本身**的
+/// 路径，那就是 `reindexByUser`：`SMEMBERS hikari:index` → 逐 id
+/// `HMGET hikari:quote:{id} user_id length` → `ZADD hikari:byuser:{uid}
+/// {length} {id}`，纯读加纯索引写，幂等、可重复跑。
+///
+/// 它仍然**不自动跑**：进程启动不跑，定时扫描不跑，读路径更不会顺手写
+/// 一笔。当初拒绝做迁移的理由（"读路径悄悄触发写"、"启动时多一个隐藏
+/// 步骤"都会引入新状态机）原样成立——一条只由运营方显式敲的子命令新增
+/// 的状态机是零。
 pub const key_byuser_prefix = "hikari:byuser";
 
 pub const Quote = struct {
@@ -358,6 +364,46 @@ fn parseOr(comptime T: type, s: ?[]const u8, fallback: T) T {
     return std.fmt.parseInt(T, raw, 10) catch fallback;
 }
 
+/// `hikari reindex` 一次运行的结果。`seen` 是 `SMEMBERS hikari:index` 回来的
+/// 成员数，`reindexed` 是真的发出了 `ZADD hikari:byuser:{user_id}` 的条数，
+/// 其余四个是各自的跳过原因——分开计数而不是合成一个 skipped，是因为它们
+/// 指向完全不同的排查方向：`bad_id` 是索引里混进了不是 message_id 的东西，
+/// `missing_hash` 是索引里的悬空 id（语录 hash 已经不在了），另外两个是
+/// hash 在、但缺了建索引必需的字段。
+pub const ReindexSummary = struct {
+    seen: usize = 0,
+    reindexed: usize = 0,
+    /// `hikari:index` 的成员不是一个能解析成 message_id 的整数。
+    bad_id: usize = 0,
+    /// `HMGET` 的两个字段都是 nil：hash 整个不存在（悬空 id），或者两个
+    /// 字段都没写过。HMGET 分不出这两种情形，对这条命令来说也不需要分。
+    missing_hash: usize = 0,
+    /// hash 在，但 `user_id` 缺失或不是数字——不知道该记进谁的 ZSET。
+    missing_user_id: usize = 0,
+    /// hash 在，但 `length` 缺失或不是数字——不知道 score 该写多少。
+    missing_length: usize = 0,
+
+    pub fn skipped(self: ReindexSummary) usize {
+        return self.bad_id + self.missing_hash + self.missing_user_id + self.missing_length;
+    }
+};
+
+pub fn formatReindexSummary(gpa: std.mem.Allocator, s: ReindexSummary) ![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\Saw {d} member(s) in hikari:index.
+        \\Reindexed {d} into hikari:byuser, skipped {d} (malformed index member {d}, no quote hash {d}, no user_id {d}, no length {d}).
+        \\
+    , .{
+        s.seen,
+        s.reindexed,
+        s.skipped(),
+        s.bad_id,
+        s.missing_hash,
+        s.missing_user_id,
+        s.missing_length,
+    });
+}
+
 pub const Store = struct {
     gpa: std.mem.Allocator,
     client: *redis.Client,
@@ -484,6 +530,104 @@ pub const Store = struct {
         // 全部成员同属一个 user_id，这里不存在"该记谁"的歧义。
         try self.client.commandOk(&.{ "ZADD", byUserKey(&ubuf, q.user_id), lens, primary_s });
         try self.client.commandOk(&.{ "SADD", key_index, primary_s });
+    }
+
+    /// `hikari reindex`（`main.zig` 的子命令）唯一的实现：把 `hikari:index`
+    /// 里已经存在的每一条语录补进它作者的 `hikari:byuser:{user_id}`。
+    ///
+    /// 为什么必须单独有这条路径：`hikari:byuser` 是后加的键，136 条更早收录
+    /// 的生产语录不在里面，`/?user_id=` 对**整个**现存语录库恒定查不到（这
+    /// 136 条同属一个作者，所以这不是"部分作者查不到"，是这个过滤器对上线
+    /// 前的全部存量语录整体失效）。曾经写在设计文档与 `key_byuser_prefix`
+    /// 注释里的修复建议是"把这些语录重新收录一遍"——那条建议是错的：扫描器
+    /// 与 `hikari import` 都在 `Store.exists()` 这道关卡上就返回了，
+    /// `add()`／`addChain()` 根本走不到，重放多少次都不会补上索引。只回填
+    /// 索引、不改动语录本身的路径必须自己存在，就是这个方法。
+    ///
+    /// 命令序列：`SMEMBERS hikari:index` → 逐 id 一次
+    /// `HMGET hikari:quote:{id} user_id length` → 两个字段都问到就
+    /// `ZADD hikari:byuser:{user_id} {length} {id}`。
+    ///
+    /// 三条纪律：
+    ///
+    ///   - **只补索引，绝不创造或改动语录**：`HMGET` 是纯读；问不出 `user_id`
+    ///     或 `length` 就跳过并计数，绝不拿 0 当默认值——`hikari:byuser:0`
+    ///     会是一个真实存在、却对应不到任何人的假索引，比缺一条更难发现。
+    ///   - **幂等、可重复跑**：`ZADD` 对已经在的成员就是原样覆盖 score。跑
+    ///     第二遍发出的是逐字节相同的一串命令，不改变任何状态，所以中途失败
+    ///     （网络断了、Redis 重启）的修复手段就是原样再跑一遍。
+    ///   - **绝不自动触发**：只有运营方显式敲 `hikari reindex` 才会走到这里。
+    ///     进程启动、定时扫描、任何 HTTP 读路径都不碰它——"读路径顺手写一笔"
+    ///     和"启动时跑一遍全量修复"都会引入这次改动范围之外的新状态机，这正
+    ///     是当初决定不做自动回填的理由，加了子命令也不推翻它。
+    ///
+    /// 先把 `SMEMBERS` 的结果解析成一份自有的 `[]i64` 再进循环，而不是抱着
+    /// 那个 `resp.Value` 一路 `HMGET` 下去：一是索引成员本身的合法性在碰任何
+    /// 一条 hash 之前就查完并计数；二是整张索引的回复能在循环开始前就释放掉，
+    /// 循环期间的常驻内存是每条 8 字节，而不是一整个 resp.Value 数组。
+    pub fn reindexByUser(self: *Store) Error!ReindexSummary {
+        var summary: ReindexSummary = .{};
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(self.gpa);
+        {
+            const v = try self.client.command(&.{ "SMEMBERS", key_index });
+            defer v.deinit(self.client.gpa);
+            const items: []const resp.Value = switch (v) {
+                .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+                else => &[_]resp.Value{},
+            };
+            summary.seen = items.len;
+            for (items) |item| {
+                const member = bulkOrNull(item) orelse {
+                    summary.bad_id += 1;
+                    continue;
+                };
+                const id = std.fmt.parseInt(i64, member, 10) catch {
+                    summary.bad_id += 1;
+                    continue;
+                };
+                try ids.append(self.gpa, id);
+            }
+        }
+
+        for (ids.items) |id| {
+            var kb: [64]u8 = undefined;
+            const v = try self.client.command(&.{ "HMGET", quoteKey(&kb, id), "user_id", "length" });
+            defer v.deinit(self.client.gpa);
+            const pair: []const resp.Value = switch (v) {
+                .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+                else => &[_]resp.Value{},
+            };
+            const uid_s: ?[]const u8 = if (pair.len > 0) bulkOrNull(pair[0]) else null;
+            const len_s: ?[]const u8 = if (pair.len > 1) bulkOrNull(pair[1]) else null;
+            if (uid_s == null and len_s == null) {
+                summary.missing_hash += 1;
+                continue;
+            }
+            const uid: ?u64 = if (uid_s) |x| (std.fmt.parseInt(u64, x, 10) catch null) else null;
+            if (uid == null) {
+                summary.missing_user_id += 1;
+                continue;
+            }
+            const length: ?usize = if (len_s) |x| (std.fmt.parseInt(usize, x, 10) catch null) else null;
+            if (length == null) {
+                summary.missing_length += 1;
+                continue;
+            }
+            var idb: [32]u8 = undefined;
+            const id_s = std.fmt.bufPrint(&idb, "{d}", .{id}) catch unreachable;
+            var lenb: [32]u8 = undefined;
+            const len_out = std.fmt.bufPrint(&lenb, "{d}", .{length.?}) catch unreachable;
+            var ubuf: [64]u8 = undefined;
+            try self.client.commandOk(&.{ "ZADD", byUserKey(&ubuf, uid.?), len_out, id_s });
+            summary.reindexed += 1;
+        }
+
+        return summary;
     }
 
     /// 撤一条语录。`message_id` 先按 `hikari:chainmember:{message_id}` 查它是
@@ -2678,4 +2822,216 @@ fn checkFetchSampledAlloc(gpa: std.mem.Allocator) !void {
 
 test "fetchSampled（经 randomManyFiltered）在分配失败时不泄漏、不重复释放（checkAllAllocationFailures）" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFetchSampledAlloc, .{});
+}
+
+// ---------------------------------------------------------------------------
+// reindexByUser（`hikari reindex`）：把 `hikari:index` 里已有的语录逐条补进
+// `hikari:byuser:{user_id}`。这是一条**只由运营方手动触发**的修复路径，进程
+// 启动、扫描、任何读路径都不会碰它——见 reindexByUser 的文档注释。
+
+test "reindexByUser：SMEMBERS 之后逐条 HMGET，问到作者与长度就 ZADD 进 hikari:byuser" {
+    const gpa = std.testing.allocator;
+    // 索引里三条：12345（🔥 链语录的主键，正数 message_id）、-4242（hikari
+    // import 写进来的语录，合成的负数 message_id）、777（hash 已经不在了的
+    // 悬空 id）。脚本依次是 SMEMBERS 回复、三次 HMGET 回复、两次 ZADD 回复。
+    const script = "*3\r\n$5\r\n12345\r\n$5\r\n-4242\r\n$3\r\n777\r\n" ++ // SMEMBERS hikari:index
+        "*2\r\n$5\r\n10001\r\n$1\r\n7\r\n" ++ // HMGET hikari:quote:12345 -> user_id=10001, length=7
+        ":1\r\n" ++ // ZADD hikari:byuser:10001
+        "*2\r\n$5\r\n20002\r\n$2\r\n12\r\n" ++ // HMGET hikari:quote:-4242 -> user_id=20002, length=12
+        ":1\r\n" ++ // ZADD hikari:byuser:20002
+        "*2\r\n$-1\r\n$-1\r\n"; // HMGET hikari:quote:777 -> 两个字段都 nil（hash 不在了）
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const s = try store.reindexByUser();
+    try std.testing.expectEqual(@as(usize, 3), s.seen);
+    try std.testing.expectEqual(@as(usize, 2), s.reindexed);
+    try std.testing.expectEqual(@as(usize, 1), s.missing_hash);
+    try std.testing.expectEqual(@as(usize, 1), s.skipped());
+
+    c.deinit();
+    srv.stop();
+
+    // 帧必须逐字节钉死：只查 "ZADD" 与 "hikari:byuser:10001" 两个子串各自
+    // 存在，会让 score 与 member 换位（`ZADD key 12345 7`）照样通过——这个
+    // 仓库已经因为两条独立的 indexOf 断言放过一次参数换位了。
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$8\r\nSMEMBERS\r\n$12\r\nhikari:index\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$18\r\nhikari:quote:12345\r\n$7\r\nuser_id\r\n$6\r\nlength\r\n",
+        "*4\r\n$4\r\nZADD\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n7\r\n$5\r\n12345\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$18\r\nhikari:quote:-4242\r\n$7\r\nuser_id\r\n$6\r\nlength\r\n",
+        "*4\r\n$4\r\nZADD\r\n$19\r\nhikari:byuser:20002\r\n$2\r\n12\r\n$5\r\n-4242\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$16\r\nhikari:quote:777\r\n$7\r\nuser_id\r\n$6\r\nlength\r\n",
+    });
+    // 悬空 id 不产生任何写命令：reindex 只补索引，绝不创造语录。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:byuser:0") == null);
+}
+
+test "reindexByUser：连跑两次——第二次逐字节发出同一串命令，ZADD 覆盖是无害的" {
+    const gpa = std.testing.allocator;
+    const first = "*1\r\n$5\r\n12345\r\n" ++ "*2\r\n$5\r\n10001\r\n$1\r\n7\r\n" ++ ":1\r\n";
+    // 第二次：同样的索引、同样的 hash，ZADD 回 0（成员已经在，score 原样
+    // 覆盖）。幂等在这里的准确含义不是"第二次什么都不发"，而是"第二次发的
+    // 是同一串命令，且不改变任何状态"——ZADD 是幂等的，所以可以随便重跑。
+    const second = "*1\r\n$5\r\n12345\r\n" ++ "*2\r\n$5\r\n10001\r\n$1\r\n7\r\n" ++ ":0\r\n";
+    const srv = try FakeServer.start(gpa, first ++ second);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const a = try store.reindexByUser();
+    const b = try store.reindexByUser();
+    try std.testing.expectEqual(a, b);
+    try std.testing.expectEqual(@as(usize, 1), b.reindexed);
+    try std.testing.expectEqual(@as(usize, 0), b.skipped());
+
+    c.deinit();
+    srv.stop();
+
+    // 整个连接上发出去的字节 = 同一串三条命令，原样两遍。用等值断言而不是
+    // 逐帧查找：这条测试要说的正是"第二次没有多发、也没有少发任何东西"。
+    const once = "*2\r\n$8\r\nSMEMBERS\r\n$12\r\nhikari:index\r\n" ++
+        "*4\r\n$5\r\nHMGET\r\n$18\r\nhikari:quote:12345\r\n$7\r\nuser_id\r\n$6\r\nlength\r\n" ++
+        "*4\r\n$4\r\nZADD\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n7\r\n$5\r\n12345\r\n";
+    try std.testing.expectEqualStrings(once ++ once, srv.received.items);
+}
+
+test "reindexByUser：空索引只发一条 SMEMBERS，一条 HMGET 都不发" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const s = try store.reindexByUser();
+    try std.testing.expectEqual(@as(usize, 0), s.seen);
+    try std.testing.expectEqual(@as(usize, 0), s.reindexed);
+    try std.testing.expectEqual(@as(usize, 0), s.skipped());
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expectEqualStrings("*2\r\n$8\r\nSMEMBERS\r\n$12\r\nhikari:index\r\n", srv.received.items);
+}
+
+test "reindexByUser：字段缺失的三种情形各自归类，都不发 ZADD" {
+    const gpa = std.testing.allocator;
+    // 三条索引成员：1（只缺 user_id）、2（只缺 length）、3（length 不是
+    // 数字）。三条都必须被跳过并各自计数，而不是拿 0 当默认值写进
+    // hikari:byuser:0 ——那会造出一个谁也查不到、却真实存在的假索引。
+    const script = "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n" ++
+        "*2\r\n$-1\r\n$1\r\n7\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$-1\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$3\r\nabc\r\n";
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const s = try store.reindexByUser();
+    try std.testing.expectEqual(@as(usize, 3), s.seen);
+    try std.testing.expectEqual(@as(usize, 0), s.reindexed);
+    try std.testing.expectEqual(@as(usize, 1), s.missing_user_id);
+    try std.testing.expectEqual(@as(usize, 2), s.missing_length);
+    try std.testing.expectEqual(@as(usize, 3), s.skipped());
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "ZADD") == null);
+}
+
+test "reindexByUser：索引里混进一个不是整数的成员 → 记 bad_id，不去碰它的 hash" {
+    const gpa = std.testing.allocator;
+    const script = "*2\r\n$3\r\nnah\r\n$5\r\n12345\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$1\r\n7\r\n" ++ ":1\r\n";
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const s = try store.reindexByUser();
+    try std.testing.expectEqual(@as(usize, 2), s.seen);
+    try std.testing.expectEqual(@as(usize, 1), s.reindexed);
+    try std.testing.expectEqual(@as(usize, 1), s.bad_id);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:quote:nah") == null);
+}
+
+test "formatReindexSummary 产出的文本带全部计数与各自的跳过原因" {
+    const gpa = std.testing.allocator;
+    const s: ReindexSummary = .{
+        .seen = 136,
+        .reindexed = 130,
+        .bad_id = 1,
+        .missing_hash = 2,
+        .missing_user_id = 1,
+        .missing_length = 2,
+    };
+    const text = try formatReindexSummary(gpa, s);
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "136") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "130") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no quote hash 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no user_id 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no length 2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "malformed index member 1") != null);
+}
+
+fn checkReindexAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+    const script = "*3\r\n$5\r\n12345\r\n$5\r\n-4242\r\n$3\r\n777\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$1\r\n7\r\n" ++ ":1\r\n" ++
+        "*2\r\n$5\r\n20002\r\n$2\r\n12\r\n" ++ ":1\r\n" ++
+        "*2\r\n$-1\r\n$-1\r\n";
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(gpa, &c);
+    _ = try st.reindexByUser();
+}
+
+test "reindexByUser 在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkReindexAlloc, .{});
+}
+
+fn checkFormatReindexSummaryAlloc(gpa: std.mem.Allocator) !void {
+    const text = try formatReindexSummary(gpa, .{ .seen = 136, .reindexed = 130, .missing_hash = 6 });
+    gpa.free(text);
+}
+
+test "formatReindexSummary 在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFormatReindexSummaryAlloc, .{});
 }

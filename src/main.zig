@@ -33,7 +33,14 @@ pub fn main() !void {
             }
             return runRunCommand(gpa);
         }
-        std.log.err("unknown subcommand: {s} (usage: hikari [import <file>|run])", .{args[1]});
+        if (std.mem.eql(u8, args[1], "reindex")) {
+            if (args.len != 2) {
+                std.log.err("usage: hikari reindex", .{});
+                std.process.exit(1);
+            }
+            return runReindexCommand(gpa);
+        }
+        std.log.err("unknown subcommand: {s} (usage: hikari [import <file>|run|reindex])", .{args[1]});
         std.process.exit(1);
     }
 
@@ -211,6 +218,49 @@ fn runRunCommand(gpa: std.mem.Allocator) !void {
     };
 
     runner.runOnce(deps, std.time.timestamp());
+}
+
+/// `hikari reindex`：把 `hikari:index` 里已有的语录逐条补进作者维度的索引
+/// `hikari:byuser:{user_id}`，然后退出。装配方式跟 `import`/`run` 一致——
+/// 自己的 config.load、自己的一条 Redis 连接（`redis.Client` 一旦被移动或
+/// 复制就会失效，这条命令跑完就退出，没有必要也不该复用常驻路径的连接）。
+///
+/// 它存在的理由：`hikari:byuser` 是后加的键，上线之前收录的 136 条生产语录
+/// 全都不在里面，`/?user_id=` 因此对整个存量语录库失效（这 136 条同属一个
+/// 作者，不是"部分作者查不到"）。而"重新收录一遍就好"这条曾经写进文档的建议
+/// 行不通：扫描器与 `hikari import` 都在 `Store.exists()` 那道关卡上就返回
+/// 了，`add()`/`addChain()` 根本走不到。见 `store.Store.reindexByUser`。
+///
+/// 它**不改变任何自动行为**：进程启动不跑它，定时扫描不跑它，HTTP 读路径
+/// 更不会顺手写一笔。只有运营方显式敲这条命令才会发出任何写命令。
+///
+/// 退出码：config 加载失败、Redis 连不上、或者回填过程中 Redis 报错，都是
+/// 非零——这三种都意味着这次修复没有（完整）做成，运营方需要能从退出码直接
+/// 看出来。被跳过的条目不算失败：它们是数据本身的既有缺陷（悬空 id、缺
+/// 字段），再跑多少遍也不会变，如实打进摘要里就够了。
+fn runReindexCommand(gpa: std.mem.Allocator) !void {
+    var bad: ?[]const u8 = null;
+    var cfg = config.load(gpa, &bad) catch |e| {
+        std.log.err("config error ({s}) at env var: {s}", .{ @errorName(e), bad orelse "?" });
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var reindex_redis = redis.Client.connect(gpa, cfg.redis_host, cfg.redis_port, cfg.redis_password, cfg.redis_db) catch |e| {
+        std.log.err("redis connect failed: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
+    defer reindex_redis.deinit();
+    var reindex_store = store.Store.init(gpa, &reindex_redis);
+
+    const summary = reindex_store.reindexByUser() catch |e| {
+        std.log.err("reindex failed: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
+
+    const text = try store.formatReindexSummary(gpa, summary);
+    defer gpa.free(text);
+    try std.fs.File.stdout().writeAll(text);
 }
 
 test {
