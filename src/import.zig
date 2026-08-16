@@ -140,6 +140,10 @@ fn importLine(
     from: []const u8,
     from_who: []const u8,
     group_id: u64,
+    /// 导入进来的这批语录算谁说的。命令行还没有 --user 之前，取
+    /// OBSERVED_QQS 的第一个；观察全员（空集）时没有可归属的人，调用方
+    /// 在进入循环之前就已经拒绝了，不会走到这里。
+    attribution_qq: u64,
     now: i64,
     summary: *Summary,
 ) !void {
@@ -169,7 +173,7 @@ fn importLine(
         .created_at = now,
         .message_id = mid,
         .group_id = group_id,
-        .user_id = deps.observed_qq,
+        .user_id = attribution_qq,
         .commit_from = "import",
     });
     defer runner.freeQuote(deps.gpa, q);
@@ -205,11 +209,20 @@ pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
     const a = ar.allocator();
 
     const group_id = deps.group_ids[0];
+
+    // 观察全员时没有"那一个被观察者"可以把这批语录记在名下。与其静默挑一个
+    // 或者写个空归属（入库后没有编辑路径，写错就是永久的），不如直接拒绝，
+    // 等 --user 参数落地后由操作者显式指定。
+    const attribution_qq = if (deps.observed_qqs.len == 0)
+        return error.AttributionUnavailable
+    else
+        deps.observed_qqs[0];
+
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
     const from_who = runner.observedCard(deps, a, group_id) orelse return error.AttributionUnavailable;
 
     for (parsed.lines) |line| {
-        try importLine(deps, line, from, from_who, group_id, now, &summary);
+        try importLine(deps, line, from, from_who, group_id, attribution_qq, now, &summary);
     }
 
     return summary;
@@ -497,7 +510,7 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 123456,
+        .observed_qqs = &.{123456},
         .admin_qqs = &.{},
         .group_ids = &.{10001},
     };
@@ -561,7 +574,7 @@ test "run 端到端：群归属解析不出来就整体中止，一条候选都�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 123456,
+        .observed_qqs = &.{123456},
         .admin_qqs = &.{},
         .group_ids = &.{10001},
     };

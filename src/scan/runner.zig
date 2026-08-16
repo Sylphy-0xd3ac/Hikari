@@ -165,7 +165,7 @@ pub const Deps = struct {
     gpa: std.mem.Allocator,
     nap: *napcat.Client,
     st: *store.Store,
-    observed_qq: u64,
+    observed_qqs: []const u64,
     admin_qqs: []const u64,
     group_ids: []const u64,
     /// getMsg 单次重试前的等待时长。生产上 24/2300 探针在负载压力下失败，紧接着
@@ -184,6 +184,13 @@ pub const Deps = struct {
     /// "測出来" 的、跑多慢都不一样的噪声，而是测试自己钦定的确定值。
     clock: *const fn () i64 = std.time.timestamp,
 };
+
+/// 需要"某一个具体 QQ"而不是集合的兜底场合：合并转发 node 的头像 id、以及
+/// 目标消息缺失时 Quote.user_id 的兜底值。观察全员（空集）时没有那一个人，
+/// 返回 null，由调用方各自决定怎么退化。
+fn soleObserved(deps: Deps) ?u64 {
+    return if (deps.observed_qqs.len == 0) null else deps.observed_qqs[0];
+}
 
 /// 一个群这一轮里 getMsg 重试的效果统计：命中过重试的调用次数，以及重试真的把
 /// 结果救回来的次数（第二次成功）。只在 scanGroup 这一次调用的作用域内存在、
@@ -278,27 +285,32 @@ fn fetchBotQq(deps: Deps) u64 {
     const a = ar.allocator();
 
     const data = deps.nap.callData(a, "get_login_info", "{}") catch |e| {
-        std.log.warn("get_login_info failed ({s}); forward messages will use OBSERVED_QQ={d} as the node avatar", .{ @errorName(e), deps.observed_qq });
-        return deps.observed_qq;
+        const fb = soleObserved(deps) orelse 0;
+        std.log.warn("get_login_info failed ({s}); forward messages will use {d} as the node avatar", .{ @errorName(e), fb });
+        return fb;
     };
     const obj = switch (data) {
         .object => |o| o,
         else => {
-            std.log.warn("get_login_info returned a non-object; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
-            return deps.observed_qq;
+            const fb = soleObserved(deps) orelse 0;
+            std.log.warn("get_login_info returned a non-object; forward messages will use {d} as the node avatar", .{fb});
+            return fb;
         },
     };
     const v = obj.get("user_id") orelse {
-        std.log.warn("get_login_info reply has no user_id field; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
-        return deps.observed_qq;
+        const fb = soleObserved(deps) orelse 0;
+        std.log.warn("get_login_info reply has no user_id field; forward messages will use {d} as the node avatar", .{fb});
+        return fb;
     };
     const n = onebot.asInt(v) orelse {
-        std.log.warn("get_login_info user_id is not a number; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
-        return deps.observed_qq;
+        const fb = soleObserved(deps) orelse 0;
+        std.log.warn("get_login_info user_id is not a number; forward messages will use {d} as the node avatar", .{fb});
+        return fb;
     };
     if (n < 0) {
-        std.log.warn("get_login_info user_id is negative ({d}); forward messages will use OBSERVED_QQ={d} as the node avatar", .{ n, deps.observed_qq });
-        return deps.observed_qq;
+        const fb = soleObserved(deps) orelse 0;
+        std.log.warn("get_login_info user_id is negative ({d}); forward messages will use {d} as the node avatar", .{ n, fb });
+        return fb;
     }
     return @intCast(n);
 }
@@ -342,10 +354,14 @@ pub fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u
 /// groupName：两个字段都缺是"没问出来"，两个字段都在但都是空是"这人确实
 /// 没设名片也没有昵称"。
 pub fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
+    // 观察全员时没有"那一个被观察者"可查群名片。逐条语录按作者解析显示名是
+    // 下一步（hikari:username:{user_id} 查表）的事，这里先老实返回 null，让
+    // 既有的"归属取不到就让这个群失败"逻辑接手，而不是编一个名字出来。
+    const who = soleObserved(deps) orelse return null;
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{
         .group_id = group_id,
-        .user_id = deps.observed_qq,
+        .user_id = who,
         .no_cache = true,
     }, .{}, &aw.writer) catch |e| {
         std.log.warn("group {d}: building get_group_member_info request failed: {s}", .{ group_id, @errorName(e) });
@@ -746,8 +762,12 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // ---- 4. 逐条查被观察者消息的表情回应（✨ 与 🔥 共用同一次 get_msg，不额外调用）----
     var star_ids: std.ArrayList(i64) = .empty;
     var fire_ids: std.ArrayList(i64) = .empty;
+    const probe_params: rules.Params = .{
+        .observed_qqs = deps.observed_qqs,
+        .admin_qqs = deps.admin_qqs,
+    };
     for (window.items) |m| {
-        if (m.user_id != deps.observed_qq) continue;
+        if (!probe_params.isObserved(m.user_id)) continue;
         const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: star-reaction probe for message {d} failed", .{ gid, m.message_id });
             continue;
@@ -786,7 +806,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
 
     // ---- 5. 判定 ----
     var outcome = try rules.classify(deps.gpa, window.items, pool.items, star_ids.items, fire_ids.items, .{
-        .observed_qq = deps.observed_qq,
+        .observed_qqs = deps.observed_qqs,
         .admin_qqs = deps.admin_qqs,
     });
     defer outcome.deinit(deps.gpa);
@@ -884,7 +904,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 .created_at = if (target) |t| t.time else win_end,
                 .message_id = cand.message_id,
                 .group_id = gid,
-                .user_id = if (target) |t| t.user_id else deps.observed_qq,
+                .user_id = if (target) |t| t.user_id else (soleObserved(deps) orelse 0),
             });
             defer freeQuote(deps.gpa, q);
 
@@ -1247,7 +1267,7 @@ test "fetchPage 翻页锚点：reverse_order=true（往回翻），message_seq �
         .gpa = gpa,
         .nap = &nap,
         .st = undefined, // fetchPage 不碰 deps.st
-        .observed_qq = 1,
+        .observed_qqs = &.{1},
         .admin_qqs = &.{},
         .group_ids = &.{},
     };
@@ -1279,7 +1299,7 @@ test "fetchPage 首页（没有锚点）：不带 message_seq，reverse_order �
         .gpa = gpa,
         .nap = &nap,
         .st = undefined,
-        .observed_qq = 1,
+        .observed_qqs = &.{1},
         .admin_qqs = &.{},
         .group_ids = &.{},
     };
@@ -1740,7 +1760,7 @@ test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{55},
     };
@@ -1811,7 +1831,7 @@ test "runOnce：scanGroup 中途硬失败（try 传播的错误）时仍然发�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{77},
     };
@@ -1908,7 +1928,7 @@ test "runOnce：正常收尾（没有 Trouble）时第七个 node 是 Successful
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{88},
         .clock = &stubClock,
@@ -1993,7 +2013,7 @@ test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{77},
     };
@@ -2075,7 +2095,7 @@ test "runOnce：isChainMember 拦下一个已属于其它链的候选——即�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{78},
     };
@@ -2115,7 +2135,7 @@ test "fetchBotQq：get_login_info 失败时退回 OBSERVED_QQ" {
         .gpa = gpa,
         .nap = &nap,
         .st = undefined, // fetchBotQq 不碰 deps.st
-        .observed_qq = 99999,
+        .observed_qqs = &.{99999},
         .admin_qqs = &.{},
         .group_ids = &.{},
     };
@@ -2142,7 +2162,7 @@ test "fetchBotQq：正常拿到 user_id 时不使用 OBSERVED_QQ" {
         .gpa = gpa,
         .nap = &nap,
         .st = undefined,
-        .observed_qq = 99999,
+        .observed_qqs = &.{99999},
         .admin_qqs = &.{},
         .group_ids = &.{},
     };
@@ -2179,7 +2199,7 @@ test "getMsg：第一次失败、第二次成功——重试且救回，计数�
         .gpa = gpa,
         .nap = &nap,
         .st = undefined,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{},
         .get_msg_retry_delay_ns = 0,
@@ -2223,7 +2243,7 @@ test "getMsg：两次都失败——恰好重试一次后如实返回 null，不
         .gpa = gpa,
         .nap = &nap,
         .st = undefined,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{},
         .get_msg_retry_delay_ns = 0,
@@ -2269,7 +2289,7 @@ test "getMsg：第一次就成功——不重试，服务端只接到一次请�
         .gpa = gpa,
         .nap = &nap,
         .st = undefined,
-        .observed_qq = 10001,
+        .observed_qqs = &.{10001},
         .admin_qqs = &.{},
         .group_ids = &.{},
     };

@@ -39,8 +39,20 @@ pub const Candidate = struct {
 };
 
 pub const Params = struct {
-    observed_qq: u64,
+    /// 被观察者集合。**空切片 = 观察所有人**。
+    observed_qqs: []const u64,
     admin_qqs: []const u64,
+
+    /// "这个 QQ 算不算被观察者" 的**唯一**判定点。四条收录路径、Pass A 的
+    /// 撤稿目标判定、🔥 链的成员资格全部走这一个函数，不允许任何一处再写
+    /// 一份自己的 `for (observed_qqs) |o| ...`——"空集合 = 全部" 这条规则
+    /// 抄四遍就是四次抄错的机会，而抄错的后果分别是：漏收（判成 false）、
+    /// 或者把不该作废的消息永久 tombstone（判成 true）。
+    pub fn isObserved(self: Params, qq: u64) bool {
+        if (self.observed_qqs.len == 0) return true;
+        for (self.observed_qqs) |o| if (o == qq) return true;
+        return false;
+    }
 };
 
 pub const Outcome = struct {
@@ -101,8 +113,8 @@ const Chain = struct {
     }
 };
 
-fn isChainMember(m: onebot.Message, star_ids: []const i64, fire_ids: []const i64, observed_qq: u64) bool {
-    return m.user_id == observed_qq and contains(star_ids, m.message_id) and contains(fire_ids, m.message_id);
+fn isChainMember(m: onebot.Message, star_ids: []const i64, fire_ids: []const i64, p: Params) bool {
+    return p.isObserved(m.user_id) and contains(star_ids, m.message_id) and contains(fire_ids, m.message_id);
 }
 
 /// window 按 message_id 去重后的序列，只保留每个 id 首次出现的那条。
@@ -177,8 +189,14 @@ fn buildChains(
     var last_pos: usize = 0;
 
     for (distinct, 0..) |m, pos| {
-        if (!isChainMember(m, star_ids, fire_ids, p.observed_qq)) continue;
-        if (run.items.len > 0 and pos - last_pos <= chain_max_gap) {
+        if (!isChainMember(m, star_ids, fire_ids, p)) continue;
+        // 同一条链的全部成员必须是**同一个人**发的。观察所有人之后这不再是
+        // 理论问题：两个人各自的半句话恰好前后脚发出、又都被贴了 ✨+🔥，
+        // 不加这条约束就会被拼成一条谁也没说过的话，而这条语录的 `from_who`
+        // 也无从谈起（它只能取第一个成员的作者，另一半的作者被静默吞掉）。
+        // 发送者一变就断开当前 run，从这条消息重新起一条。
+        const same_sender = run.items.len > 0 and run.items[0].user_id == m.user_id;
+        if (same_sender and pos - last_pos <= chain_max_gap) {
             try run.append(gpa, m);
         } else {
             if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
@@ -242,7 +260,7 @@ pub fn classify(
             if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
             continue;
         };
-        var ok = target.user_id == p.observed_qq;
+        var ok = p.isObserved(target.user_id);
         if (!ok) {
             if (try manualBody(gpa, target, p)) |body| {
                 gpa.free(body);
@@ -323,7 +341,7 @@ pub fn classify(
         // 路径1：被观察者本人的消息带 ✨ 表情回应，且不是已并入某条 🔥 链的成员
         // （链已经把它的内容拼进 joined 语录了；不排除的话 "你们有钱"、
         // "你们潇洒"、"你们有钱 你们潇洒" 会同时入库）
-        if (m.user_id == p.observed_qq and contains(star_ids, m.message_id) and !is_chain_member) {
+        if (p.isObserved(m.user_id) and contains(star_ids, m.message_id) and !is_chain_member) {
             try appendCandidate(gpa, &cands, .{
                 .message_id = m.message_id,
                 .path = .emoji_reaction,
@@ -333,8 +351,18 @@ pub fn classify(
             continue;
         }
 
-        // 路径2：他人引用被观察者的消息，且除 reply 外只有一个 ✨ 文本段
-        if (m.user_id == p.observed_qq) continue;
+        // 路径2：**别人**引用一条被观察者的消息，且除 reply 外只有一个 ✨ 文本段。
+        //
+        // "别人" 这个条件过去写成 `if (m.user_id == p.observed_qq) continue;`
+        // ——只有一个被观察者时它等价于 "回复的人不是这条消息的作者"，因为
+        // 目标本来就必须是那唯一一个被观察者。把它机械地换成
+        // `if (p.isObserved(m.user_id)) continue;` 会在空集合（观察所有人）
+        // 下让这一条恒为真，**整条路径2直接失效**，而且不会有任何测试以外
+        // 的迹象。正确的推广是把它下移到解析出目标之后，判 "回复的人 ≠ 被
+        // 引用消息的作者"：单被观察者配置下与旧行为逐字等价（目标必然是那
+        // 个被观察者，于是 `m.user_id != target.user_id` ⇔
+        // `m.user_id != observed_qq`），多被观察者/观察所有人时表达的也正是
+        // 原本的意思——自己给自己的话贴 ✨ 不算数，别人认可才算。
         const rid = m.replyTarget() orelse continue;
         const txt = m.soleTextBesidesReply() orelse continue;
         if (!std.mem.eql(u8, std.mem.trim(u8, txt, ws), star)) continue;
@@ -342,7 +370,8 @@ pub fn classify(
             if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
             continue;
         };
-        if (target.user_id != p.observed_qq) continue;
+        if (!p.isObserved(target.user_id)) continue;
+        if (m.user_id == target.user_id) continue;
         // 引用目标是链成员时同样让路给路径4：这条 ✨ 回复只是在说"这句话说得好"，
         // 链已经替它把这句话（连同它的邻居）收进 joined 语录了。
         if (chainOf(chains, rid) != null) continue;
@@ -463,7 +492,7 @@ const ADMIN: u64 = 20001;
 const OUTSIDER: u64 = 30001;
 
 fn params() Params {
-    return .{ .observed_qq = OBSERVED, .admin_qqs = &.{ADMIN} };
+    return .{ .observed_qqs = &.{OBSERVED}, .admin_qqs = &.{ADMIN} };
 }
 
 // 注意：这两个 helper 的形参必须是 comptime。它们的 .segments 指向一个匿名数组
@@ -622,7 +651,7 @@ test "路径3：管理员发 ✨ 加内容但带了 reply 段 → 走路径2判�
 
 test "路径3 优先于路径1：被观察者兼任管理员时按路径3处理" {
     const gpa = std.testing.allocator;
-    const p: Params = .{ .observed_qq = OBSERVED, .admin_qqs = &.{OBSERVED} };
+    const p: Params = .{ .observed_qqs = &.{OBSERVED}, .admin_qqs = &.{OBSERVED} };
     const msgs = [_]onebot.Message{textMsg(5, OBSERVED, "✨ 我自己补一句")};
     var out = try classify(gpa, &msgs, &msgs, &.{5}, &.{}, p);
     defer out.deinit(gpa);
@@ -935,7 +964,7 @@ test "🔥链：路径2引用链上成员被抑制——只留 fire_chain 一条
 test "🔥链：非主键成员自身是路径3格式时被抑制为个体候选，joined正文剥掉它的✨前缀" {
     const gpa = std.testing.allocator;
     // 被观察者同时在 ADMIN_QQS 里，这样第二个成员的 "✨ 你们潇洒" 才满足路径3格式。
-    const p: Params = .{ .observed_qq = OBSERVED, .admin_qqs = &.{OBSERVED} };
+    const p: Params = .{ .observed_qqs = &.{OBSERVED}, .admin_qqs = &.{OBSERVED} };
     const msgs = [_]onebot.Message{
         textMsg(1, OBSERVED, "你们有钱"),
         textMsg(2, OBSERVED, "✨ 你们潇洒"),
@@ -953,7 +982,7 @@ test "🔥链：非主键成员自身是路径3格式时被抑制为个体候选
 
 test "🔥链：主键自身是路径3格式时同样被抑制，链仍然赢（路径4压过路径3）" {
     const gpa = std.testing.allocator;
-    const p: Params = .{ .observed_qq = OBSERVED, .admin_qqs = &.{OBSERVED} };
+    const p: Params = .{ .observed_qqs = &.{OBSERVED}, .admin_qqs = &.{OBSERVED} };
     const msgs = [_]onebot.Message{
         textMsg(1, OBSERVED, "✨ 你们有钱"),
         textMsg(2, OBSERVED, "你们潇洒"),
@@ -1000,4 +1029,187 @@ fn classifyChainRevokedUnderFailingAllocator(gpa: std.mem.Allocator) !void {
 
 test "OOM 回归：🔥链被 💦 撤稿（revoked 展开为全部成员）时任意分配点失败都不能段错误或重复释放" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyChainRevokedUnderFailingAllocator, .{});
+}
+
+// ---------------------------------------------------------------------------
+// 观察所有人（OBSERVED_QQS 为空）——这是部署上的常态配置，不是兜底分支。
+// 下面这组测试逐条路径确认 Params.isObserved 的"空集合 = 全部"语义真的贯穿到
+// 了四条收录路径、撤稿目标判定和链构建，而不是只改了其中几处。
+
+const everyone: Params = .{ .observed_qqs = &.{}, .admin_qqs = &.{ADMIN} };
+const subset: Params = .{ .observed_qqs = &.{ OBSERVED, OUTSIDER }, .admin_qqs = &.{ADMIN} };
+const THIRD: u64 = 40001;
+
+test "isObserved：空集合对任何人都为真，非空集合只对集合内的人为真" {
+    try std.testing.expect(everyone.isObserved(OBSERVED));
+    try std.testing.expect(everyone.isObserved(OUTSIDER));
+    try std.testing.expect(everyone.isObserved(0));
+    try std.testing.expect(subset.isObserved(OBSERVED));
+    try std.testing.expect(subset.isObserved(OUTSIDER));
+    try std.testing.expect(!subset.isObserved(THIRD));
+}
+
+test "观察所有人 · 路径1：任何人的消息带 ✨ 都入选" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{ textMsg(1, OUTSIDER, "路人甲的金句"), textMsg(2, THIRD, "路人乙的话") };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, everyone);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.emoji_reaction, out.candidates[0].path);
+}
+
+test "观察所有人 · 路径2：任何人引用任何**别人**的消息回 ✨ 都收录被引用那条" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{ textMsg(1, OUTSIDER, "路人甲的金句"), replyMsg(2, THIRD, 1, "✨") };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, everyone);
+    defer out.deinit(gpa);
+    // 机械地把 `m.user_id == observed_qq` 换成 `isObserved(m.user_id)` 会让
+    // 这条恒为真、整条路径2静默失效——这个测试就是那条回归的守卫。
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqual(Path.quoted_star, out.candidates[0].path);
+}
+
+test "观察所有人 · 路径2：自己给自己的话回 ✨ 不算数（自吹不是他人认可）" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{ textMsg(1, OUTSIDER, "我说得真好"), replyMsg(2, OUTSIDER, 1, "✨") };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, everyone);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "配置了子集时 · 路径2：集合内的 A 认可集合内的 B → 收录（单人配置下这一条退化成旧行为）" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{ textMsg(1, OBSERVED, "B 的金句"), replyMsg(2, OUTSIDER, 1, "✨") };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, subset);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+}
+
+test "配置了子集时 · 路径1：集合外的人带 ✨ 仍然不入选" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{textMsg(1, THIRD, "集合外的人")};
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, subset);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "观察所有人 · 路径3：管理员手动收录不受影响（ADMIN_QQS 与观察集合是两回事）" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{textMsg(1, ADMIN, "✨ 手动补录")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, everyone);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.admin_manual, out.candidates[0].path);
+    try std.testing.expectEqualStrings("手动补录", out.candidates[0].text_override.?);
+}
+
+test "观察所有人 · 路径4：任何人的连续消息带 ✨+🔥 都能并成链" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "你们有钱"),
+        textMsg(2, OUTSIDER, "你们潇洒"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, everyone);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("你们有钱 你们潇洒", out.candidates[0].text_override.?);
+}
+
+test "观察所有人 · 撤稿：管理员 💦 引用任何人的消息都能作废" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{ textMsg(1, THIRD, "路人的话"), replyMsg(2, ADMIN, 1, "💦") };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, everyone);
+    defer out.deinit(gpa);
+    try std.testing.expectEqualSlices(i64, &.{1}, out.revoked);
+}
+
+test "配置了子集时 · 撤稿：💦 引用集合外的人的普通消息 → 不作废（旧行为原样保留）" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{ textMsg(1, THIRD, "集合外的话"), replyMsg(2, ADMIN, 1, "💦") };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, subset);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), out.revoked.len);
+}
+
+// ---------------------------------------------------------------------------
+// 🔥 链的同一发送者约束。
+
+test "🔥链：发送者中途变化 → 断链，两个人各自的半句不会被拼成一条" {
+    const gpa = std.testing.allocator;
+    // 两条相邻、都带 ✨+🔥，但分别是两个人发的。观察所有人之后这不是理论
+    // 情形：任何两个人前后脚说话都可能撞上。合并会产出一条谁都没说过的
+    // 语录，`from_who` 也只能取其中一个人——必须断开。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "你们有钱"),
+        textMsg(2, THIRD, "你们潇洒"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, everyone);
+    defer out.deinit(gpa);
+
+    // 两条都退回路径1单独收录，没有任何 fire_chain 候选。
+    try std.testing.expectEqual(@as(usize, 2), out.candidates.len);
+    for (out.candidates) |c| {
+        try std.testing.expectEqual(Path.emoji_reaction, c.path);
+        try std.testing.expectEqual(@as(?[]i64, null), c.chain_members);
+    }
+}
+
+test "🔥链：A A B B → 断成两条各自成链，成员不跨作者混入" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "甲上"),
+        textMsg(2, OUTSIDER, "甲下"),
+        textMsg(3, THIRD, "乙上"),
+        textMsg(4, THIRD, "乙下"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3, 4 }, &.{ 1, 2, 3, 4 }, everyone);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("甲上 甲下", out.candidates[0].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 1, 2 }, out.candidates[0].chain_members.?);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[1].path);
+    try std.testing.expectEqualStrings("乙上 乙下", out.candidates[1].text_override.?);
+    try std.testing.expectEqualSlices(i64, &.{ 3, 4 }, out.candidates[1].chain_members.?);
+}
+
+test "🔥链：A B A（中间夹一条别人的合格消息）→ 两端的 A 不会跨过 B 连起来" {
+    const gpa = std.testing.allocator;
+    // 间距上 1 与 3 是能连的（下标差 2 ≤ 4），但中间那条是别人发的，
+    // run 在 B 处被打断，A 的两条各自落单，全部退回路径1。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "甲上"),
+        textMsg(2, THIRD, "乙插话"),
+        textMsg(3, OUTSIDER, "甲下"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3 }, &.{ 1, 2, 3 }, everyone);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 3), out.candidates.len);
+    for (out.candidates) |c| try std.testing.expectEqual(Path.emoji_reaction, c.path);
+}
+
+fn classifyEveryoneChainUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    // 观察所有人 + 同一发送者约束下的链构建：A A B B B，两条链各自成立，
+    // 练 buildChains 里"发送者变化时先 finalize 旧 run 再起新 run"这条
+    // 新分支上的每一个分配点（ids/text 两次 ArrayList、chains 扩容、
+    // Pass B 转移所有权时的 chain_members dupe）。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "甲上"),
+        textMsg(2, OUTSIDER, "甲下"),
+        textMsg(3, THIRD, "乙上"),
+        textMsg(4, THIRD, "乙中"),
+        textMsg(5, THIRD, "乙下"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3, 4, 5 }, &.{ 1, 2, 3, 4, 5 }, everyone);
+    out.deinit(gpa);
+}
+
+test "OOM 回归：同一发送者约束下的多条链构建，任意分配点失败都不泄漏也不重复释放" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyEveryoneChainUnderFailingAllocator, .{});
 }

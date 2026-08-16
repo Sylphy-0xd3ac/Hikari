@@ -22,7 +22,11 @@ pub const Config = struct {
     gpa: std.mem.Allocator,
     napcat_url: []u8,
     napcat_token: []u8,
-    observed_qq: u64,
+    /// 被观察者集合。**空切片 = 观察所有人**（任何群成员的消息都可能被收录），
+    /// 这是部署上的常态配置，不是没人走的兜底分支。判定统一走
+    /// `scan/rules.zig` 的 `Params.isObserved`，本文件只负责把 env 解析成
+    /// 这个切片，不在这里再写一份"空即全部"的规则。
+    observed_qqs: []u64,
     group_ids: []u64,
     admin_qqs: []u64,
     scan_hour: u8,
@@ -37,6 +41,7 @@ pub const Config = struct {
     pub fn deinit(self: *Config) void {
         self.gpa.free(self.napcat_url);
         self.gpa.free(self.napcat_token);
+        self.gpa.free(self.observed_qqs);
         self.gpa.free(self.group_ids);
         self.gpa.free(self.admin_qqs);
         self.gpa.free(self.http_host);
@@ -112,10 +117,22 @@ fn need(env: Env, key: []const u8, bad: *?[]const u8) Error![]const u8 {
     return std.mem.trim(u8, v, ws);
 }
 
+/// 取一个**可选**变量：不存在、或者存在但 trim 后是空串，都当作"没填"。
+/// `OBSERVED_QQS` 靠这条把"没填"和"填了空串"折叠成同一个语义（观察所有人），
+/// 而不是像 need() 那样把空串当成缺失错误。
+fn optional(env: Env, key: []const u8) ?[]const u8 {
+    const v = env.get(key) orelse return null;
+    const t = std.mem.trim(u8, v, ws);
+    return if (t.len == 0) null else t;
+}
+
+/// `bad` 里报给运营方的那句话：既点名旧变量、也点名新变量，让人一眼知道
+/// 要把 .env 里的哪一行改成什么。
+pub const observed_renamed_hint = "OBSERVED_QQ (renamed to OBSERVED_QQS; unset means observe everyone)";
+
 pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Config {
     const napcat_url_raw = try need(env, "NAPCAT_HTTP_URL", bad);
     const napcat_token_raw = try need(env, "NAPCAT_TOKEN", bad);
-    const observed_raw = try need(env, "OBSERVED_QQ", bad);
     const groups_raw = try need(env, "QQ_GROUP_IDS", bad);
     const admins_raw = try need(env, "ADMIN_QQS", bad);
     const scan_raw = try need(env, "SCAN_TIME", bad);
@@ -123,10 +140,24 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
     const port_raw = try need(env, "HTTP_PORT", bad);
     const redis_raw = try need(env, "REDIS_URL", bad);
 
-    const observed = std.fmt.parseInt(u64, observed_raw, 10) catch {
-        bad.* = "OBSERVED_QQ";
+    // 旧名字 OBSERVED_QQ 已经不存在了，而且**故意不做别名**：一个被静默
+    // 忽略的旧变量名比一条"改名字"的启动错误糟糕得多——运营方会以为观察
+    // 范围还是原来那个人，实际上进程已经在观察所有人（空集合语义）。只有
+    // 旧名字在场、新名字缺席时才报错，两个都在时以新的为准（迁移期间
+    // .env 里两个并存不该拦住启动）。
+    if (env.get("OBSERVED_QQ") != null and optional(env, "OBSERVED_QQS") == null) {
+        bad.* = observed_renamed_hint;
         return error.InvalidValue;
+    }
+    // 不填 / 填空串 = 观察所有人 → 空切片。
+    const observed = blk: {
+        const raw = optional(env, "OBSERVED_QQS") orelse break :blk try gpa.alloc(u64, 0);
+        break :blk parseUintList(gpa, raw) catch |e| {
+            bad.* = "OBSERVED_QQS";
+            return if (e == error.OutOfMemory) e else error.InvalidValue;
+        };
     };
+    errdefer gpa.free(observed);
     const groups = parseUintList(gpa, groups_raw) catch |e| {
         bad.* = "QQ_GROUP_IDS";
         return if (e == error.OutOfMemory) e else error.InvalidValue;
@@ -161,7 +192,7 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
         .gpa = gpa,
         .napcat_url = napcat_url,
         .napcat_token = napcat_token,
-        .observed_qq = observed,
+        .observed_qqs = observed,
         .group_ids = groups,
         .admin_qqs = admins,
         .scan_hour = scan.hour,
@@ -177,9 +208,12 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
 
 pub fn load(gpa: std.mem.Allocator, bad: *?[]const u8) Error!Config {
     const keys = [_][]const u8{
-        "NAPCAT_HTTP_URL", "NAPCAT_TOKEN", "OBSERVED_QQ", "QQ_GROUP_IDS",
+        "NAPCAT_HTTP_URL", "NAPCAT_TOKEN", "OBSERVED_QQS", "QQ_GROUP_IDS",
         "ADMIN_QQS",       "SCAN_TIME",    "HTTP_HOST",   "HTTP_PORT",
         "REDIS_URL",
+        // 已废弃，仍然读进来：只为了在它单独在场时报出那条改名错误，
+        // 而不是静默忽略。
+        "OBSERVED_QQ",
     };
     var env: Env = .init(gpa);
     defer {
@@ -253,7 +287,7 @@ fn testEnv(gpa: std.mem.Allocator) !Env {
     var env: Env = .init(gpa);
     try env.put("NAPCAT_HTTP_URL", "http://127.0.0.1:3000");
     try env.put("NAPCAT_TOKEN", "tok");
-    try env.put("OBSERVED_QQ", "10001");
+    try env.put("OBSERVED_QQS", "10001");
     try env.put("QQ_GROUP_IDS", "111,222");
     try env.put("ADMIN_QQS", "20001");
     try env.put("SCAN_TIME", "03:00");
@@ -272,7 +306,7 @@ test "loadFrom 读全所有字段" {
     defer cfg.deinit();
 
     try std.testing.expectEqualStrings("http://127.0.0.1:3000", cfg.napcat_url);
-    try std.testing.expectEqual(@as(u64, 10001), cfg.observed_qq);
+    try std.testing.expectEqualSlices(u64, &.{10001}, cfg.observed_qqs);
     try std.testing.expectEqualSlices(u64, &.{ 111, 222 }, cfg.group_ids);
     try std.testing.expectEqualSlices(u64, &.{20001}, cfg.admin_qqs);
     try std.testing.expectEqual(@as(u8, 3), cfg.scan_hour);
@@ -298,4 +332,73 @@ test "loadFrom 值非法时报出是哪一个" {
     var bad: ?[]const u8 = null;
     try std.testing.expectError(error.InvalidValue, loadFrom(gpa, env, &bad));
     try std.testing.expectEqualStrings("HTTP_PORT", bad.?);
+}
+
+test "loadFrom：OBSERVED_QQS 不填 = 观察所有人（空切片，不是错误）" {
+    const gpa = std.testing.allocator;
+    var env = try testEnv(gpa);
+    defer env.deinit();
+    _ = env.remove("OBSERVED_QQS");
+    var bad: ?[]const u8 = null;
+    var cfg = try loadFrom(gpa, env, &bad);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cfg.observed_qqs.len);
+}
+
+test "loadFrom：OBSERVED_QQS 填空串同样是观察所有人" {
+    const gpa = std.testing.allocator;
+    var env = try testEnv(gpa);
+    defer env.deinit();
+    try env.put("OBSERVED_QQS", "   ");
+    var bad: ?[]const u8 = null;
+    var cfg = try loadFrom(gpa, env, &bad);
+    defer cfg.deinit();
+    try std.testing.expectEqual(@as(usize, 0), cfg.observed_qqs.len);
+}
+
+test "loadFrom：OBSERVED_QQS 解析成逗号分隔的多个 QQ，跟 ADMIN_QQS 同一套语法" {
+    const gpa = std.testing.allocator;
+    var env = try testEnv(gpa);
+    defer env.deinit();
+    try env.put("OBSERVED_QQS", "10001, 10002 ,10003");
+    var bad: ?[]const u8 = null;
+    var cfg = try loadFrom(gpa, env, &bad);
+    defer cfg.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 10001, 10002, 10003 }, cfg.observed_qqs);
+}
+
+test "loadFrom：只留旧名字 OBSERVED_QQ 时启动失败，错误里同时点名新旧两个变量" {
+    const gpa = std.testing.allocator;
+    var env = try testEnv(gpa);
+    defer env.deinit();
+    _ = env.remove("OBSERVED_QQS");
+    try env.put("OBSERVED_QQ", "10001");
+    var bad: ?[]const u8 = null;
+    // 静默忽略旧变量名是这条规则唯一不能接受的行为：运营方会以为观察范围
+    // 还是那一个人，实际上进程已经在观察所有人。
+    try std.testing.expectError(error.InvalidValue, loadFrom(gpa, env, &bad));
+    try std.testing.expect(std.mem.indexOf(u8, bad.?, "OBSERVED_QQ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bad.?, "OBSERVED_QQS") != null);
+}
+
+test "loadFrom：新旧两个名字并存时以新的为准，不拦启动（迁移期间可以两个都写着）" {
+    const gpa = std.testing.allocator;
+    var env = try testEnv(gpa);
+    defer env.deinit();
+    try env.put("OBSERVED_QQ", "77777");
+    try env.put("OBSERVED_QQS", "10001,10002");
+    var bad: ?[]const u8 = null;
+    var cfg = try loadFrom(gpa, env, &bad);
+    defer cfg.deinit();
+    try std.testing.expectEqualSlices(u64, &.{ 10001, 10002 }, cfg.observed_qqs);
+}
+
+test "loadFrom：OBSERVED_QQS 值非法时报出是哪一个" {
+    const gpa = std.testing.allocator;
+    var env = try testEnv(gpa);
+    defer env.deinit();
+    try env.put("OBSERVED_QQS", "10001,abc");
+    var bad: ?[]const u8 = null;
+    try std.testing.expectError(error.InvalidValue, loadFrom(gpa, env, &bad));
+    try std.testing.expectEqualStrings("OBSERVED_QQS", bad.?);
 }

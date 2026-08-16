@@ -68,7 +68,7 @@ pub fn main() !void {
         .gpa = gpa,
         .nap = &nap,
         .st = &scan_store,
-        .observed_qq = cfg.observed_qq,
+        .observed_qqs = cfg.observed_qqs,
         .admin_qqs = cfg.admin_qqs,
         .group_ids = cfg.group_ids,
     };
@@ -148,7 +148,7 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
         .gpa = gpa,
         .nap = &nap,
         .st = &imp_store,
-        .observed_qq = cfg.observed_qq,
+        .observed_qqs = cfg.observed_qqs,
         .admin_qqs = cfg.admin_qqs,
         .group_ids = cfg.group_ids,
     };
@@ -205,7 +205,7 @@ fn runRunCommand(gpa: std.mem.Allocator) !void {
         .gpa = gpa,
         .nap = &nap,
         .st = &run_store,
-        .observed_qq = cfg.observed_qq,
+        .observed_qqs = cfg.observed_qqs,
         .admin_qqs = cfg.admin_qqs,
         .group_ids = cfg.group_ids,
     };
