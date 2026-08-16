@@ -3,6 +3,10 @@ const onebot = @import("../onebot.zig");
 
 pub const star = "✨";
 pub const drop = "💦";
+/// 💤 = U+1F4A4。管理员在窗口内发一条**只有** 💤 的消息（不含 reply 段、
+/// 不含任何其它段、trim 之后正好是这一个 emoji）＝ 「这个群这一轮别收录
+/// 任何东西」。见 classify 里 sleepCommand 与 Outcome.skip_collection。
+pub const sleep = "💤";
 
 const ws = " \t\r\n";
 
@@ -35,6 +39,22 @@ pub const Candidate = struct {
     /// 持久化，非主键成员就永远等不到被跨窗口撤稿。见 store.zig 顶部
     /// key_chainmember_prefix 的注释。
     chain_members: ?[]i64,
+
+    /// 路径3专用：`✨ @某人 内容` 这条可选语法里被 at 的那个人的 QQ——
+    /// 这条语录的**作者**（`from_who` / `hikari:byuser:{user_id}` 该记的人），
+    /// 不是敲这条指令的管理员。`null` 表示没有用这条语法（`✨ 内容`），作者
+    /// 落回"发这条消息的人"，跟改动之前逐字一致。
+    ///
+    /// `creator` / `creator_uid` **不**跟着走这个字段：Hitokoto 语义下
+    /// creator 是"把这条语录加进来的人"，那永远是敲指令的管理员本人；作者
+    /// （from_who）才是"说这句话的人"。改动之前两者恰好是同一个人，所以
+    /// runner.zig 只算了一次；现在必须分开算，见 scanGroup 里
+    /// `author_uid` / `sender_uid` 那两行。
+    ///
+    /// 被 at 的人**不要求**在 `OBSERVED_QQS` 里：管理员是在显式断言"这句话
+    /// 是他说的"，要求目标必须被观察会让这条语法在配置了子集时彻底没法用
+    /// （生产上观察集合是空的，任何人都算被观察，这条限制本来也不起作用）。
+    author_uid: ?u64,
 };
 
 pub const Params = struct {
@@ -59,6 +79,19 @@ pub const Outcome = struct {
     candidates: []Candidate,
     unresolved: []i64,
 
+    /// 💤：窗口内有管理员发过一条"只有 💤"的消息，且这条消息**没有**被同一个
+    /// 窗口里的某条管理员 💦 引用作废掉 → 这个群这一轮一条都不收录。
+    ///
+    /// 刻意**不**在 rules.zig 里把 candidates 清空：运营方要求这一轮照样扫、
+    /// 照样发七行日志，并且把每一条候选都如实计进 `skipped`（`Added 0
+    /// messages, skipped N messages.`）——"这个群今天什么都没发"跟"这个服务
+    /// 死了"必须在群里长得不一样。候选列表因此原样返回，由 runner.zig 决定
+    /// 不写库、只计数。
+    ///
+    /// 这个标志**不影响** `revoked`：💤 的意思是"今天别加东西"，不是"忽略
+    /// 撤稿"。一条被 💤 吞掉的 💦 正是这个项目一直在消灭的那种静默失败。
+    skip_collection: bool,
+
     pub fn deinit(self: *Outcome, gpa: std.mem.Allocator) void {
         for (self.candidates) |c| {
             if (c.text_override) |t| gpa.free(t);
@@ -75,17 +108,170 @@ fn isAdmin(p: Params, qq: u64) bool {
     return false;
 }
 
-/// 路径3格式判定：发送者是管理员、不含 reply 段、渲染文本以 ✨ 开头、剥掉前缀后非空。
-/// 命中返回剥掉前缀并 trim 后的正文（新分配，调用方 free），否则 null。
-pub fn manualBody(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?[]u8 {
+/// 路径3的判定结果：正文 + （可选的）被 at 出来的作者。
+pub const Manual = struct {
+    /// 剥掉 `✨` 前缀（以及、若有的话，紧跟其后作为作者标记的那个 at 段）
+    /// 之后 trim 过的正文。新分配，调用方负责 free。
+    body: []u8,
+    /// `✨ @某人 内容` 里被 at 的那个人的 QQ；`✨ 内容` 时为 null。
+    author_uid: ?u64,
+};
+
+/// 按 `onebot.Message.renderText` 的同一套规则渲染一段 segment 序列
+/// （text 原样、at → `@昵称`（缺 name 退回 `@QQ号`）、其余段丢弃），**不** trim，
+/// 前面先拼上 `prefix`（承载 `✨` 的那个 text 段被剥掉前缀后剩下的尾巴）。
+///
+/// 单独抽出来是因为路径3现在必须在**段列表**上判定而不是渲染文本上：
+/// renderText 把 at 段烧成 `@昵称` 并把 QQ 号彻底丢掉，而 `✨ @某人 内容`
+/// 恰恰需要那个 QQ 号。判定完之后正文仍然要按同一套规则渲染，于是渲染这一
+/// 半在这里复用，两处不会漂移。
+fn renderSegments(gpa: std.mem.Allocator, segs: []const onebot.Segment, prefix: []const u8) ![]u8 {
+    var list: std.ArrayList(u8) = .empty;
+    errdefer list.deinit(gpa);
+    try list.appendSlice(gpa, prefix);
+    for (segs) |s| switch (s) {
+        .text => |t| try list.appendSlice(gpa, t),
+        .at => |a| {
+            try list.append(gpa, '@');
+            try list.appendSlice(gpa, a.name orelse a.qq);
+        },
+        else => {},
+    };
+    return list.toOwnedSlice(gpa);
+}
+
+/// 路径3格式判定：发送者是管理员、不含 reply 段、（按段序渲染出来的）文本以
+/// `✨` 开头、剥掉前缀后非空。命中返回正文与可选作者，否则 null。
+///
+/// **判定走段列表，不走渲染文本。** 两种语法：
+///
+/// ```
+/// ✨ @某人 内容   → 作者 = 被 at 的人，正文 = 内容
+/// ✨ 内容         → 作者 = 敲指令的管理员（改动之前的行为，逐字不变）
+/// ```
+///
+/// 为什么必须在段上判定：`renderText` 把 at 段渲染成 `@昵称` 就把
+/// `at.data.qq` 丢了，而"这句话是谁说的"只能从那个 QQ 号来——在渲染文本上
+/// 反解 `@昵称` 既不可靠（昵称可以带空格、可以跟正文粘在一起、可以重名）
+/// 也拿不到 QQ 号。
+///
+/// 走法（与 renderText 的口径逐条对齐，保证"改动前能命中的今天照样命中"）：
+///
+///   1. 找承载 `✨` 的那个 text 段：按段序往后走，`.other` 段丢弃（renderText
+///      也丢），左 trim 之后为空的 text 段跳过（它对渲染结果没有贡献）。第一
+///      个有内容的段若是 `.at`，渲染出来就是 `@…` 开头而不是 `✨` 开头 → 不
+///      是路径3；若是 text 但不以 `✨` 开头 → 同样不是。
+///   2. 只有当 `✨` 之后这个 text 段里**再没有别的内容**时，才去看下一个有内容
+///      的段是不是 `at`——`✨ 你好 @某人` 里的 at 前面已经有正文了，它是普通
+///      内容，照旧渲染成 `@昵称`。**只有紧跟 `✨` 的那个 at 才是作者标记。**
+///   3. 作者标记的 at 之后的全部段（含后面的 at）就是正文，按 renderSegments
+///      渲染 + trim；空 → null（`✨ @某人` 没有正文，跟 `✨` 光杆一样什么都
+///      不产生）。
+///   4. `at.data.qq` 解析不出 u64（`@全体成员` 的 `"all"` 就是这种）→ 不当作
+///      者标记，退回"没有 at"那一支，这个 at 照旧渲染进正文。
+pub fn manualParse(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?Manual {
     if (!isAdmin(p, m.user_id)) return null;
     if (m.replyTarget() != null) return null;
-    const rendered = try m.renderText(gpa);
+
+    // 1. 定位 ✨。
+    var i: usize = 0;
+    var rest_first: []const u8 = "";
+    var found = false;
+    while (i < m.segments.len) : (i += 1) {
+        switch (m.segments[i]) {
+            .text => |t| {
+                const lt = std.mem.trimLeft(u8, t, ws);
+                if (lt.len == 0) continue;
+                if (!std.mem.startsWith(u8, lt, star)) return null;
+                rest_first = lt[star.len..];
+                found = true;
+            },
+            .at => return null, // 渲染出来是 @… 开头，不是 ✨
+            else => continue, // .other（reply 段上面已经排除）
+        }
+        if (found) break;
+    }
+    if (!found) return null;
+    i += 1; // 跳过承载 ✨ 的那个 text 段本身
+
+    // 2/3/4. 紧跟 ✨ 的那个 at（如果有）就是作者标记。
+    var author_uid: ?u64 = null;
+    var body_start = i;
+    if (std.mem.trim(u8, rest_first, ws).len == 0) {
+        var j = i;
+        while (j < m.segments.len) : (j += 1) {
+            switch (m.segments[j]) {
+                .text => |t| {
+                    if (std.mem.trim(u8, t, ws).len == 0) continue;
+                    break; // 先撞上正文 → 没有作者标记
+                },
+                .at => |a| {
+                    const qq = std.fmt.parseInt(u64, std.mem.trim(u8, a.qq, ws), 10) catch break;
+                    author_uid = qq;
+                    body_start = j + 1;
+                    rest_first = "";
+                    break;
+                },
+                else => continue,
+            }
+        }
+    }
+
+    const rendered = try renderSegments(gpa, m.segments[body_start..], rest_first);
     defer gpa.free(rendered);
-    if (!std.mem.startsWith(u8, rendered, star)) return null;
-    const rest = std.mem.trim(u8, rendered[star.len..], ws);
-    if (rest.len == 0) return null;
-    return try gpa.dupe(u8, rest);
+    const body = std.mem.trim(u8, rendered, ws);
+    if (body.len == 0) return null;
+    return .{ .body = try gpa.dupe(u8, body), .author_uid = author_uid };
+}
+
+/// 只要正文、不要作者的调用点（🔥 链拼接、Pass A 判"这条消息是不是路径3格式"）
+/// 的薄包装。链的作者由 `buildChains` 的同一发送者约束定死，不看这个字段。
+pub fn manualBody(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?[]u8 {
+    const parsed = try manualParse(gpa, m, p) orelse return null;
+    return parsed.body;
+}
+
+/// 这条消息是不是一条"路径2的 ✨ 触发消息"——除 reply 段外只有一个文本段、
+/// 文本 trim 之后正好是 `✨`，且确实引用了某条消息。是的话返回它引用的
+/// `message_id`。
+///
+/// 用途有两个，都只关心**形状**、不关心是谁发的：
+///
+///   - Pass A 的 💦 一跳（4.3 节）：管理员看得见的是群里那条 `✨`，让他 💦 那
+///     一条比让他翻回去找原文自然得多。这里把目标换成"那条 ✨ 引用的消息"，
+///     然后所有既有的目标判定（含 🔥 链展开）原样再跑一遍。
+///   - `scan/runner.zig` 步骤 3：为这一跳预解析目标。💦 引用的那条 ✨ 很可能
+///     是几天前的（语录是在收录它的那次扫描**之后**才出现在 `GET /` 里的），
+///     落在窗口外、只能靠 get_msg 回补，它自己的 reply 目标不会被窗口内那轮
+///     解析捎带上，必须显式再补一次。
+pub fn starTriggerTarget(m: onebot.Message) ?i64 {
+    const rid = m.replyTarget() orelse return null;
+    const txt = m.soleTextBesidesReply() orelse return null;
+    if (!std.mem.eql(u8, std.mem.trim(u8, txt, ws), star)) return null;
+    return rid;
+}
+
+/// 💤：这条消息是不是"这个群这一轮别收录任何东西"的指令。
+///
+/// **"只有 💤" 的精确定义**（三条同时成立）：
+///
+///   1. 发送者 ∈ `ADMIN_QQS`。
+///   2. **不含 reply 段**。💤 是一条群级指令，没有作用对象；带 reply 段的
+///      消息在这套语法里一律是"针对被引用那条"的意思（路径2 的 `✨`、
+///      Pass A 的 `💦`），让 💤 也能带 reply 就是让两套语法打架，跟路径3
+///      "含 reply 段的一律走路径2判定"是同一条既有原则。
+///   3. 除此之外**恰好只有一个 text 段**（`soleTextBesidesReply`：夹带
+///      image/face/at/多个 text 段一律不算），且它 trim（空格/制表/CR/LF）
+///      之后逐字节等于 `💤`。
+///
+/// 注意"trim 之后等于"用的是字节比较，不是"包含 💤"：`💤💤`、`睡了💤`、
+/// `💤 明天见` 都**不**是这条指令——一条能让整个群这一轮静默的开关，触发
+/// 条件必须窄到不可能被闲聊误触。
+fn sleepCommand(m: onebot.Message, p: Params) bool {
+    if (!isAdmin(p, m.user_id)) return false;
+    if (m.replyTarget() != null) return false;
+    const txt = m.soleTextBesidesReply() orelse return false;
+    return std.mem.eql(u8, std.mem.trim(u8, txt, ws), sleep);
 }
 
 fn lookup(pool: []const onebot.Message, id: i64) ?onebot.Message {
@@ -299,16 +485,51 @@ pub fn classify(
         cands.deinit(gpa);
     }
 
-    // Pass A：收集作废指令
+    // 💤 与"哪些消息被 💦 引用过"这两份名单在 Pass A 里同时攒起来，循环结束
+    // 后才算 skip_collection——一条 💤 可能先于、也可能晚于撤掉它的那条 💦
+    // 出现在窗口里，边走边判会依赖出现顺序。
+    var sleep_ids: std.ArrayList(i64) = .empty;
+    defer sleep_ids.deinit(gpa);
+    var drop_targets: std.ArrayList(i64) = .empty;
+    defer drop_targets.deinit(gpa);
+
+    // Pass A：收集作废指令（顺带收集 💤 指令）
     for (window) |m| {
         if (!isAdmin(p, m.user_id)) continue;
-        const rid = m.replyTarget() orelse continue;
+        if (sleepCommand(m, p)) {
+            if (!contains(sleep_ids.items, m.message_id)) try sleep_ids.append(gpa, m.message_id);
+            continue;
+        }
+        const rid0 = m.replyTarget() orelse continue;
         const txt = m.soleTextBesidesReply() orelse continue;
         if (!std.mem.eql(u8, std.mem.trim(u8, txt, ws), drop)) continue;
-        const target = lookup(pool, rid) orelse {
+        // 💦 **直接**引用的那个 id（一跳之前）——"💦 引用 💤 那条消息就取消
+        // 这一轮的跳过"看的是这个，不是一跳之后的目标，也不是 revoked：
+        // 💤 那条消息的发送者是管理员，`OBSERVED_QQS` 配了子集且管理员不在
+        // 里面时它压根不是一个"可作废的目标"（4.3 节），永远不会进 revoked，
+        // 拿 revoked 判就会让取消功能在那种配置下静默失效。
+        if (!contains(drop_targets.items, rid0)) try drop_targets.append(gpa, rid0);
+        var rid = rid0;
+        var target = lookup(pool, rid) orelse {
             if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
             continue;
         };
+        // 一跳（4.3 节）：💦 的目标本身就是一条路径2的 `✨` 触发消息时，真正
+        // 要撤的是**那条 ✨ 引用的消息**——那才是被收录进库的语录。管理员在群里
+        // 看得见的是那条 ✨，让他去 💦 它是最自然的动作；改动之前这个动作什么
+        // 都不会发生，而且没有任何反馈。
+        //
+        // 只跳这一次，跳完之后所有既有的目标判定（发送者是不是被观察者 /
+        // 是不是路径3格式 / 🔥 链展开）原样再跑一遍，没有任何新语义。跳到的
+        // 东西要是解析不出来（窗口外 + get_msg 也回补不到），跟改动之前一样
+        // 什么都不发生，只是多记一条 unresolved 警告。
+        if (starTriggerTarget(target)) |hop| {
+            rid = hop;
+            target = lookup(pool, rid) orelse {
+                if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
+                continue;
+            };
+        }
         var ok = p.isObserved(target.user_id);
         if (!ok) {
             if (try manualBody(gpa, target, p)) |body| {
@@ -329,6 +550,19 @@ pub fn classify(
             }
         } else if (!contains(revoked.items, rid)) {
             try revoked.append(gpa, rid);
+        }
+    }
+
+    // 💤：窗口里存在一条**没有被 💦 引用**的 💤 指令 → 这一轮不收录。
+    // 被 💦 引用的那条 💤 视为管理员当场收回了这条指令（"取消跳过"），此时
+    // 这个群照常收录；两条 💤 里只撤掉一条，剩下那条仍然生效——跳过是"任意
+    // 一条 💤 说了算"，撤销必须逐条撤干净，方向上偏保守的那一边跟撤稿
+    // "宁可多 tombstone 也不能少"是同一个取向。
+    var skip_collection = false;
+    for (sleep_ids.items) |sid| {
+        if (!contains(drop_targets.items, sid)) {
+            skip_collection = true;
+            break;
         }
     }
 
@@ -353,6 +587,7 @@ pub fn classify(
                 .path = .fire_chain,
                 .text_override = t,
                 .chain_members = members_dup,
+                .author_uid = null,
             });
             c.text = null; // 所有权转移给 cands 了；防止函数末尾 chains 的 defer 重复释放
         }
@@ -375,13 +610,16 @@ pub fn classify(
 
         // 路径3 优先于路径1（但链成员整体让路给路径4，见上）
         if (!is_chain_member) {
-            if (try manualBody(gpa, m, p)) |body| {
-                errdefer gpa.free(body);
+            if (try manualParse(gpa, m, p)) |manual| {
+                errdefer gpa.free(manual.body);
                 try appendCandidate(gpa, &cands, .{
                     .message_id = m.message_id,
                     .path = .admin_manual,
-                    .text_override = body,
+                    .text_override = manual.body,
                     .chain_members = null,
+                    // `✨ @某人 内容` 时是被 at 的那个人；`✨ 内容` 时是 null，
+                    // runner.zig 落回"发这条消息的人"（也就是这位管理员）。
+                    .author_uid = manual.author_uid,
                 });
                 continue;
             }
@@ -396,6 +634,7 @@ pub fn classify(
                 .path = .emoji_reaction,
                 .text_override = null,
                 .chain_members = null,
+                .author_uid = null,
             });
             continue;
         }
@@ -429,6 +668,7 @@ pub fn classify(
             .path = .quoted_star,
             .text_override = null,
             .chain_members = null,
+            .author_uid = null,
         });
     }
 
@@ -487,6 +727,7 @@ pub fn classify(
         .revoked = revoked_owned,
         .candidates = candidates_owned,
         .unresolved = unresolved_owned,
+        .skip_collection = skip_collection,
     };
 }
 
@@ -1419,4 +1660,477 @@ fn classifyEveryoneChainUnderFailingAllocator(gpa: std.mem.Allocator) !void {
 
 test "OOM 回归：同一发送者约束下的多条链构建，任意分配点失败都不泄漏也不重复释放" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, classifyEveryoneChainUnderFailingAllocator, .{});
+}
+
+// ---------------------------------------------------------------------------
+// 路径3 的 `✨ @某人 内容` 语法（design.md §4.5 路径3）：作者是被 at 的人，
+// 添加者（creator）仍然是敲指令的管理员。判定必须走**段列表**——renderText
+// 把 at 段烧成 `@昵称` 就把 QQ 号丢了，而作者恰恰只能从那个 QQ 号来。
+
+const NAMED: u64 = 50001;
+
+/// `[text(prefix), at{qq,name}, text(suffix)]` 三段式，模拟 NapCat 对
+/// `✨ @某人 内容` 的真实分段。
+fn atMsg(
+    comptime id: i64,
+    comptime uid: u64,
+    comptime prefix: []const u8,
+    comptime qq: []const u8,
+    comptime name: ?[]const u8,
+    comptime suffix: []const u8,
+) onebot.Message {
+    return .{
+        .message_id = id,
+        .user_id = uid,
+        .time = 0,
+        .segments = &.{
+            .{ .text = prefix },
+            .{ .at = .{ .qq = qq, .name = name } },
+            .{ .text = suffix },
+        },
+    };
+}
+
+test "路径3 · at 语法：✨ @某人 内容 → 作者是被 at 的人，正文不含 ✨ 也不含那个 at" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{atMsg(1, ADMIN, "✨ ", "50001", "小明", " 这句是他说的")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.admin_manual, out.candidates[0].path);
+    try std.testing.expectEqualStrings("这句是他说的", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+    // 主键仍然是管理员那条指令消息本身，不是被 at 的人的任何一条消息。
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+}
+
+test "路径3 · at 语法：✨ 与 at 之间没有空格也认（分段是 [✨, at, 内容]）" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{atMsg(1, ADMIN, "✨", "50001", "小明", "内容")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqualStrings("内容", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：✨ 内容（没有 at）行为逐字不变，author_uid 为 null" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{textMsg(1, ADMIN, "✨ 好一句话")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqualStrings("好一句话", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, null), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：只有紧跟 ✨ 的 at 是作者标记，后面的 at 是普通正文（渲染成 @昵称）" {
+    const gpa = std.testing.allocator;
+    // `✨ 你好 @小明` —— at 前面已经有正文了，它不是作者标记。
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .text = "✨ 你好 " },
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+        },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqualStrings("你好 @小明", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, null), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：作者标记之后的 at 仍然渲染成 @昵称，只有第一个被吃掉" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .text = "✨ " },
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+            .{ .text = " 谢谢 " },
+            .{ .at = .{ .qq = "60001", .name = "小红" } },
+        },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqualStrings("谢谢 @小红", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：✨ @某人 后面没有正文 → 剥完为空，什么都不产生" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .text = "✨ " },
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+            .{ .text = "   " },
+        },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "路径3 · at 语法：被 at 的人不在 OBSERVED_QQS 里也照样收录（管理员在显式断言作者）" {
+    const gpa = std.testing.allocator;
+    // 观察集合里只有 OBSERVED / OUTSIDER，被 at 的 NAMED 不在里面。
+    const msgs = [_]onebot.Message{atMsg(1, ADMIN, "✨ ", "50001", "小明", " 集合外的人说的")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, subset);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：@全体成员（qq 不是数字）不是作者标记，原样渲染进正文" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{atMsg(1, ADMIN, "✨ ", "all", "全体成员", " 大家好")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqualStrings("@全体成员 大家好", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, null), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：at 缺 name 时正文里退化成 @QQ号，作者标记本身仍按 qq 解析" {
+    const gpa = std.testing.allocator;
+    // 第一个 at 是作者标记（被吃掉），第二个 at 缺 name → 渲染成 @60001。
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .text = "✨" },
+            .{ .at = .{ .qq = "50001", .name = null } },
+            .{ .text = "对 " },
+            .{ .at = .{ .qq = "60001", .name = null } },
+            .{ .text = " 说的" },
+        },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqualStrings("对 @60001 说的", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+}
+
+test "路径3 · at 语法：消息以 at 开头（渲染出来是 @ 而不是 ✨）→ 不是路径3" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+            .{ .text = " ✨ 内容" },
+        },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "路径3 · at 语法：前导的 image 段与空白 text 段不影响判定（跟 renderText 口径一致）" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .other,
+            .{ .text = "" },
+            .{ .text = "  " },
+            .{ .text = "✨ " },
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+            .{ .text = " 内容" },
+        },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqualStrings("内容", out.candidates[0].text_override.?);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+}
+
+test "manualParse 单独可用：返回正文与作者" {
+    const gpa = std.testing.allocator;
+    const m = atMsg(1, ADMIN, "✨ ", "50001", "小明", " 内容");
+    const parsed = (try manualParse(gpa, m, params())).?;
+    defer gpa.free(parsed.body);
+    try std.testing.expectEqualStrings("内容", parsed.body);
+    try std.testing.expectEqual(@as(?u64, NAMED), parsed.author_uid);
+}
+
+fn manualAtUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    // `✨ @某人 内容`（多分配：renderSegments 的 ArrayList 扩容 + 最终 dupe）
+    // 与一条普通 `✨ 内容` 混在一起 → 让「剔除已作废候选 / kept.append /
+    // toOwnedSlice」这几段在两个 text_override 都在场的情况下逐个分配点失败。
+    const msgs = [_]onebot.Message{
+        atMsg(1, ADMIN, "✨ ", "50001", "小明", " 被 at 的人说的这一句要足够长一点"),
+        textMsg(2, ADMIN, "✨ 管理员自己补录的另一句"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：✨ @某人 内容 的多次分配（renderSegments + dupe + 候选转移）任意一处失败都不泄漏" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, manualAtUnderFailingAllocator, .{});
+}
+
+// ---------------------------------------------------------------------------
+// 💦 的一跳（design.md §4.3）：💦 引用的是那条路径2的 `✨` 触发消息时，撤稿
+// 目标解析成**那条 ✨ 引用的消息**，然后所有既有规则原样再跑一遍。
+
+test "💦 一跳：引用路径2的 ✨ 触发消息 → 作废那条 ✨ 引用的原消息" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"), // 原消息，路径2收录的就是它
+        replyMsg(2, OUTSIDER, 1, "✨"), // 路径2触发消息
+        replyMsg(3, ADMIN, 2, "💦"), // 管理员 💦 的是那条 ✨，不是原消息
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.revoked.len);
+    try std.testing.expectEqual(@as(i64, 1), out.revoked[0]);
+    // 同一个窗口里的路径2候选也因此被剔除（作废优先于收录）。
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "💦 一跳：跳到的消息是 🔥 链的内容成员 → 整条链全部成员都进 revoked" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "上半句"),
+        textMsg(2, OBSERVED, "下半句"),
+        replyMsg(3, OUTSIDER, 2, "✨"), // 对链上第二个成员回 ✨
+        replyMsg(4, ADMIN, 3, "💦"), // 💦 那条 ✨ → 一跳到 2 → 展开成整条链
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 2), out.revoked.len);
+    try std.testing.expect(contains(out.revoked, 1));
+    try std.testing.expect(contains(out.revoked, 2));
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "💦 一跳：只跳一次——被跳到的还是一条 ✨ 触发消息时不继续往下跳" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        replyMsg(2, OUTSIDER, 1, "✨"),
+        replyMsg(3, OUTSIDER, 2, "✨"), // 又一条 ✨，引用的是上一条 ✨
+        replyMsg(4, ADMIN, 3, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    // 一跳落在 id=2 那条 ✨ 触发消息上：它的发送者 OUTSIDER 不是被观察者、
+    // 也不是路径3格式 → 不是可作废的目标 → 什么都不发生。
+    try std.testing.expectEqual(@as(usize, 0), out.revoked.len);
+}
+
+test "💦 一跳：跳到的目标不在 pool 里 → 记 unresolved，什么都不作废" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        replyMsg(2, OUTSIDER, 999, "✨"), // 它引用的 999 不在窗口也不在 pool
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), out.revoked.len);
+    try std.testing.expectEqual(@as(usize, 1), out.unresolved.len);
+    try std.testing.expectEqual(@as(i64, 999), out.unresolved[0]);
+}
+
+test "💦 一跳只在目标确实是 ✨ 触发消息时发生：目标是普通引用消息 → 行为逐字不变" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        replyMsg(2, OBSERVED, 1, "我也这么想"), // 普通回复，不是 ✨ 触发
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    // 没有一跳：作废的是 id=2 自己（它的发送者是被观察者，本来就是合法目标）。
+    try std.testing.expectEqual(@as(usize, 1), out.revoked.len);
+    try std.testing.expectEqual(@as(i64, 2), out.revoked[0]);
+}
+
+fn dropHopUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "上半句"),
+        textMsg(2, OBSERVED, "下半句"),
+        replyMsg(3, OUTSIDER, 2, "✨"),
+        replyMsg(4, ADMIN, 3, "💦"),
+        textMsg(5, ADMIN, "✨ 同一轮里还有一条存活的手动收录"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：💦 一跳 + 链展开 + 存活候选混在一起时任意分配点失败都不泄漏也不重复释放" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, dropHopUnderFailingAllocator, .{});
+}
+
+// ---------------------------------------------------------------------------
+// 💤（design.md §4.5.2）：管理员发一条只有 💤 的消息 → 这个群这一轮不收录。
+
+test "💤：管理员发一条只有 💤 的消息 → skip_collection 为真，候选照常算出来" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        textMsg(2, ADMIN, "💤"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expect(out.skip_collection);
+    // 候选列表**不**被清空：runner.zig 要靠它的长度如实报 skipped。
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+}
+
+test "💤：前后带空白仍然算数" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{textMsg(1, ADMIN, "  💤 \n")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expect(out.skip_collection);
+}
+
+test "💤：非管理员发的不算" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{textMsg(1, OUTSIDER, "💤")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expect(!out.skip_collection);
+}
+
+test "💤：夹带别的字一律不算——开关不能被闲聊误触" {
+    const gpa = std.testing.allocator;
+    inline for ([_][]const u8{ "💤💤", "睡了💤", "💤 明天见" }) |txt| {
+        const msgs = [_]onebot.Message{textMsg(1, ADMIN, txt)};
+        var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+        defer out.deinit(gpa);
+        try std.testing.expect(!out.skip_collection);
+    }
+}
+
+test "💤：夹带图片段（不是唯一的 text 段）不算" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{.{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{ .{ .text = "💤" }, .other },
+    }};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expect(!out.skip_collection);
+}
+
+test "💤：带 reply 段的 💤 不算——💤 是群级指令，带引用的语法归 ✨/💦" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        replyMsg(2, ADMIN, 1, "💤"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expect(!out.skip_collection);
+}
+
+test "💤 不影响撤稿：同一窗口里的 💦 照常进 revoked" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        replyMsg(2, ADMIN, 1, "💦"),
+        textMsg(3, ADMIN, "💤"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expect(out.skip_collection);
+    try std.testing.expectEqual(@as(usize, 1), out.revoked.len);
+    try std.testing.expectEqual(@as(i64, 1), out.revoked[0]);
+}
+
+test "💤：管理员 💦 引用这条 💤 → 取消跳过，这一轮照常收录" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        textMsg(2, ADMIN, "💤"),
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expect(!out.skip_collection);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+}
+
+test "💤：撤销走的是「💦 直接引用了这个 id」而不是 revoked——管理员不被观察时同样生效" {
+    const gpa = std.testing.allocator;
+    // subset 的观察集合是 {OBSERVED, OUTSIDER}，ADMIN 不在里面：这条 💤 消息
+    // 按 4.3 节根本不是"可作废的目标"，永远进不了 revoked。取消跳过若拿
+    // revoked 判就会在这种配置下静默失效。
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        textMsg(2, ADMIN, "💤"),
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, subset);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), out.revoked.len);
+    try std.testing.expect(!out.skip_collection);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+}
+
+test "💤：两条 💤 只撤掉一条 → 剩下那条仍然让这一轮跳过" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, ADMIN, "💤"),
+        textMsg(2, ADMIN, "💤"),
+        replyMsg(3, ADMIN, 1, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expect(out.skip_collection);
+}
+
+fn sleepUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        textMsg(2, ADMIN, "💤"),
+        textMsg(3, ADMIN, "💤"),
+        replyMsg(4, ADMIN, 3, "💦"),
+        textMsg(5, ADMIN, "✨ 一条存活的手动收录"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：💤/💦 两份名单（sleep_ids / drop_targets）扩容在任意分配点失败都不泄漏" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, sleepUnderFailingAllocator, .{});
 }
