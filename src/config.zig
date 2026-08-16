@@ -148,7 +148,7 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
     const port_raw = try need(env, "HTTP_PORT", bad);
     const redis_raw = try need(env, "REDIS_URL", bad);
 
-    const observed = parseObservedQqs(gpa, observed_raw) catch |e| {
+    const observed = parseObservedQqs(gpa, observed_raw) catch {
         bad.* = "OBSERVED_QQ";
         return error.InvalidValue;
     };

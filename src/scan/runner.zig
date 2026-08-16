@@ -2,7 +2,6 @@ const std = @import("std");
 const napcat = @import("../napcat.zig");
 const onebot = @import("../onebot.zig");
 const rules = @import("rules.zig");
-const config = @import("../config.zig");
 
 const store = @import("../store.zig");
 const uuid = @import("../uuid.zig");
@@ -168,8 +167,8 @@ pub const Deps = struct {
     nap: *napcat.Client,
     st: *store.Store,
     observed_qq: u64,
-    observed_qqs: []const u64 = config.global_observed_qqs,
-    observe_all: bool = config.global_observe_all,
+    observed_qqs: []const u64 = &.{},
+    observe_all: bool = false,
     admin_qqs: []const u64,
     group_ids: []const u64,
     /// getMsg 单次重试前的等待时长。生产上 24/2300 探针在负载压力下失败，紧接着
