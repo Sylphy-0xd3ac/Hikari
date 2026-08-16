@@ -4,6 +4,12 @@ pub const Error = error{ MissingEnv, InvalidValue, OutOfMemory };
 
 pub const Env = std.StringHashMap([]const u8);
 
+/// 由 loadFrom 在解析 OBSERVED_QQ 后设置，供 Deps 默认字段读取，避免 main 为
+/// 每个构造点都手传一份。进程生命周期内只读，Config 持有同一份切片的所有权。
+pub var global_observed_qqs: []const u64 = &.{};
+pub var global_observe_all: bool = false;
+
+
 pub const ScanTime = struct { hour: u8, minute: u8 };
 
 pub const RedisTarget = struct {
@@ -23,6 +29,8 @@ pub const Config = struct {
     napcat_url: []u8,
     napcat_token: []u8,
     observed_qq: u64,
+    observed_qqs: []u64,
+    observe_all: bool,
     group_ids: []u64,
     admin_qqs: []u64,
     scan_hour: u8,
@@ -38,6 +46,8 @@ pub const Config = struct {
         self.gpa.free(self.napcat_url);
         self.gpa.free(self.napcat_token);
         self.gpa.free(self.group_ids);
+        self.gpa.free(self.observed_qqs);
+
         self.gpa.free(self.admin_qqs);
         self.gpa.free(self.http_host);
         self.gpa.free(self.redis_host);
@@ -58,8 +68,23 @@ fn parseUintList(gpa: std.mem.Allocator, raw: []const u8) Error![]u64 {
         try out.append(gpa, n);
     }
     if (out.items.len == 0) return error.InvalidValue;
+
+
+
+
+
+
     return out.toOwnedSlice(gpa);
 }
+
+/// OBSERVED_QQ 支持逗号分隔的多个 QQ；留空/缺失表示“检测所有人”。
+/// 返回的切片总是由 gpa 分配（空列表也是），调用方需要 gpa.free。
+fn parseObservedQqs(gpa: std.mem.Allocator, raw: []const u8) Error![]u64 {
+    const t = std.mem.trim(u8, raw, ws);
+    if (t.len == 0) return gpa.alloc(u64, 0);
+    return parseUintList(gpa, t);
+}
+
 
 fn parseScanTime(raw: []const u8) Error!ScanTime {
     if (raw.len != 5 or raw[2] != ':') return error.InvalidValue;
@@ -115,7 +140,7 @@ fn need(env: Env, key: []const u8, bad: *?[]const u8) Error![]const u8 {
 pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Config {
     const napcat_url_raw = try need(env, "NAPCAT_HTTP_URL", bad);
     const napcat_token_raw = try need(env, "NAPCAT_TOKEN", bad);
-    const observed_raw = try need(env, "OBSERVED_QQ", bad);
+    const observed_raw = env.get("OBSERVED_QQ") orelse "";
     const groups_raw = try need(env, "QQ_GROUP_IDS", bad);
     const admins_raw = try need(env, "ADMIN_QQS", bad);
     const scan_raw = try need(env, "SCAN_TIME", bad);
@@ -123,10 +148,12 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
     const port_raw = try need(env, "HTTP_PORT", bad);
     const redis_raw = try need(env, "REDIS_URL", bad);
 
-    const observed = std.fmt.parseInt(u64, observed_raw, 10) catch {
+    const observed = parseObservedQqs(gpa, observed_raw) catch |e| {
         bad.* = "OBSERVED_QQ";
         return error.InvalidValue;
     };
+    errdefer gpa.free(observed);
+
     const groups = parseUintList(gpa, groups_raw) catch |e| {
         bad.* = "QQ_GROUP_IDS";
         return if (e == error.OutOfMemory) e else error.InvalidValue;
@@ -157,11 +184,15 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
     errdefer gpa.free(napcat_token);
     const http_host = try gpa.dupe(u8, host_raw);
 
+
+
     return .{
         .gpa = gpa,
         .napcat_url = napcat_url,
         .napcat_token = napcat_token,
-        .observed_qq = observed,
+        .observed_qq = if (observed.len > 0) observed[0] else 0,
+        .observed_qqs = observed,
+        .observe_all = observed.len == 0,
         .group_ids = groups,
         .admin_qqs = admins,
         .scan_hour = scan.hour,
@@ -194,7 +225,10 @@ pub fn load(gpa: std.mem.Allocator, bad: *?[]const u8) Error!Config {
         };
         try env.put(k, v);
     }
-    return loadFrom(gpa, env, bad);
+    const cfg = try loadFrom(gpa, env, bad);
+    global_observed_qqs = cfg.observed_qqs;
+    global_observe_all = cfg.observe_all;
+    return cfg;
 }
 
 test "parseUintList 解析逗号分隔的 QQ 号" {
@@ -273,6 +307,7 @@ test "loadFrom 读全所有字段" {
 
     try std.testing.expectEqualStrings("http://127.0.0.1:3000", cfg.napcat_url);
     try std.testing.expectEqual(@as(u64, 10001), cfg.observed_qq);
+    try std.testing.expectEqualSlices(u64, &.{10001}, cfg.observed_qqs);
     try std.testing.expectEqualSlices(u64, &.{ 111, 222 }, cfg.group_ids);
     try std.testing.expectEqualSlices(u64, &.{20001}, cfg.admin_qqs);
     try std.testing.expectEqual(@as(u8, 3), cfg.scan_hour);

@@ -39,7 +39,7 @@ NapCat 扩展）。
 |---|---|---|---|
 | `NAPCAT_HTTP_URL` | 是 | NapCat HTTP 接口 base URL | `http://127.0.0.1:3000` |
 | `NAPCAT_TOKEN` | 是 | NapCat access token，以 `Authorization: Bearer <token>` 发送 | |
-| `OBSERVED_QQ` | 是 | 被观察的 QQ 号 | `10001` |
+| `OBSERVED_QQ` | 否（留空=全部） | 被观察的 QQ 号，多个用逗号分隔 | `10001,10002` |
 | `QQ_GROUP_IDS` | 是 | 逗号分隔的目标群号，扫描与日志都作用于这些群 | `123456,789012` |
 | `ADMIN_QQS` | 是 | 逗号分隔的管理员 QQ 号 | `20001,20002` |
 | `SCAN_TIME` | 是 | 每日扫描时刻，24 小时制 `HH:MM`，本地时区 | `03:00` |

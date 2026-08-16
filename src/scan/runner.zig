@@ -2,6 +2,8 @@ const std = @import("std");
 const napcat = @import("../napcat.zig");
 const onebot = @import("../onebot.zig");
 const rules = @import("rules.zig");
+const config = @import("../config.zig");
+
 const store = @import("../store.zig");
 const uuid = @import("../uuid.zig");
 const scheduler = @import("../scheduler.zig");
@@ -166,6 +168,8 @@ pub const Deps = struct {
     nap: *napcat.Client,
     st: *store.Store,
     observed_qq: u64,
+    observed_qqs: []const u64 = config.global_observed_qqs,
+    observe_all: bool = config.global_observe_all,
     admin_qqs: []const u64,
     group_ids: []const u64,
     /// getMsg 单次重试前的等待时长。生产上 24/2300 探针在负载压力下失败，紧接着
@@ -184,6 +188,24 @@ pub const Deps = struct {
     /// "測出来" 的、跑多慢都不一样的噪声，而是测试自己钦定的确定值。
     clock: *const fn () i64 = std.time.timestamp,
 };
+
+fn isObserved(deps: Deps, qq: u64) bool {
+    // OBSERVED_QQ 留空 = 检测所有人
+    if (deps.observe_all) return true;
+    if (qq == deps.observed_qq) return true;
+    for (deps.observed_qqs) |o| if (o == qq) return true;
+    return false;
+}
+
+fn observedFallbackLabel(deps: Deps) []const u8 {
+    return if (deps.observe_all) "all" else "OBSERVED_QQ";
+}
+
+fn observedFallback(deps: Deps) u64 {
+    return deps.observed_qq;
+}
+
+
 
 /// 一个群这一轮里 getMsg 重试的效果统计：命中过重试的调用次数，以及重试真的把
 /// 结果救回来的次数（第二次成功）。只在 scanGroup 这一次调用的作用域内存在、
@@ -278,26 +300,28 @@ fn fetchBotQq(deps: Deps) u64 {
     const a = ar.allocator();
 
     const data = deps.nap.callData(a, "get_login_info", "{}") catch |e| {
-        std.log.warn("get_login_info failed ({s}); forward messages will use OBSERVED_QQ={d} as the node avatar", .{ @errorName(e), deps.observed_qq });
+        std.log.warn("get_login_info failed ({s}); forward messages will use OBSERVED_QQ={s} as the node avatar", .{ @errorName(e), observedFallbackLabel(deps) });
+
+
         return deps.observed_qq;
     };
     const obj = switch (data) {
         .object => |o| o,
         else => {
-            std.log.warn("get_login_info returned a non-object; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
+            std.log.warn("get_login_info returned a non-object; forward messages will use OBSERVED_QQ={s} as the node avatar", .{observedFallbackLabel(deps)});
             return deps.observed_qq;
         },
     };
     const v = obj.get("user_id") orelse {
-        std.log.warn("get_login_info reply has no user_id field; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
+        std.log.warn("get_login_info reply has no user_id field; forward messages will use OBSERVED_QQ={s} as the node avatar", .{observedFallbackLabel(deps)});
         return deps.observed_qq;
     };
     const n = onebot.asInt(v) orelse {
-        std.log.warn("get_login_info user_id is not a number; forward messages will use OBSERVED_QQ={d} as the node avatar", .{deps.observed_qq});
+        std.log.warn("get_login_info user_id is not a number; forward messages will use OBSERVED_QQ={s} as the node avatar", .{observedFallbackLabel(deps)});
         return deps.observed_qq;
     };
     if (n < 0) {
-        std.log.warn("get_login_info user_id is negative ({d}); forward messages will use OBSERVED_QQ={d} as the node avatar", .{ n, deps.observed_qq });
+        std.log.warn("get_login_info user_id is negative ({d}); forward messages will use OBSERVED_QQ={s} as the node avatar", .{ n, observedFallbackLabel(deps) });
         return deps.observed_qq;
     }
     return @intCast(n);
@@ -341,11 +365,11 @@ pub fn groupName(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u
 /// 取被观察者在这个群里的名片（群名片优先，其次昵称）。null / 空串的区分同
 /// groupName：两个字段都缺是"没问出来"，两个字段都在但都是空是"这人确实
 /// 没设名片也没有昵称"。
-pub fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64) ?[]const u8 {
+pub fn observedCard(deps: Deps, arena: std.mem.Allocator, group_id: u64, user_id: u64) ?[]const u8 {
     var aw: std.Io.Writer.Allocating = .init(arena);
     std.json.Stringify.value(.{
         .group_id = group_id,
-        .user_id = deps.observed_qq,
+        .user_id = user_id,
         .no_cache = true,
     }, .{}, &aw.writer) catch |e| {
         std.log.warn("group {d}: building get_group_member_info request failed: {s}", .{ group_id, @errorName(e) });
@@ -746,7 +770,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // ---- 4. 逐条查被观察者消息的表情回应 ----
     var star_ids: std.ArrayList(i64) = .empty;
     for (window.items) |m| {
-        if (m.user_id != deps.observed_qq) continue;
+        if (!isObserved(deps, m.user_id)) continue;
         const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: star-reaction probe for message {d} failed", .{ gid, m.message_id });
             continue;
@@ -780,6 +804,8 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // ---- 5. 判定 ----
     var outcome = try rules.classify(deps.gpa, window.items, pool.items, star_ids.items, .{
         .observed_qq = deps.observed_qq,
+        .observed_qqs = deps.observed_qqs,
+        .observe_all = deps.observe_all,
         .admin_qqs = deps.admin_qqs,
     });
     defer outcome.deinit(deps.gpa);
@@ -807,7 +833,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
 
     // ---- 7. 过滤并入库 ----
     const from = groupName(deps, a, gid);
-    const from_who = observedCard(deps, a, gid);
+
     // 归属信息没问出来就一条都不写：buildQuote 把 from/from_who 原样烧进每一条
     // 语录，而设计里没有任何事后编辑的路径——一次 get_group_info 抖动会让这一批
     // 语录永远带着空的 from/from_who 对外服务。宁可整批不写、这个群算失败、
@@ -816,12 +842,12 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // 下一次正常触发，窗口都会从那个旧起点重新覆盖到这一批候选（受 7 天回看
     // 上限约束），不需要靠"固定 run_at - 24h"时代那种只有重启补跑才补得上
     // 的特殊路径。候选仍在窗口里，isTombstoned/exists 保证重扫是幂等的。
-    const attributed = from != null and from_who != null;
+
 
     var added: usize = 0;
     var skipped: usize = 0;
 
-    if (attributed) {
+    if (from != null) {
         for (outcome.candidates) |cand| {
             if (try deps.st.isTombstoned(cand.message_id)) {
                 skipped += 1;
@@ -840,6 +866,16 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 }
             }
 
+            const card_user_id: u64 = if (target) |t| blk: {
+                if (deps.observe_all or isObserved(deps, t.user_id)) break :blk t.user_id;
+                break :blk deps.observed_qq;
+            } else deps.observed_qq;
+            const from_who = observedCard(deps, a, gid, card_user_id) orelse {
+                skipped += 1;
+                continue;
+            };
+
+
             const text: []const u8 = if (cand.text_override) |t| t else blk: {
                 const tm = target orelse {
                     skipped += 1;
@@ -857,7 +893,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 .id = id,
                 .text = text,
                 .from = from.?,
-                .from_who = from_who.?,
+                .from_who = from_who,
                 .created_at = if (target) |t| t.time else win_end,
                 .message_id = cand.message_id,
                 .group_id = gid,

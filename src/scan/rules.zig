@@ -17,6 +17,8 @@ pub const Candidate = struct {
 
 pub const Params = struct {
     observed_qq: u64,
+    observed_qqs: []const u64 = &.{},
+    observe_all: bool = false,
     admin_qqs: []const u64,
 };
 
@@ -37,6 +39,15 @@ fn isAdmin(p: Params, qq: u64) bool {
     for (p.admin_qqs) |a| if (a == qq) return true;
     return false;
 }
+
+fn isObserved(p: Params, qq: u64) bool {
+    // OBSERVED_QQ 留空 = 检测所有人
+    if (p.observe_all) return true;
+    if (qq == p.observed_qq) return true;
+    for (p.observed_qqs) |o| if (o == qq) return true;
+    return false;
+}
+
 
 /// 路径3格式判定：发送者是管理员、不含 reply 段、渲染文本以 ✨ 开头、剥掉前缀后非空。
 /// 命中返回剥掉前缀并 trim 后的正文（新分配，调用方 free），否则 null。
@@ -88,7 +99,7 @@ pub fn classify(
             if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
             continue;
         };
-        var ok = target.user_id == p.observed_qq;
+        var ok = isObserved(p, target.user_id);
         if (!ok) {
             if (try manualBody(gpa, target, p)) |body| {
                 gpa.free(body);
@@ -112,7 +123,7 @@ pub fn classify(
         }
 
         // 路径1：被观察者本人的消息带 ✨ 表情回应
-        if (m.user_id == p.observed_qq and contains(star_ids, m.message_id)) {
+        if (isObserved(p, m.user_id) and contains(star_ids, m.message_id)) {
             try appendCandidate(gpa, &cands, .{
                 .message_id = m.message_id,
                 .path = .emoji_reaction,
@@ -122,7 +133,7 @@ pub fn classify(
         }
 
         // 路径2：他人引用被观察者的消息，且除 reply 外只有一个 ✨ 文本段
-        if (m.user_id == p.observed_qq) continue;
+        if (!p.observe_all and isObserved(p, m.user_id)) continue;
         const rid = m.replyTarget() orelse continue;
         const txt = m.soleTextBesidesReply() orelse continue;
         if (!std.mem.eql(u8, std.mem.trim(u8, txt, ws), star)) continue;
@@ -130,7 +141,7 @@ pub fn classify(
             if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
             continue;
         };
-        if (target.user_id != p.observed_qq) continue;
+        if (!isObserved(p, target.user_id)) continue;
         try appendCandidate(gpa, &cands, .{
             .message_id = rid,
             .path = .quoted_star,
@@ -219,7 +230,7 @@ const ADMIN: u64 = 20001;
 const OUTSIDER: u64 = 30001;
 
 fn params() Params {
-    return .{ .observed_qq = OBSERVED, .admin_qqs = &.{ADMIN} };
+    return .{ .observed_qq = OBSERVED, .observed_qqs = &.{}, .observe_all = false, .admin_qqs = &.{ADMIN} };
 }
 
 // 注意：这两个 helper 的形参必须是 comptime。它们的 .segments 指向一个匿名数组

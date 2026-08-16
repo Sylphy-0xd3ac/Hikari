@@ -206,7 +206,7 @@ pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
 
     const group_id = deps.group_ids[0];
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
-    const from_who = runner.observedCard(deps, a, group_id) orelse return error.AttributionUnavailable;
+    const from_who = runner.observedCard(deps, a, group_id, deps.observed_qq) orelse return error.AttributionUnavailable;
 
     for (parsed.lines) |line| {
         try importLine(deps, line, from, from_who, group_id, now, &summary);
