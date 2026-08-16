@@ -8,6 +8,63 @@ const runner = @import("scan/runner.zig");
 const scheduler = @import("scheduler.zig");
 const import = @import("import.zig");
 
+const ImportCommandArgs = struct {
+    path: []const u8,
+    user_id: u64,
+};
+
+const ImportArgsError = error{InvalidArguments};
+
+const RunCommandArgs = struct {
+    /// null = 沿用这个群自己的 lastrun；非 null = 本次强制回看这么多秒。
+    lookback_seconds: ?i64 = null,
+};
+
+const RunArgsError = error{InvalidArguments};
+
+/// `hikari run --last 24h` 的时长语法。只接受正整数 + m/h/d，且沿用扫描器
+/// 既有的 7 天安全回看上限：更长的窗口会超过当前翻页护栏的设计容量，与其
+/// 悄悄只扫到一部分，不如在联网前明确拒绝。
+fn parseLookbackDuration(raw: []const u8) RunArgsError!i64 {
+    if (raw.len < 2) return error.InvalidArguments;
+
+    const multiplier: u64 = switch (raw[raw.len - 1]) {
+        'm' => 60,
+        'h' => 60 * 60,
+        'd' => 24 * 60 * 60,
+        else => return error.InvalidArguments,
+    };
+    const amount = std.fmt.parseInt(u64, raw[0 .. raw.len - 1], 10) catch return error.InvalidArguments;
+    if (amount == 0) return error.InvalidArguments;
+    const seconds = std.math.mul(u64, amount, multiplier) catch return error.InvalidArguments;
+    if (seconds > @as(u64, @intCast(scheduler.max_lookback_seconds))) return error.InvalidArguments;
+    return @intCast(seconds);
+}
+
+fn parseRunCommandArgs(parts: []const []const u8) RunArgsError!RunCommandArgs {
+    if (parts.len == 0) return .{};
+    if (parts.len != 2 or !std.mem.eql(u8, parts[0], "--last")) return error.InvalidArguments;
+    return .{ .lookback_seconds = try parseLookbackDuration(parts[1]) };
+}
+
+/// `--user` 是必填归属，不再从 OBSERVED_QQS 猜。接受 option-first 的规范写法，
+/// 同时兼容常见的 file-first 排列；其它数量、未知 flag、0/负数/溢出 QQ 都拒绝。
+fn parseImportCommandArgs(parts: []const []const u8) ImportArgsError!ImportCommandArgs {
+    if (parts.len != 3) return error.InvalidArguments;
+
+    const path: []const u8, const user_raw: []const u8 = if (std.mem.eql(u8, parts[0], "--user"))
+        .{ parts[2], parts[1] }
+    else if (std.mem.eql(u8, parts[1], "--user"))
+        .{ parts[0], parts[2] }
+    else
+        return error.InvalidArguments;
+
+    if (path.len == 0 or std.mem.startsWith(u8, path, "--")) return error.InvalidArguments;
+    const user_id = std.fmt.parseInt(u64, user_raw, 10) catch return error.InvalidArguments;
+    if (user_id == 0) return error.InvalidArguments;
+    return .{ .path = path, .user_id = user_id };
+}
+
 pub fn main() !void {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
     defer _ = dbg.deinit();
@@ -20,18 +77,18 @@ pub fn main() !void {
     defer std.process.argsFree(gpa, args);
     if (args.len > 1) {
         if (std.mem.eql(u8, args[1], "import")) {
-            if (args.len != 3) {
-                std.log.err("usage: hikari import <file>", .{});
+            const import_args = parseImportCommandArgs(args[2..]) catch {
+                std.log.err("usage: hikari import --user <qq> <file>", .{});
                 std.process.exit(1);
-            }
-            return runImportCommand(gpa, args[2]);
+            };
+            return runImportCommand(gpa, import_args.path, import_args.user_id);
         }
         if (std.mem.eql(u8, args[1], "run")) {
-            if (args.len != 2) {
-                std.log.err("usage: hikari run", .{});
+            const run_args = parseRunCommandArgs(args[2..]) catch {
+                std.log.err("usage: hikari run [--last <duration>]  (duration: positive integer with m/h/d suffix, max 7d)", .{});
                 std.process.exit(1);
-            }
-            return runRunCommand(gpa);
+            };
+            return runRunCommand(gpa, run_args.lookback_seconds);
         }
         if (std.mem.eql(u8, args[1], "reindex")) {
             if (args.len != 2) {
@@ -40,7 +97,7 @@ pub fn main() !void {
             }
             return runReindexCommand(gpa);
         }
-        std.log.err("unknown subcommand: {s} (usage: hikari [import <file>|run|reindex])", .{args[1]});
+        std.log.err("unknown subcommand: {s} (usage: hikari [import --user <qq> <file>|run [--last <duration>]|reindex])", .{args[1]});
         std.process.exit(1);
     }
 
@@ -132,11 +189,12 @@ pub fn main() !void {
     }
 }
 
-/// `hikari import <file>`：装配一条独立的 Redis 连接 + NapCat 客户端（不跟
+/// `hikari import --user <qq> <file>`：装配一条独立的 Redis 连接 + NapCat
+/// 客户端（不跟
 /// 常驻路径共享，理由跟 main() 里 http_redis/scan_redis 分开是同一个——
 /// redis.Client 一旦被移动/复制就会失效，这条命令本来就是独立进程运行到
 /// 结束就退出，没有必要也不该尝试复用常驻路径的连接管理）。
-fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
+fn runImportCommand(gpa: std.mem.Allocator, path: []const u8, attribution_qq: u64) !void {
     var bad: ?[]const u8 = null;
     var cfg = config.load(gpa, &bad) catch |e| {
         std.log.err("config error ({s}) at env var: {s}", .{ @errorName(e), bad orelse "?" });
@@ -160,7 +218,7 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
         .group_ids = cfg.group_ids,
     };
 
-    const summary = import.run(deps, path, std.time.timestamp()) catch |e| {
+    const summary = import.run(deps, path, attribution_qq, std.time.timestamp()) catch |e| {
         std.log.err("import failed: {s}", .{@errorName(e)});
         std.process.exit(1);
     };
@@ -172,7 +230,8 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
     if (summary.write_failed > 0) std.process.exit(1);
 }
 
-/// `hikari run`：跑一次扫描立刻退出，不起 HTTP 服务。装配跟常驻路径
+/// `hikari run` / `hikari run --last <duration>`：跑一次扫描立刻退出，
+/// 不起 HTTP 服务。装配跟常驻路径
 /// （main() 里那条）逐字段相同——同一个 config.load、同一种独立 Redis
 /// 连接、同一个 runner.Deps 构造方式——因为这必须是一次真实的运行：窗口
 /// 起点仍然是 `hikari:lastrun:{group_id}`，跑完仍然逐群写回它，跟定时
@@ -180,9 +239,9 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
 /// 扫描，得靠"临时改 SCAN_TIME、重启、等、再改回去"这套仪式；`runOnce`
 /// 从来就不关心调用者是谁，唯一缺的只是一个不需要仪式的入口。
 ///
-/// `run_at = std.time.timestamp()`：窗口因此是 `[last_run, now)`——上次
-/// 成功运行之后错过的整段，跟调度路径完全同一条计算逻辑（含 7 天回看
-/// 上限），不是"固定回看 24 小时"那种阉割版本。
+/// 默认窗口是 `[last_run, now)`；显式 `--last 24h` 时，本次不读 last_run，
+/// 强制改成 `[now-24h, now)`。两者成功后都照常把这个群的 lastrun 写成 now：
+/// `--last` 是一次性的窗口覆盖，不是删除进度，也不会改变之后的定时行为。
 ///
 /// 退出码：只有 config 加载失败或 Redis 连不上才是非零——这两步失败意味着
 /// 这次调用压根没跑起来，运营方需要能从退出码看出"根本没跑"和"跑了但
@@ -190,7 +249,7 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8) !void {
 /// `scan/runner.zig`），这里不改这个既有行为：单个群失败不该让整条命令
 /// 退出码变成非零，否则 cron/CI 里跑这条命令会在"完全正常的部分失败"
 /// 场景下持续报警。
-fn runRunCommand(gpa: std.mem.Allocator) !void {
+fn runRunCommand(gpa: std.mem.Allocator, lookback_seconds: ?i64) !void {
     var bad: ?[]const u8 = null;
     var cfg = config.load(gpa, &bad) catch |e| {
         std.log.err("config error ({s}) at env var: {s}", .{ @errorName(e), bad orelse "?" });
@@ -217,7 +276,7 @@ fn runRunCommand(gpa: std.mem.Allocator) !void {
         .group_ids = cfg.group_ids,
     };
 
-    runner.runOnce(deps, std.time.timestamp());
+    runner.runOnceWithOptions(deps, std.time.timestamp(), .{ .lookback_seconds = lookback_seconds });
 }
 
 /// `hikari reindex`：把 `hikari:index` 里已有的语录逐条补进作者维度的索引
@@ -261,6 +320,58 @@ fn runReindexCommand(gpa: std.mem.Allocator) !void {
     const text = try store.formatReindexSummary(gpa, summary);
     defer gpa.free(text);
     try std.fs.File.stdout().writeAll(text);
+}
+
+test "import CLI：--user 必填，option-first 与 file-first 都解析到同一结果" {
+    const a = try parseImportCommandArgs(&.{ "--user", "123456", "seed.txt" });
+    try std.testing.expectEqualStrings("seed.txt", a.path);
+    try std.testing.expectEqual(@as(u64, 123456), a.user_id);
+
+    const b = try parseImportCommandArgs(&.{ "seed.txt", "--user", "123456" });
+    try std.testing.expectEqualStrings("seed.txt", b.path);
+    try std.testing.expectEqual(@as(u64, 123456), b.user_id);
+}
+
+test "import CLI：缺 --user、坏 QQ、额外参数与未知 flag 都拒绝" {
+    inline for ([_][]const []const u8{
+        &.{"seed.txt"},
+        &.{ "--user", "0", "seed.txt" },
+        &.{ "--user", "-1", "seed.txt" },
+        &.{ "--user", "abc", "seed.txt" },
+        &.{ "--user", "18446744073709551616", "seed.txt" },
+        &.{ "--author", "123", "seed.txt" },
+        &.{ "--user", "123", "seed.txt", "extra" },
+    }) |parts| {
+        try std.testing.expectError(error.InvalidArguments, parseImportCommandArgs(parts));
+    }
+}
+
+test "run CLI：默认沿用 lastrun，--last 接受 m h d 并换算成秒" {
+    const normal = try parseRunCommandArgs(&.{});
+    try std.testing.expectEqual(@as(?i64, null), normal.lookback_seconds);
+
+    const one_hour = try parseRunCommandArgs(&.{ "--last", "1h" });
+    try std.testing.expectEqual(@as(?i64, 3600), one_hour.lookback_seconds);
+    const ninety_minutes = try parseRunCommandArgs(&.{ "--last", "90m" });
+    try std.testing.expectEqual(@as(?i64, 5400), ninety_minutes.lookback_seconds);
+    const seven_days = try parseRunCommandArgs(&.{ "--last", "7d" });
+    try std.testing.expectEqual(@as(?i64, scheduler.max_lookback_seconds), seven_days.lookback_seconds);
+}
+
+test "run CLI：--last 拒绝零、负数、小数、无单位、超 7 天及多余参数" {
+    inline for ([_][]const []const u8{
+        &.{"--last"},
+        &.{ "--last", "0h" },
+        &.{ "--last", "-1h" },
+        &.{ "--last", "1.5h" },
+        &.{ "--last", "24" },
+        &.{ "--last", "169h" },
+        &.{ "--last", "18446744073709551615d" },
+        &.{ "--last", "1h", "extra" },
+        &.{ "--since", "1h" },
+    }) |parts| {
+        try std.testing.expectError(error.InvalidArguments, parseRunCommandArgs(parts));
+    }
 }
 
 test {

@@ -140,9 +140,8 @@ fn importLine(
     from: []const u8,
     from_who: []const u8,
     group_id: u64,
-    /// 导入进来的这批语录算谁说的。命令行还没有 --user 之前，取
-    /// OBSERVED_QQS 的第一个；观察全员（空集）时没有可归属的人，调用方
-    /// 在进入循环之前就已经拒绝了，不会走到这里。
+    /// 导入进来的这批语录算谁说的。只来自命令行必填的 `--user <qq>`，
+    /// 与 OBSERVED_QQS 的观察范围完全独立。
     attribution_qq: u64,
     now: i64,
     summary: *Summary,
@@ -195,7 +194,7 @@ fn importLine(
 /// "这个群这一轮失败，下次/补跑再试"的退路，import 是一次性手工操作，没有
 /// 重跑窗口的概念，写出去的残缺归属字段就是永久的（design.md：入库后只能
 /// 被 💦 作废，没有编辑路径）。
-pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
+pub fn run(deps: runner.Deps, path: []const u8, attribution_qq: u64, now: i64) !Summary {
     const contents = try std.fs.cwd().readFileAlloc(deps.gpa, path, 64 * 1024 * 1024);
     defer deps.gpa.free(contents);
 
@@ -209,12 +208,6 @@ pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
     const a = ar.allocator();
 
     const group_id = deps.group_ids[0];
-
-    // 观察全员时没有"那一个被观察者"可以把这批语录记在名下。与其静默挑一个
-    // 或者写个空归属（入库后没有编辑路径，写错就是永久的），不如直接拒绝，
-    // 等 --user 参数落地后由操作者显式指定。复用 runner.soleObserved 而不是
-    // 在这里另开一份等价的 if/else——"空集合怎么办"这个判断只应该有一处。
-    const attribution_qq = runner.soleObserved(deps) orelse return error.AttributionUnavailable;
 
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
     const from_who = runner.memberCard(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
@@ -414,6 +407,9 @@ const FakeNapcatServer = struct {
     thread: std.Thread,
     replies: []const []const u8,
     gpa: std.mem.Allocator,
+    mutex: std.Thread.Mutex,
+    active_stream: ?std.net.Stream,
+    stopped: bool,
 
     fn serve(self: *FakeNapcatServer) void {
         // 一条连接、依次答完全部 replies——不是每条回复起一条新连接。
@@ -424,7 +420,20 @@ const FakeNapcatServer = struct {
         // 老老实实地在同一条连接上循环 receiveHead，模拟真实的 keep-alive
         // 服务端行为。
         const conn = self.listener.accept() catch return;
-        defer conn.stream.close();
+        self.mutex.lock();
+        if (self.stopped) {
+            self.mutex.unlock();
+            conn.stream.close();
+            return;
+        }
+        self.active_stream = conn.stream;
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            self.active_stream = null;
+            self.mutex.unlock();
+            conn.stream.close();
+        }
         var rbuf: [8192]u8 = undefined;
         var wbuf: [8192]u8 = undefined;
         var sr = conn.stream.reader(&rbuf);
@@ -450,6 +459,9 @@ const FakeNapcatServer = struct {
             .thread = undefined,
             .replies = replies,
             .gpa = gpa,
+            .mutex = .{},
+            .active_stream = null,
+            .stopped = false,
         };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
@@ -460,7 +472,13 @@ const FakeNapcatServer = struct {
     }
 
     fn stop(self: *FakeNapcatServer) void {
+        self.mutex.lock();
+        self.stopped = true;
         self.listener.deinit();
+        if (self.active_stream) |stream| {
+            std.posix.shutdown(stream.handle, .both) catch {};
+        }
+        self.mutex.unlock();
         self.thread.join();
         self.gpa.destroy(self);
     }
@@ -510,7 +528,8 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qqs = &.{123456},
+        // import 的归属只由显式 --user 决定；观察全员时同样可导入。
+        .observed_qqs = &.{},
         .admin_qqs = &.{},
         .group_ids = &.{10001},
     };
@@ -520,7 +539,7 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     const path = try writeTempInput(gpa, &tmp, "新的一行文本\n已经入库过的文本\n");
     defer gpa.free(path);
 
-    const summary = try run(deps, path, 1_700_000_000);
+    const summary = try run(deps, path, 123456, 1_700_000_000);
 
     // 文件以 '\n' 结尾，splitScalar 会多切出一段末尾空段，所以 total_lines
     // 是 3（两条真实文本 + 一段末尾空段）、blank_skipped 是 1。
@@ -538,6 +557,7 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     // summary.added==1 钉不住 commit_from 有没有被正确改写成 "import"。
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "import") != null);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "新的一行文本") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:byuser:123456") != null);
     const want_id = try std.fmt.allocPrint(gpa, "{d}", .{deriveId("新的一行文本")});
     defer gpa.free(want_id);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, want_id) != null);
@@ -584,7 +604,7 @@ test "run 端到端：群归属解析不出来就整体中止，一条候选都�
     const path = try writeTempInput(gpa, &tmp, "这一行永远不该被写进去\n");
     defer gpa.free(path);
 
-    try std.testing.expectError(error.AttributionUnavailable, run(deps, path, 1_700_000_000));
+    try std.testing.expectError(error.AttributionUnavailable, run(deps, path, 123456, 1_700_000_000));
 
     c.deinit();
     redis_srv.stop();

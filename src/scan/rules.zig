@@ -3,9 +3,9 @@ const onebot = @import("../onebot.zig");
 
 pub const star = "✨";
 pub const drop = "💦";
-/// 💤 = U+1F4A4。管理员在窗口内发一条**只有** 💤 的消息（不含 reply 段、
-/// 不含任何其它段、trim 之后正好是这一个 emoji）＝ 「这个群这一轮别收录
-/// 任何东西」。见 classify 里 sleepCommand 与 Outcome.skip_collection。
+/// 💤 = U+1F4A4。管理员在窗口内发一条**只有** 💤 的消息，再由同一个管理员
+/// 给这条消息点一个 💤 表情回应，才等于「这个群这一轮别收录任何东西」。
+/// 单独的 💤 只是普通聊天，没有任何控制效果。
 pub const sleep = "💤";
 
 const ws = " \t\r\n";
@@ -61,6 +61,10 @@ pub const Params = struct {
     /// 被观察者集合。**空切片 = 观察所有人**。
     observed_qqs: []const u64,
     admin_qqs: []const u64,
+    /// 已经由 runner 通过 `get_msg` + `get_emoji_likes` 确认“消息发送者本人点了
+    /// 💤 表情回应”的 message_id。默认空，保持 rules 的绝大多数纯函数测试与
+    /// 其它调用点无需关心 NapCat 数据来源。
+    sleep_reaction_ids: []const i64 = &.{},
 
     /// "这个 QQ 算不算被观察者" 的**唯一**判定点。四条收录路径、Pass A 的
     /// 撤稿目标判定、🔥 链的成员资格全部走这一个函数，不允许任何一处再写
@@ -79,8 +83,9 @@ pub const Outcome = struct {
     candidates: []Candidate,
     unresolved: []i64,
 
-    /// 💤：窗口内有管理员发过一条"只有 💤"的消息，且这条消息**没有**被同一个
-    /// 窗口里的某条管理员 💦 引用作废掉 → 这个群这一轮一条都不收录。
+    /// 💤：窗口内有管理员发过一条"只有 💤"的消息，runner 又确认同一个管理员
+    /// 给它点了 💤 表情回应，且这条消息**没有**被同一个窗口里的管理员 💦
+    /// 引用取消 → 这个群这一轮一条都不收录。
     ///
     /// 刻意**不**在 rules.zig 里把 candidates 清空：运营方要求这一轮照样扫、
     /// 照样发七行日志，并且把每一条候选都如实计进 `skipped`（`Added 0
@@ -165,8 +170,8 @@ fn renderSegments(gpa: std.mem.Allocator, segs: []const onebot.Segment, prefix: 
 ///      的段是不是 `at`——`✨ 你好 @某人` 里的 at 前面已经有正文了，它是普通
 ///      内容，照旧渲染成 `@昵称`。**只有紧跟 `✨` 的那个 at 才是作者标记。**
 ///   3. 作者标记的 at 之后的全部段（含后面的 at）就是正文，按 renderSegments
-///      渲染 + trim；空 → null（`✨ @某人` 没有正文，跟 `✨` 光杆一样什么都
-///      不产生）。
+///      渲染 + trim；`✨ @某人` 没有正文时仍返回一个 body 为空的 Manual，让
+///      路径3赢过路径1，并由 runner 的既有空文本关卡诚实计入 skipped。
 ///   4. `at.data.qq` 解析不出 u64（`@全体成员` 的 `"all"` 就是这种）→ 不当作
 ///      者标记，退回"没有 at"那一支，这个 at 照旧渲染进正文。
 pub fn manualParse(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?Manual {
@@ -220,7 +225,10 @@ pub fn manualParse(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?Manua
     const rendered = try renderSegments(gpa, m.segments[body_start..], rest_first);
     defer gpa.free(rendered);
     const body = std.mem.trim(u8, rendered, ws);
-    if (body.len == 0) return null;
+    // 光杆 `✨` 维持旧行为（不是候选）；但 `✨ @某人` 已经明确命中了新增的
+    // 路径3语法，即使正文为空也必须作为空候选返回。否则它若又被贴了 ✨，会
+    // 从路径3漏下去被路径1收成字面量 `✨ @某人`，同时 skipped 也少算一条。
+    if (body.len == 0 and author_uid == null) return null;
     return .{ .body = try gpa.dupe(u8, body), .author_uid = author_uid };
 }
 
@@ -228,6 +236,12 @@ pub fn manualParse(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?Manua
 /// 的薄包装。链的作者由 `buildChains` 的同一发送者约束定死，不看这个字段。
 pub fn manualBody(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?[]u8 {
     const parsed = try manualParse(gpa, m, p) orelse return null;
+    // Pass A 的“是不是可作废的路径3目标”和 🔥 链正文剥前缀只接受有正文的
+    // 手动收录；空 Manual 只为 Pass B 生成空候选、走 skipped 关卡。
+    if (parsed.body.len == 0) {
+        gpa.free(parsed.body);
+        return null;
+    }
     return parsed.body;
 }
 
@@ -235,7 +249,9 @@ pub fn manualBody(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?[]u8 {
 /// 文本 trim 之后正好是 `✨`，且确实引用了某条消息。是的话返回它引用的
 /// `message_id`。
 ///
-/// 用途有两个，都只关心**形状**、不关心是谁发的：
+/// 这里只识别消息形状；路径2还要求触发者与原消息作者不是同一个人。Pass A
+/// 一跳在拿到被引用的原消息之后补做这条身份判定，不能把“自己回自己 ✨”误认
+/// 成第三方认可。
 ///
 ///   - Pass A 的 💦 一跳（4.3 节）：管理员看得见的是群里那条 `✨`，让他 💦 那
 ///     一条比让他翻回去找原文自然得多。这里把目标换成"那条 ✨ 引用的消息"，
@@ -251,7 +267,8 @@ pub fn starTriggerTarget(m: onebot.Message) ?i64 {
     return rid;
 }
 
-/// 💤：这条消息是不是"这个群这一轮别收录任何东西"的指令。
+/// 这条消息是不是 💤 控制命令的**文本锚点**。锚点本身不产生控制效果；
+/// sleepCommand 还会要求 runner 已确认发送者本人点过 💤 表情回应。
 ///
 /// **"只有 💤" 的精确定义**（三条同时成立）：
 ///
@@ -265,13 +282,16 @@ pub fn starTriggerTarget(m: onebot.Message) ?i64 {
 ///      之后逐字节等于 `💤`。
 ///
 /// 注意"trim 之后等于"用的是字节比较，不是"包含 💤"：`💤💤`、`睡了💤`、
-/// `💤 明天见` 都**不**是这条指令——一条能让整个群这一轮静默的开关，触发
-/// 条件必须窄到不可能被闲聊误触。
-fn sleepCommand(m: onebot.Message, p: Params) bool {
+/// `💤 明天见` 都不是锚点。
+pub fn sleepAnchor(m: onebot.Message, p: Params) bool {
     if (!isAdmin(p, m.user_id)) return false;
     if (m.replyTarget() != null) return false;
     const txt = m.soleTextBesidesReply() orelse return false;
     return std.mem.eql(u8, std.mem.trim(u8, txt, ws), sleep);
+}
+
+fn sleepCommand(m: onebot.Message, p: Params) bool {
+    return sleepAnchor(m, p) and contains(p.sleep_reaction_ids, m.message_id);
 }
 
 fn lookup(pool: []const onebot.Message, id: i64) ?onebot.Message {
@@ -485,15 +505,16 @@ pub fn classify(
         cands.deinit(gpa);
     }
 
-    // 💤 与"哪些消息被 💦 引用过"这两份名单在 Pass A 里同时攒起来，循环结束
-    // 后才算 skip_collection——一条 💤 可能先于、也可能晚于撤掉它的那条 💦
-    // 出现在窗口里，边走边判会依赖出现顺序。
+    // 已经由 runner 确认过“发送者本人点了 💤 回应”的锚点，与“哪些消息被
+    // 💦 引用过”这两份名单在 Pass A 里同时攒起来，循环结束后才算
+    // skip_collection——💦 可能出现在窗口内锚点的前面或后面，边走边判会
+    // 依赖出现顺序。
     var sleep_ids: std.ArrayList(i64) = .empty;
     defer sleep_ids.deinit(gpa);
     var drop_targets: std.ArrayList(i64) = .empty;
     defer drop_targets.deinit(gpa);
 
-    // Pass A：收集作废指令（顺带收集 💤 指令）
+    // Pass A：收集作废指令（顺带收集经过表情回应二次确认的 💤 指令）
     for (window) |m| {
         if (!isAdmin(p, m.user_id)) continue;
         if (sleepCommand(m, p)) {
@@ -503,7 +524,7 @@ pub fn classify(
         const rid0 = m.replyTarget() orelse continue;
         const txt = m.soleTextBesidesReply() orelse continue;
         if (!std.mem.eql(u8, std.mem.trim(u8, txt, ws), drop)) continue;
-        // 💦 **直接**引用的那个 id（一跳之前）——"💦 引用 💤 那条消息就取消
+        // 💦 **直接**引用的那个 id（一跳之前）——“💦 引用已确认的 💤 锚点就取消
         // 这一轮的跳过"看的是这个，不是一跳之后的目标，也不是 revoked：
         // 💤 那条消息的发送者是管理员，`OBSERVED_QQS` 配了子集且管理员不在
         // 里面时它压根不是一个"可作废的目标"（4.3 节），永远不会进 revoked，
@@ -524,11 +545,18 @@ pub fn classify(
         // 东西要是解析不出来（窗口外 + get_msg 也回补不到），跟改动之前一样
         // 什么都不发生，只是多记一条 unresolved 警告。
         if (starTriggerTarget(target)) |hop| {
-            rid = hop;
-            target = lookup(pool, rid) orelse {
-                if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
+            const trigger = target;
+            const hop_target = lookup(pool, hop) orelse {
+                if (!contains(unresolved.items, hop)) try unresolved.append(gpa, hop);
                 continue;
             };
+            // 只有完整满足路径2资格才 hop：原消息必须被观察，且触发者必须是
+            // 别人。否则这只是“一条长得像 ✨ 触发的普通引用消息”，保持旧的
+            // 直接撤稿语义，继续对 rid0 / trigger 本身做下方资格判定。
+            if (p.isObserved(hop_target.user_id) and trigger.user_id != hop_target.user_id) {
+                rid = hop;
+                target = hop_target;
+            }
         }
         var ok = p.isObserved(target.user_id);
         if (!ok) {
@@ -553,11 +581,10 @@ pub fn classify(
         }
     }
 
-    // 💤：窗口里存在一条**没有被 💦 引用**的 💤 指令 → 这一轮不收录。
-    // 被 💦 引用的那条 💤 视为管理员当场收回了这条指令（"取消跳过"），此时
-    // 这个群照常收录；两条 💤 里只撤掉一条，剩下那条仍然生效——跳过是"任意
-    // 一条 💤 说了算"，撤销必须逐条撤干净，方向上偏保守的那一边跟撤稿
-    // "宁可多 tombstone 也不能少"是同一个取向。
+    // 💤：窗口里存在一条“管理员发单独 💤 + 同一管理员亲自点 💤 回应”、且
+    // **没有被 💦 引用**的确认指令 → 这一轮不收录。单独的文本锚点不会进入
+    // sleep_ids，因此完全没有控制效果。两条已确认锚点只撤掉一条，剩下那条
+    // 仍然生效；撤销必须逐条撤干净。
     var skip_collection = false;
     for (sleep_ids.items) |sid| {
         if (!contains(drop_targets.items, sid)) {
@@ -1767,7 +1794,7 @@ test "路径3 · at 语法：作者标记之后的 at 仍然渲染成 @昵称，
     try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
 }
 
-test "路径3 · at 语法：✨ @某人 后面没有正文 → 剥完为空，什么都不产生" {
+test "路径3 · at 语法：✨ @某人 后面没有正文 → 空路径3候选，计 skipped 且不能跌落路径1" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{.{
         .message_id = 1,
@@ -1779,10 +1806,15 @@ test "路径3 · at 语法：✨ @某人 后面没有正文 → 剥完为空，�
             .{ .text = "   " },
         },
     }};
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    // 即使这条消息本身还带了 ✨ reaction，也必须由更具体的路径3赢；旧实现
+    // manualParse 返回 null 后会跌落路径1，把 `✨ @小明` 原样收进库。
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
     defer out.deinit(gpa);
 
-    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.admin_manual, out.candidates[0].path);
+    try std.testing.expectEqual(@as(usize, 0), out.candidates[0].text_override.?.len);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
 }
 
 test "路径3 · at 语法：被 at 的人不在 OBSERVED_QQS 里也照样收录（管理员在显式断言作者）" {
@@ -1914,6 +1946,35 @@ test "💦 一跳：引用路径2的 ✨ 触发消息 → 作废那条 ✨ 引�
     try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
 }
 
+test "💦 一跳：作者自己回自己的消息 ✨ 不构成路径2，只按旧规则作废触发消息本身" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "金句"),
+        replyMsg(2, OBSERVED, 1, "✨"), // 自己认可自己，不是路径2触发
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqualSlices(i64, &.{2}, out.revoked);
+}
+
+test "💦 一跳：原消息不在观察集合时不构成路径2，不能借 💦 作废管理员手动语录" {
+    const gpa = std.testing.allocator;
+    const p: Params = .{ .observed_qqs = &.{OBSERVED}, .admin_qqs = &.{ADMIN} };
+    const msgs = [_]onebot.Message{
+        textMsg(1, ADMIN, "✨ 一条管理员手动语录"), // 路径3，但不是被观察原消息
+        replyMsg(2, OUTSIDER, 1, "✨"),
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 0), out.revoked.len);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+}
+
 test "💦 一跳：跳到的消息是 🔥 链的内容成员 → 整条链全部成员都进 revoked" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{
@@ -1993,15 +2054,26 @@ test "OOM 回归：💦 一跳 + 链展开 + 存活候选混在一起时任意�
 }
 
 // ---------------------------------------------------------------------------
-// 💤（design.md §4.5.2）：管理员发一条只有 💤 的消息 → 这个群这一轮不收录。
+// 💤（design.md §4.5.2）：管理员发一条只有 💤 的消息，并由同一个管理员亲自
+// 点一个 💤 表情回应 → 这个群这一轮不收录。文本或回应缺一不可。
 
-test "💤：管理员发一条只有 💤 的消息 → skip_collection 为真，候选照常算出来" {
+test "💤：单独文本没有本人表情回应 → 完全无效，不会误触" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{textMsg(1, ADMIN, "💤")};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expect(!out.skip_collection);
+}
+
+test "💤：管理员单独文本 + 本人 💤 表情回应 → skip_collection 为真，候选照常算出来" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{
         textMsg(1, OBSERVED, "金句"),
         textMsg(2, ADMIN, "💤"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{2};
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, p);
     defer out.deinit(gpa);
 
     try std.testing.expect(out.skip_collection);
@@ -2013,7 +2085,9 @@ test "💤：管理员发一条只有 💤 的消息 → skip_collection 为真�
 test "💤：前后带空白仍然算数" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{textMsg(1, ADMIN, "  💤 \n")};
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{1};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
     defer out.deinit(gpa);
     try std.testing.expect(out.skip_collection);
 }
@@ -2021,7 +2095,9 @@ test "💤：前后带空白仍然算数" {
 test "💤：非管理员发的不算" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{textMsg(1, OUTSIDER, "💤")};
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{1};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
     defer out.deinit(gpa);
     try std.testing.expect(!out.skip_collection);
 }
@@ -2030,7 +2106,9 @@ test "💤：夹带别的字一律不算——开关不能被闲聊误触" {
     const gpa = std.testing.allocator;
     inline for ([_][]const u8{ "💤💤", "睡了💤", "💤 明天见" }) |txt| {
         const msgs = [_]onebot.Message{textMsg(1, ADMIN, txt)};
-        var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+        var p = params();
+        p.sleep_reaction_ids = &.{1};
+        var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
         defer out.deinit(gpa);
         try std.testing.expect(!out.skip_collection);
     }
@@ -2044,7 +2122,9 @@ test "💤：夹带图片段（不是唯一的 text 段）不算" {
         .time = 0,
         .segments = &.{ .{ .text = "💤" }, .other },
     }};
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{1};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
     defer out.deinit(gpa);
     try std.testing.expect(!out.skip_collection);
 }
@@ -2055,7 +2135,9 @@ test "💤：带 reply 段的 💤 不算——💤 是群级指令，带引用�
         textMsg(1, OBSERVED, "金句"),
         replyMsg(2, ADMIN, 1, "💤"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{2};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
     defer out.deinit(gpa);
     try std.testing.expect(!out.skip_collection);
 }
@@ -2067,7 +2149,9 @@ test "💤 不影响撤稿：同一窗口里的 💦 照常进 revoked" {
         replyMsg(2, ADMIN, 1, "💦"),
         textMsg(3, ADMIN, "💤"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{3};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
     defer out.deinit(gpa);
 
     try std.testing.expect(out.skip_collection);
@@ -2082,7 +2166,9 @@ test "💤：管理员 💦 引用这条 💤 → 取消跳过，这一轮照常
         textMsg(2, ADMIN, "💤"),
         replyMsg(3, ADMIN, 2, "💦"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{2};
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, p);
     defer out.deinit(gpa);
 
     try std.testing.expect(!out.skip_collection);
@@ -2099,7 +2185,9 @@ test "💤：撤销走的是「💦 直接引用了这个 id」而不是 revoked
         textMsg(2, ADMIN, "💤"),
         replyMsg(3, ADMIN, 2, "💦"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, subset);
+    var p = subset;
+    p.sleep_reaction_ids = &.{2};
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, p);
     defer out.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 0), out.revoked.len);
@@ -2114,7 +2202,9 @@ test "💤：两条 💤 只撤掉一条 → 剩下那条仍然让这一轮跳�
         textMsg(2, ADMIN, "💤"),
         replyMsg(3, ADMIN, 1, "💦"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{ 1, 2 };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, p);
     defer out.deinit(gpa);
     try std.testing.expect(out.skip_collection);
 }
@@ -2127,7 +2217,9 @@ fn sleepUnderFailingAllocator(gpa: std.mem.Allocator) !void {
         replyMsg(4, ADMIN, 3, "💦"),
         textMsg(5, ADMIN, "✨ 一条存活的手动收录"),
     };
-    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    var p = params();
+    p.sleep_reaction_ids = &.{ 2, 3 };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, p);
     out.deinit(gpa);
 }
 

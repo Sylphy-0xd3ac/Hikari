@@ -1402,11 +1402,13 @@ const FakeServer = struct {
     script: []const u8,
     received: std.ArrayList(u8),
     gpa: std.mem.Allocator,
+    shutdown: std.atomic.Value(bool),
     stopped: bool,
 
     fn serve(self: *FakeServer) void {
         const conn = self.listener.accept() catch return;
         defer conn.stream.close();
+        if (self.shutdown.load(.acquire)) return;
         var buf: [4096]u8 = undefined;
         _ = conn.stream.writeAll(self.script) catch return;
         while (true) {
@@ -1425,6 +1427,7 @@ const FakeServer = struct {
             .script = script,
             .received = .empty,
             .gpa = gpa,
+            .shutdown = .init(false),
             .stopped = false,
         };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
@@ -1438,10 +1441,33 @@ const FakeServer = struct {
     fn stop(self: *FakeServer) void {
         if (self.stopped) return;
         self.stopped = true;
-        self.listener.deinit();
+        // 不能从控制线程直接 close 正阻塞在 accept() 的监听 fd：Darwin 会让
+        // std.posix.accept 收到 BADF，而 Zig 把它判作竞态并 unreachable panic。
+        // 先用本机连接正常唤醒 accept；服务线程看见 shutdown 后立即退出，等
+        // join 确认它不再访问 listener，最后才安全关闭监听 fd。
+        self.shutdown.store(true, .release);
+        if (std.net.tcpConnectToAddress(self.listener.listen_address)) |wake| {
+            wake.close();
+        } else |_| {}
         self.thread.join();
+        self.listener.deinit();
     }
 };
+
+test "FakeServer.stop：没有客户端 connect 时也能安全唤醒 accept" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "+OK\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+
+    // 不建立客户端连接：stop 自己必须唤醒服务线程，不能并发 close listener
+    // 触发 Darwin BADF panic，也不能把 join 永久卡在 accept 上。
+    srv.stop();
+    try std.testing.expectEqual(@as(usize, 0), srv.received.items.len);
+}
 
 /// 把 args[skip..] 编码成一段 RESP bulk-string 数组回复，字节布局与
 /// `resp.encodeCommand` 完全相同（都是 `*N\r\n$len\r\nval\r\n...`），

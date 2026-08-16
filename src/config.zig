@@ -4,6 +4,14 @@ pub const Error = error{ MissingEnv, InvalidValue, OutOfMemory };
 
 pub const Env = std.StringHashMap([]const u8);
 
+const env_keys = [_][]const u8{
+    "NAPCAT_HTTP_URL", "NAPCAT_TOKEN", "OBSERVED_QQS", "QQ_GROUP_IDS",
+    "ADMIN_QQS",       "SCAN_TIME",    "HTTP_HOST",    "HTTP_PORT",
+    "REDIS_URL",
+    // 已废弃，仍然读取：只为了在它单独在场时报出明确的改名错误。
+          "OBSERVED_QQ",
+};
+
 pub const ScanTime = struct { hour: u8, minute: u8 };
 
 pub const RedisTarget = struct {
@@ -51,6 +59,76 @@ pub const Config = struct {
 };
 
 const ws = " \t\r\n";
+
+fn validEnvKey(key: []const u8) bool {
+    if (key.len == 0 or !(std.ascii.isAlphabetic(key[0]) or key[0] == '_')) return false;
+    for (key[1..]) |c| {
+        if (!(std.ascii.isAlphanumeric(c) or c == '_')) return false;
+    }
+    return true;
+}
+
+/// dotenv 值解析刻意不做 `$VAR` / `${VAR}` 展开：配置文件不是 shell，值的
+/// 含义不应依赖启动进程恰好带了哪些其它变量。单双引号只负责把空格、`#` 和
+/// shell 元字符包在值里，外层引号会被剥掉；反斜杠保持字面量。
+fn dotEnvValue(raw0: []const u8) Error![]const u8 {
+    const raw = std.mem.trim(u8, raw0, ws);
+    if (raw.len == 0) return raw;
+
+    if (raw[0] == '\'' or raw[0] == '"') {
+        const quote = raw[0];
+        var close: ?usize = null;
+        var i: usize = 1;
+        while (i < raw.len) : (i += 1) {
+            if (raw[i] == quote) {
+                close = i;
+                break;
+            }
+        }
+        const end = close orelse return error.InvalidValue;
+        const tail = std.mem.trim(u8, raw[end + 1 ..], ws);
+        if (tail.len > 0 and tail[0] != '#') return error.InvalidValue;
+        return raw[1..end];
+    }
+
+    // 未加引号时，`#` 只有位于值开头或前面是空白才开始注释；URL/token 中
+    // 连着写的 `#` 是值本身，不能被截断。
+    var end = raw.len;
+    for (raw, 0..) |c, i| {
+        if (c == '#' and (i == 0 or std.ascii.isWhitespace(raw[i - 1]))) {
+            end = i;
+            break;
+        }
+    }
+    return std.mem.trimRight(u8, raw[0..end], ws);
+}
+
+fn putOverride(env: *Env, key: []const u8, value: []const u8) Error!void {
+    env.put(key, value) catch return error.OutOfMemory;
+}
+
+/// 把一份 `.env` 文本解析进 Env。后出现的同名键覆盖前面的；真正的进程环境
+/// 会在 load() 里再覆盖这一层，所以优先级固定为 process env > .env。
+fn parseDotEnvInto(env: *Env, contents0: []const u8) Error!void {
+    var contents = contents0;
+    if (std.mem.startsWith(u8, contents, "\xEF\xBB\xBF")) contents = contents[3..];
+
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw_line| {
+        var line = std.mem.trim(u8, raw_line, ws);
+        if (line.len == 0 or line[0] == '#') continue;
+
+        if (std.mem.startsWith(u8, line, "export") and line.len > "export".len and std.ascii.isWhitespace(line["export".len])) {
+            line = std.mem.trimLeft(u8, line["export".len..], ws);
+        }
+
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse return error.InvalidValue;
+        const key = std.mem.trim(u8, line[0..eq], ws);
+        if (!validEnvKey(key)) return error.InvalidValue;
+        const value = try dotEnvValue(line[eq + 1 ..]);
+        try putOverride(env, key, value);
+    }
+}
 
 fn parseUintList(gpa: std.mem.Allocator, raw: []const u8) Error![]u64 {
     var out: std.ArrayList(u64) = .empty;
@@ -207,28 +285,93 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
 }
 
 pub fn load(gpa: std.mem.Allocator, bad: *?[]const u8) Error!Config {
-    const keys = [_][]const u8{
-        "NAPCAT_HTTP_URL", "NAPCAT_TOKEN", "OBSERVED_QQS", "QQ_GROUP_IDS",
-        "ADMIN_QQS",       "SCAN_TIME",    "HTTP_HOST",   "HTTP_PORT",
-        "REDIS_URL",
-        // 已废弃，仍然读进来：只为了在它单独在场时报出那条改名错误，
-        // 而不是静默忽略。
-        "OBSERVED_QQ",
-    };
     var env: Env = .init(gpa);
-    defer {
-        var it = env.valueIterator();
-        while (it.next()) |v| gpa.free(v.*);
-        env.deinit();
+    defer env.deinit();
+
+    const dot_env: ?[]u8 = std.fs.cwd().readFileAlloc(gpa, ".env", 1024 * 1024) catch |e| switch (e) {
+        error.FileNotFound => null,
+        error.OutOfMemory => return error.OutOfMemory,
+        else => {
+            bad.* = ".env";
+            return error.InvalidValue;
+        },
+    };
+    defer if (dot_env) |contents| gpa.free(contents);
+    if (dot_env) |contents| {
+        parseDotEnvInto(&env, contents) catch |e| {
+            bad.* = ".env";
+            return e;
+        };
     }
-    for (keys) |k| {
+
+    // 只拥有真实进程环境返回的副本；`.env` 的 key/value 都是 dot_env 里的
+    // 切片，随上面的 buffer 一起释放，不能在 valueIterator 里混着 free。
+    var process_values: std.ArrayList([]u8) = .empty;
+    defer {
+        for (process_values.items) |v| gpa.free(v);
+        process_values.deinit(gpa);
+    }
+    for (env_keys) |k| {
         const v = std.process.getEnvVarOwned(gpa, k) catch |e| switch (e) {
             error.EnvironmentVariableNotFound => continue,
             else => return error.InvalidValue,
         };
-        try env.put(k, v);
+        process_values.append(gpa, v) catch {
+            gpa.free(v);
+            return error.OutOfMemory;
+        };
+        putOverride(&env, k, v) catch |e| {
+            _ = process_values.pop();
+            gpa.free(v);
+            return e;
+        };
     }
     return loadFrom(gpa, env, bad);
+}
+
+test ".env：支持注释、export、单双引号和 shell 元字符，且不展开 $VAR" {
+    const gpa = std.testing.allocator;
+    var env: Env = .init(gpa);
+    defer env.deinit();
+
+    try parseDotEnvInto(&env,
+        \\# comment
+        \\export NAPCAT_HTTP_URL = http://127.0.0.1:3000 # inline comment
+        \\NAPCAT_TOKEN='a?b)c!d#e*f'
+        \\REDIS_URL="redis://:$PASSWORD@127.0.0.1:6379/0"
+        \\HTTP_HOST=host#literal
+        \\HTTP_PORT=8080
+    );
+
+    try std.testing.expectEqualStrings("http://127.0.0.1:3000", env.get("NAPCAT_HTTP_URL").?);
+    try std.testing.expectEqualStrings("a?b)c!d#e*f", env.get("NAPCAT_TOKEN").?);
+    try std.testing.expectEqualStrings("redis://:$PASSWORD@127.0.0.1:6379/0", env.get("REDIS_URL").?);
+    try std.testing.expectEqualStrings("host#literal", env.get("HTTP_HOST").?);
+}
+
+test ".env：后写覆盖前写，进程环境覆盖文件值使用同一条 putOverride" {
+    const gpa = std.testing.allocator;
+    var env: Env = .init(gpa);
+    defer env.deinit();
+
+    try parseDotEnvInto(&env, "HTTP_PORT=7000\nHTTP_PORT=7001\n");
+    try std.testing.expectEqualStrings("7001", env.get("HTTP_PORT").?);
+    try putOverride(&env, "HTTP_PORT", "9000");
+    try std.testing.expectEqualStrings("9000", env.get("HTTP_PORT").?);
+}
+
+test ".env：拒绝坏键、缺等号、未闭合引号和引号后的垃圾" {
+    const gpa = std.testing.allocator;
+    inline for ([_][]const u8{
+        "1BAD=x\n",
+        "NO_EQUALS\n",
+        "TOKEN='unterminated\n",
+        "TOKEN='ok' trailing\n",
+    }) |contents| {
+        var env: Env = .init(gpa);
+        defer env.deinit();
+        try std.testing.expectError(error.InvalidValue, parseDotEnvInto(&env, contents));
+    }
 }
 
 test "parseUintList 解析逗号分隔的 QQ 号" {

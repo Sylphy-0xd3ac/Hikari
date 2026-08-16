@@ -25,6 +25,16 @@ pub fn resultLine(gpa: std.mem.Allocator, added: usize, skipped: usize) ![]u8 {
     return std.fmt.allocPrint(gpa, "Added {d} messages, skipped {d} messages.", .{ added, skipped });
 }
 
+/// 💤 双重确认命中时仍保持七行合并转发，只把第六行写清楚“为什么全跳过”。
+/// 不能只放在 std.log：群里看到结果时扫描窗口已经关闭，产品日志必须自己解释。
+pub fn sleepResultLine(gpa: std.mem.Allocator, skipped: usize) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "Added 0 messages, skipped {d} messages. Collection paused by confirmed 💤 reaction.",
+        .{skipped},
+    );
+}
+
 pub fn failedLine(gpa: std.mem.Allocator, reason: []const u8) ![]u8 {
     return std.fmt.allocPrint(gpa, "Failed: {s}", .{reason});
 }
@@ -47,7 +57,7 @@ pub fn probeSummaryLine(gpa: std.mem.Allocator, group_id: u64, probed: usize, el
     const clamped: i64 = if (elapsed_ms > 0) elapsed_ms else 0;
     return std.fmt.allocPrint(
         gpa,
-        "group {d}: probed {d} message(s) for ✨/🔥 reactions in {d}ms",
+        "group {d}: probed {d} message(s) for ✨/🔥/💤 reactions in {d}ms",
         .{ group_id, probed, clamped },
     );
 }
@@ -616,6 +626,31 @@ fn getMsg(deps: Deps, arena: std.mem.Allocator, message_id: i64, stats: *GetMsgS
     return retried;
 }
 
+/// `get_msg.emoji_likes_list` 只告诉我们“有人点了 💤”及数量，不包含点击者。
+/// NapCat 的扩展 action `get_emoji_likes` 才返回 `emoji_like_list[].user_id`；这里
+/// 用它确认点击者就是发出 💤 锚点的管理员本人，普通群员不能替管理员触发跳过。
+fn sleepReactionConfirmed(
+    deps: Deps,
+    arena: std.mem.Allocator,
+    group_id: u64,
+    message_id: i64,
+    sender_uid: u64,
+) !bool {
+    const body = try std.fmt.allocPrint(
+        arena,
+        "{{\"group_id\":\"{d}\",\"message_id\":\"{d}\",\"emoji_id\":\"{s}\",\"emoji_type\":\"2\",\"count\":0}}",
+        .{ group_id, message_id, napcat.sleep_emoji_id },
+    );
+    const data = deps.nap.callData(arena, "get_emoji_likes", body) catch |e| {
+        std.log.warn(
+            "group {d}: could not verify who reacted 💤 to admin message {d}: {s}; treating it as an ordinary chat message",
+            .{ group_id, message_id, @errorName(e) },
+        );
+        return false;
+    };
+    return napcat.hasEmojiLikeFromUser(data, sender_uid);
+}
+
 /// 单个群这一轮该不该写它自己的 `hikari:lastrun:{group_id}`：只在这个群
 /// 本身成功（`ok == true`）时写。抽成独立函数，一是让 runOnce 的循环体
 /// 读起来是"扫、然后按结果决定写不写"这一步一步，二是让这条"失败的群不写、
@@ -639,7 +674,15 @@ fn applyLastRun(st: *store.Store, group_id: u64, ok: bool, run_at: i64) void {
 ///
 /// `clamped`（停机跨度超过 7 天回看上限）也在这里报警：那一段里的 💦
 /// 撤稿指令永久不可恢复，运营方需要知道是哪个群、丢了哪一段时间。
-fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64) i64 {
+fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_seconds: ?i64) i64 {
+    if (lookback_seconds) |seconds| {
+        std.log.info(
+            "group {d}: --last forces a {d}s lookback window; stored lastrun is not read for this run",
+            .{ group_id, seconds },
+        );
+        return run_at - seconds;
+    }
+
     const last_run = st.getLastRun(group_id) catch |e| blk: {
         std.log.warn(
             "group {d}: getLastRun failed ({s}); falling back to a fixed 24h window instead of the real catch-up span since last run",
@@ -667,7 +710,18 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64) i64 {
 /// 扫描窗口的起点逐群计算（`resolveWindowStart`），不在循环外算一次共用：
 /// `last_run` 本身就是逐群独立的状态，固定在循环外算等于假装所有群这一轮
 /// 该回看的跨度都一样——它们并不一样。
+pub const RunOptions = struct {
+    /// null = 正常从逐群 lastrun 接着扫；非 null = 本轮忽略 lastrun，强制
+    /// `[run_at-lookback_seconds, run_at)`。调用方在 CLI 层保证范围为 (0, 7d]。
+    lookback_seconds: ?i64 = null,
+};
+
+/// 原有入口保持不变，daemon、定时补跑和现有调用方全部继续按 lastrun 扫。
 pub fn runOnce(deps: Deps, run_at: i64) void {
+    runOnceWithOptions(deps, run_at, .{});
+}
+
+pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
     // design.md §7 要求这个 QQ 每轮只问一次、逐群逐 node 复用；放在两个 for
     // 循环之前，早于任何一个群的扫描。
     const bot_qq = fetchBotQq(deps);
@@ -688,7 +742,7 @@ pub fn runOnce(deps: Deps, run_at: i64) void {
         for (banner) |line| pushLine(a, &lines, gid, line);
         pushLine(a, &lines, gid, processing_line);
 
-        const win_start = resolveWindowStart(deps.st, gid, run_at);
+        const win_start = resolveWindowStart(deps.st, gid, run_at, options.lookback_seconds);
         const ok = scanGroup(deps, a, &lines, gid, win_start, run_at) catch |e| catch_blk: {
             const msg = failedLine(a, @errorName(e)) catch {
                 // 格式化 Failed 行本身失败（理论上只会是 arena 背后的 gpa
@@ -882,9 +936,10 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         if (try onebot.parseMessage(a, hop_data)) |parsed| try pool.append(a, parsed);
     }
 
-    // ---- 4. 逐条查被观察者消息的表情回应（✨ 与 🔥 共用同一次 get_msg，不额外调用）----
+    // ---- 4. 查表情回应（✨/🔥 共用 get_msg；管理员的单独 💤 也必须探测）----
     var star_ids: std.ArrayList(i64) = .empty;
     var fire_ids: std.ArrayList(i64) = .empty;
+    var sleep_reaction_ids: std.ArrayList(i64) = .empty;
     const probe_params: rules.Params = .{
         .observed_qqs = deps.observed_qqs,
         .admin_qqs = deps.admin_qqs,
@@ -896,20 +951,41 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     const probe_started_ms = std.time.milliTimestamp();
     var probed_count: usize = 0;
     for (window.items) |m| {
-        if (!probe_params.isObserved(m.user_id)) continue;
+        const observed = probe_params.isObserved(m.user_id);
+        const sleep_anchor = rules.sleepAnchor(m, probe_params);
+        // 配置了观察子集时管理员可能不在集合里；单独 💤 是控制锚点，仍必须
+        // 探测它的回应，否则这条命令会随配置不同而静默失效。
+        if (!observed and !sleep_anchor) continue;
         probed_count += 1;
         const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
-            std.log.warn("group {d}: star-reaction probe for message {d} failed", .{ gid, m.message_id });
+            std.log.warn("group {d}: reaction probe for message {d} failed", .{ gid, m.message_id });
+            // 控制效果必须以“本人回应已确认”为准。任何探针失败都按未确认
+            // 处理，让单独一句随手 💤 仍然只是普通聊天，不能反过来卡住本群。
             continue;
         };
         var matched = false;
-        if (napcat.hasStarReaction(data)) {
-            try star_ids.append(a, m.message_id);
-            matched = true;
+        if (observed) {
+            if (napcat.hasStarReaction(data)) {
+                try star_ids.append(a, m.message_id);
+                matched = true;
+            }
+            if (napcat.hasFireReaction(data)) {
+                try fire_ids.append(a, m.message_id);
+                matched = true;
+            }
         }
-        if (napcat.hasFireReaction(data)) {
-            try fire_ids.append(a, m.message_id);
+        if (napcat.hasSleepReaction(data)) {
             matched = true;
+            if (sleep_anchor) {
+                if (try sleepReactionConfirmed(deps, a, gid, m.message_id, m.user_id)) {
+                    try sleep_reaction_ids.append(a, m.message_id);
+                } else {
+                    std.log.info(
+                        "group {d}: admin message {d} has a 💤 reaction, but a reaction by its sender could not be confirmed; sleep command ignored",
+                        .{ gid, m.message_id },
+                    );
+                }
+            }
         }
         if (matched) continue;
         // design.md §3.3 要求把未匹配的 emoji_id 打进日志，README 线上假设 #4
@@ -918,8 +994,8 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         // 表情回应、且一个都没匹配上时打，避免给没有任何回应的消息刷屏。
         const seen = napcat.emojiIdsSummary(a, data) catch continue;
         if (seen.len > 0) std.log.info(
-            "group {d}: message {d} carries emoji reactions but none matched star_emoji_id={s} or fire_emoji_id={s}: {s}",
-            .{ gid, m.message_id, napcat.star_emoji_id, napcat.fire_emoji_id, seen },
+            "group {d}: message {d} carries emoji reactions but none matched star_emoji_id={s}, fire_emoji_id={s}, or sleep_emoji_id={s}: {s}",
+            .{ gid, m.message_id, napcat.star_emoji_id, napcat.fire_emoji_id, napcat.sleep_emoji_id, seen },
         );
     }
 
@@ -948,6 +1024,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     var outcome = try rules.classify(deps.gpa, window.items, pool.items, star_ids.items, fire_ids.items, .{
         .observed_qqs = deps.observed_qqs,
         .admin_qqs = deps.admin_qqs,
+        .sleep_reaction_ids = sleep_reaction_ids.items,
     });
     defer outcome.deinit(deps.gpa);
 
@@ -1022,7 +1099,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         //     "作者已离群"那个 bug 是同一个形状。
         skipped = outcome.candidates.len;
         std.log.info(
-            "group {d}: a 💤 sleep command was seen in this window — collecting nothing for this group this run; {d} candidate(s) counted as skipped. Revocations were still applied and lastrun still advances.",
+            "group {d}: an admin's standalone 💤 message was confirmed by the same admin's 💤 reaction — collecting nothing for this group this run; {d} candidate(s) counted as skipped. Revocations were still applied and lastrun still advances.",
             .{ gid, skipped },
         );
     } else if (attributed) {
@@ -1197,7 +1274,10 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         trouble.unattributed = outcome.candidates.len;
     }
 
-    const result = try resultLine(a, added, skipped);
+    const result = if (outcome.skip_collection)
+        try sleepResultLine(a, skipped)
+    else
+        try resultLine(a, added, skipped);
     pushLine(a, lines, gid, result);
 
     // 出过岔子就不能用 Successfully in Ns. 收尾——那是运营方唯一的"这次跑成功了"信号。
@@ -1254,6 +1334,16 @@ test "resultLine 处理 0/0" {
     try std.testing.expectEqualStrings("Added 0 messages, skipped 0 messages.", a);
 }
 
+test "sleepResultLine 保留稳定结果句并追加暂停原因" {
+    const gpa = std.testing.allocator;
+    const a = try sleepResultLine(gpa, 7);
+    defer gpa.free(a);
+    try std.testing.expectEqualStrings(
+        "Added 0 messages, skipped 7 messages. Collection paused by confirmed 💤 reaction.",
+        a,
+    );
+}
+
 test "successLine 格式：正常耗时、零耗时、负数被钳制到 0" {
     const gpa = std.testing.allocator;
 
@@ -1277,18 +1367,18 @@ test "probeSummaryLine 格式：正常用量、零探测、负耗时被钳制到
 
     const a = try probeSummaryLine(gpa, 55, 4700, 823000);
     defer gpa.free(a);
-    try std.testing.expectEqualStrings("group 55: probed 4700 message(s) for ✨/🔥 reactions in 823000ms", a);
+    try std.testing.expectEqualStrings("group 55: probed 4700 message(s) for ✨/🔥/💤 reactions in 823000ms", a);
 
     // 安静的一天（窗口里没有一条被观察的消息）也要打这一行——0 本身是有用
     // 的信息，不是只在"出事了"才值得报的那种警告。
     const b = try probeSummaryLine(gpa, 55, 0, 0);
     defer gpa.free(b);
-    try std.testing.expectEqualStrings("group 55: probed 0 message(s) for ✨/🔥 reactions in 0ms", b);
+    try std.testing.expectEqualStrings("group 55: probed 0 message(s) for ✨/🔥/💤 reactions in 0ms", b);
 
     // 负耗时（时钟被往回拨）钳制到 0，跟 successLine 同一个理由。
     const c = try probeSummaryLine(gpa, 55, 3, -1);
     defer gpa.free(c);
-    try std.testing.expectEqualStrings("group 55: probed 3 message(s) for ✨/🔥 reactions in 0ms", c);
+    try std.testing.expectEqualStrings("group 55: probed 3 message(s) for ✨/🔥/💤 reactions in 0ms", c);
 }
 
 test "failedLine 格式" {
@@ -1813,7 +1903,7 @@ test "resolveWindowStart：正常回补——窗口起点就是 Redis 里的 las
     defer c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(last_run, resolveWindowStart(&st, 100, run_at));
+    try std.testing.expectEqual(last_run, resolveWindowStart(&st, 100, run_at, null));
 }
 
 test "resolveWindowStart：Redis 里没有这个群的键（nil）→ 退化成固定 24h 窗口" {
@@ -1829,7 +1919,7 @@ test "resolveWindowStart：Redis 里没有这个群的键（nil）→ 退化成�
     defer c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at));
+    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null));
 }
 
 test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口，不让这个群直接崩" {
@@ -1847,7 +1937,7 @@ test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口�
     c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at));
+    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null));
 }
 
 test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clamped 的 warn 只影响日志，不影响返回值）" {
@@ -1868,7 +1958,26 @@ test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clampe
     defer c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - scheduler.max_lookback_seconds, resolveWindowStart(&st, 100, run_at));
+    try std.testing.expectEqual(run_at - scheduler.max_lookback_seconds, resolveWindowStart(&st, 100, run_at, null));
+}
+
+test "resolveWindowStart：--last 强制使用指定窗口且完全不读取 Redis lastrun" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const srv = try FakeServer.start(gpa, "");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    var st = store.Store.init(gpa, &c);
+
+    try std.testing.expectEqual(run_at - 3 * 3600, resolveWindowStart(&st, 100, run_at, 3 * 3600));
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expectEqual(@as(usize, 0), srv.received.items.len);
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,11 +2062,26 @@ const FakeNapcatServer = struct {
     replies: []const []const u8,
     bodies: std.ArrayList([]u8),
     gpa: std.mem.Allocator,
+    mutex: std.Thread.Mutex,
+    active_stream: ?std.net.Stream,
     stopped: bool,
 
     fn serve(self: *FakeNapcatServer) void {
         const conn = self.listener.accept() catch return;
-        defer conn.stream.close();
+        self.mutex.lock();
+        if (self.stopped) {
+            self.mutex.unlock();
+            conn.stream.close();
+            return;
+        }
+        self.active_stream = conn.stream;
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            self.active_stream = null;
+            self.mutex.unlock();
+            conn.stream.close();
+        }
         var rbuf: [8192]u8 = undefined;
         var wbuf: [8192]u8 = undefined;
         var sr = conn.stream.reader(&rbuf);
@@ -1986,6 +2110,8 @@ const FakeNapcatServer = struct {
             .replies = replies,
             .bodies = .empty,
             .gpa = gpa,
+            .mutex = .{},
+            .active_stream = null,
             .stopped = false,
         };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
@@ -1997,9 +2123,17 @@ const FakeNapcatServer = struct {
     }
 
     fn stop(self: *FakeNapcatServer) void {
-        if (self.stopped) return;
+        self.mutex.lock();
+        if (self.stopped) {
+            self.mutex.unlock();
+            return;
+        }
         self.stopped = true;
         self.listener.deinit();
+        if (self.active_stream) |stream| {
+            std.posix.shutdown(stream.handle, .both) catch {};
+        }
+        self.mutex.unlock();
         self.thread.join();
     }
 
@@ -2009,6 +2143,34 @@ const FakeNapcatServer = struct {
         self.gpa.destroy(self);
     }
 };
+
+test "FakeNapcatServer.stop：客户端少请求一次且仍存活时不会等死" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":42}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":43}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    _ = try nap.call(arena.allocator(), "get_msg", "{\"message_id\":42}");
+
+    // nap 及其池住的 keep-alive 连接此刻仍存活；第二条脚本回复不会被消费。
+    // stop 必须主动唤醒服务线程正在等待的 receiveHead，而不是等客户端先析构。
+    nap_srv.stop();
+
+    try std.testing.expectEqual(@as(usize, 1), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings("{\"message_id\":42}", nap_srv.bodies.items[0]);
+}
 
 test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里最后一个，合并转发确实发出去了" {
     const gpa = std.testing.allocator;
@@ -3106,6 +3268,43 @@ test "getMsg：第一次就成功——不重试，服务端只接到一次请�
     try std.testing.expectEqual(@as(usize, 1), nap_srv.bodies.items.len);
 }
 
+test "sleepReactionConfirmed：他人代点和身份接口失败都按未确认处理" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_like_list\":[{\"user_id\":\"30001\"}]}}",
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qqs = &.{},
+        .admin_qqs = &.{20001},
+        .group_ids = &.{},
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    try std.testing.expect(!try sleepReactionConfirmed(deps, ar.allocator(), 300, 2, 20001));
+    try std.testing.expect(!try sleepReactionConfirmed(deps, ar.allocator(), 300, 3, 20001));
+
+    nap_srv.stop();
+    try std.testing.expectEqual(@as(usize, 2), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":\"300\",\"message_id\":\"2\",\"emoji_id\":\"128164\",\"emoji_type\":\"2\",\"count\":0}",
+        nap_srv.bodies.items[0],
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 路径3 的 `✨ @某人 内容`（design.md §4.5 路径3）端到端：语录的**作者**
 // （`user_id` / `from_who` / `hikari:byuser:{user_id}`）是被 at 的那个人，
@@ -3225,8 +3424,131 @@ test "runOnce：✨ @某人 内容 → 作者是被 at 的人，creator 仍是�
     ) != null);
 }
 
+test "runOnce：✨ @某人 无正文 → 计 skipped 且即使带 ✨ 回应也不跌落路径1" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // GET lastrun(nil) → SET groupname → 空路径3候选仍依次过 tomb/index/
+    // chainmember 三道关卡 → 文本空关卡计 skipped → SET lastrun。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":8,\"user_id\":20001,\"time\":1700050000,\"message\":[" ++
+            "{\"type\":\"text\",\"data\":{\"text\":\"✨ \"}}," ++
+            "{\"type\":\"at\",\"data\":{\"qq\":\"50001\",\"name\":\"小明\"}}," ++
+            "{\"type\":\"text\",\"data\":{\"text\":\"   \"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        // 观察所有人时这条管理员消息也会走探针；特意让它带 ✨ 回应，钉死
+        // “路径3空候选赢过路径1”，不能把控制语法本身当语录正文收进去。
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{},
+        .admin_qqs = &.{20001},
+        .group_ids = &.{211},
+    };
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    try std.testing.expectEqual(@as(usize, 6), nap_srv.bodies.items.len);
+    const forward = nap_srv.bodies.items[5];
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "HSET") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:211") != null);
+}
+
 // ---------------------------------------------------------------------------
 // 💤（design.md §4.5.2）：作用域只到这一个群，撤稿照常执行，lastrun 照常前移。
+
+test "runOnce：裸 💤 锚点的 get_msg 两次失败也只是未确认，不阻塞群扫描" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // GET lastrun(nil) → SET groupname → SET lastrun。裸锚点不是候选，也没有
+    // 任何控制效果，因此不存在落库命令。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":2,\"user_id\":20001,\"time\":1700050100,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"💤\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        // get_msg 的首次请求和唯一一次重试都失败。这里绝不能把群判硬失败，
+        // 否则一句随手 💤 会让 lastrun 永远不前移、每轮反复卡在同一窗口。
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"普通聊天群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{20001},
+        .group_ids = &.{305},
+        .get_msg_retry_delay_ns = 0,
+    };
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings("{\"message_id\":2}", nap_srv.bodies.items[3]);
+    try std.testing.expectEqualStrings("{\"message_id\":2}", nap_srv.bodies.items[4]);
+    const forward = nap_srv.bodies.items[6];
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Collection paused") == null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:305") != null);
+}
 
 test "runOnce：💤 只让那一个群不收录，同一轮里的兄弟群照常入库" {
     const gpa = std.testing.allocator;
@@ -3247,8 +3569,9 @@ test "runOnce：💤 只让那一个群不收录，同一轮里的兄弟群照�
         gpa.destroy(redis_srv);
     }
 
-    // 12 次 NapCat 调用：get_login_info →
-    //   群 300：两页历史 → get_msg(1)（唯一的被观察者消息，带 ✨）→
+    // 14 次 NapCat 调用：get_login_info →
+    //   群 300：两页历史 → get_msg(1)（被观察者消息，带 ✨）→
+    //           get_msg(2)（锚点有 💤 回应）→ get_emoji_likes（本人确认）→
     //           get_group_info → 合并转发（**没有** get_group_member_info：
     //           跳过分支根本走不到解析作者名片那一步）
     //   群 301：两页历史 → get_msg(11) → get_group_info →
@@ -3262,6 +3585,8 @@ test "runOnce：💤 只让那一个群不收录，同一轮里的兄弟群照�
             "]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"128164\",\"emoji_type\":\"2\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_like_list\":[{\"user_id\":\"20001\",\"nick_name\":\"管理员\"}]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"睡觉群\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
         // --- 群 301 ---
@@ -3302,16 +3627,21 @@ test "runOnce：💤 只让那一个群不收录，同一轮里的兄弟群照�
     redis_srv.stop();
     nap_srv.stop();
 
-    try std.testing.expectEqual(@as(usize, 12), nap_srv.bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 14), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings("{\"message_id\":2}", nap_srv.bodies.items[4]);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":\"300\",\"message_id\":\"2\",\"emoji_id\":\"128164\",\"emoji_type\":\"2\",\"count\":0}",
+        nap_srv.bodies.items[5],
+    );
 
     // 💤 的群照样发七行，并且**如实**报出被跳过的条数——一个安静发不出东西
     // 的群跟一个死掉的服务在群里必须长得不一样。
-    const sleepy = nap_srv.bodies.items[5];
+    const sleepy = nap_srv.bodies.items[7];
     try std.testing.expect(std.mem.indexOf(u8, sleepy, "Added 0 messages, skipped 1 messages.") != null);
     try std.testing.expect(std.mem.indexOf(u8, sleepy, "Will process 2 messages.") != null);
     try std.testing.expect(std.mem.indexOf(u8, sleepy, "Successfully in ") != null);
 
-    const busy = nap_srv.bodies.items[11];
+    const busy = nap_srv.bodies.items[13];
     try std.testing.expect(std.mem.indexOf(u8, busy, "Added 1 messages, skipped 0 messages.") != null);
 
     const received = redis_srv.received.items;
@@ -3355,8 +3685,9 @@ test "runOnce：💤 的那一轮里 💦 撤稿照常执行，lastrun 照常前
         gpa.destroy(redis_srv);
     }
 
-    // 7 次 NapCat 调用：get_login_info → 两页历史 → get_msg(1) / get_msg(4)
-    // （两条被观察者的消息各探一次，都带 ✨）→ get_group_info → 合并转发。
+    // 9 次 NapCat 调用：get_login_info → 两页历史 → get_msg(1) / get_msg(4)
+    // （两条被观察者的消息各探一次，都带 ✨）→ get_msg(3)（锚点）→
+    // get_emoji_likes（本人确认）→ get_group_info → 合并转发。
     const nap_srv = try FakeNapcatServer.start(gpa, &.{
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
@@ -3369,6 +3700,8 @@ test "runOnce：💤 的那一轮里 💦 撤稿照常执行，lastrun 照常前
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"128164\",\"emoji_type\":\"2\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_like_list\":[{\"user_id\":20001}]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
     });
@@ -3400,8 +3733,8 @@ test "runOnce：💤 的那一轮里 💦 撤稿照常执行，lastrun 照常前
     redis_srv.stop();
     nap_srv.stop();
 
-    try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
-    const forward = nap_srv.bodies.items[6];
+    try std.testing.expectEqual(@as(usize, 9), nap_srv.bodies.items.len);
+    const forward = nap_srv.bodies.items[8];
     // id=1 被撤稿后从候选里剔除，只剩 id=4 一条候选，被 💤 计进 skipped。
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages.") != null);
     // 撤稿成功 → 没有 Trouble → 第七行仍然是 Successfully。
@@ -3454,6 +3787,8 @@ test "runOnce：管理员 💦 引用那条 💤 → 取消跳过，这一轮照
             "]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"128164\",\"emoji_type\":\"2\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_like_list\":[{\"user_id\":\"20001\"}]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"小李\",\"nickname\":\"li\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
@@ -3486,8 +3821,8 @@ test "runOnce：管理员 💦 引用那条 💤 → 取消跳过，这一轮照
     redis_srv.stop();
     nap_srv.stop();
 
-    try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
-    const forward = nap_srv.bodies.items[6];
+    try std.testing.expectEqual(@as(usize, 9), nap_srv.bodies.items.len);
+    const forward = nap_srv.bodies.items[8];
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
 
     const received = redis_srv.received.items;
