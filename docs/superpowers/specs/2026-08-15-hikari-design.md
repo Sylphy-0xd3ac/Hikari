@@ -550,7 +550,7 @@ Made with ❤️ by CuzTeam, AmethystDevs-Lab
 Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy
 Processing...
 Will process 1234 messages.
-Added 12 messages, skipped 34 messages.
+Added 12 messages, skipped 34 messages (existing 20, tombstoned 5, chain member 7, target missing 1, empty 1).
 Successfully in 87s.
 ```
 
@@ -558,6 +558,11 @@ Successfully in 87s.
 {d}s.` 里的秒数是这个群从 `scanGroup` 开始处理、到这一行成文为止的耗时，向下取整到整秒
 （负值/时钟跳变时钳制到 0）——只测这个群自己这一轮的处理时长，不是整个运行的总时长，也不
 包含 `resolveWindowStart` 那次 Redis 读。
+
+正常结果行括号里的五项逐项解释 `Y`：`existing` 是 `hikari:index` 已存在，`tombstoned` 是
+`hikari:tomb` 已作废，`chain member` 是消息已经归属某条持久化的 🔥 链，`target missing` 是候选
+找不到对应的原消息、无法渲染正文，`empty` 是渲染或剥离控制语法后的正文为空。五项之和必须逐字
+等于 `skipped Y`；所有项都输出（包括 0），让每次重扫的去重行为可以直接从群内日志审计。
 
 若 4.5.2 节的 💤 命令已由锚点发送者本人回应确认，结果行改为
 `Added 0 messages, skipped N messages. Collection paused by confirmed 💤 reaction.`。它保留同一组
