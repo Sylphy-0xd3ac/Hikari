@@ -140,6 +140,9 @@ fn importLine(
     from: []const u8,
     from_who: []const u8,
     group_id: u64,
+    /// 导入进来的这批语录算谁说的。只来自命令行必填的 `--user <qq>`，
+    /// 与 OBSERVED_QQS 的观察范围完全独立。
+    attribution_qq: u64,
     now: i64,
     summary: *Summary,
 ) !void {
@@ -169,7 +172,7 @@ fn importLine(
         .created_at = now,
         .message_id = mid,
         .group_id = group_id,
-        .user_id = deps.observed_qq,
+        .user_id = attribution_qq,
         .commit_from = "import",
     });
     defer runner.freeQuote(deps.gpa, q);
@@ -191,7 +194,7 @@ fn importLine(
 /// "这个群这一轮失败，下次/补跑再试"的退路，import 是一次性手工操作，没有
 /// 重跑窗口的概念，写出去的残缺归属字段就是永久的（design.md：入库后只能
 /// 被 💦 作废，没有编辑路径）。
-pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
+pub fn run(deps: runner.Deps, path: []const u8, attribution_qq: u64, now: i64) !Summary {
     const contents = try std.fs.cwd().readFileAlloc(deps.gpa, path, 64 * 1024 * 1024);
     defer deps.gpa.free(contents);
 
@@ -205,11 +208,12 @@ pub fn run(deps: runner.Deps, path: []const u8, now: i64) !Summary {
     const a = ar.allocator();
 
     const group_id = deps.group_ids[0];
+
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
-    const from_who = runner.observedCard(deps, a, group_id) orelse return error.AttributionUnavailable;
+    const from_who = runner.memberCard(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
 
     for (parsed.lines) |line| {
-        try importLine(deps, line, from, from_who, group_id, now, &summary);
+        try importLine(deps, line, from, from_who, group_id, attribution_qq, now, &summary);
     }
 
     return summary;
@@ -397,12 +401,15 @@ const FakeRedisServer = struct {
 /// 接受一条连接，在这条连接上依次收 `replies.len` 个 HTTP 请求、按顺序各
 /// 回一个预先写好的 JSON body——跟 napcat.zig「call 发出带 Bearer token
 /// 的 POST 请求」测试用的是同一套 std.http.Server 搭法，只是把单次请求-响应
-/// 循环了 replies.len 次，好覆盖 groupName + observedCard 两次调用。
+/// 循环了 replies.len 次，好覆盖 groupName + memberCard 两次调用。
 const FakeNapcatServer = struct {
     listener: std.net.Server,
     thread: std.Thread,
     replies: []const []const u8,
     gpa: std.mem.Allocator,
+    mutex: std.Thread.Mutex,
+    active_stream: ?std.net.Stream,
+    stopped: bool,
 
     fn serve(self: *FakeNapcatServer) void {
         // 一条连接、依次答完全部 replies——不是每条回复起一条新连接。
@@ -413,7 +420,20 @@ const FakeNapcatServer = struct {
         // 老老实实地在同一条连接上循环 receiveHead，模拟真实的 keep-alive
         // 服务端行为。
         const conn = self.listener.accept() catch return;
-        defer conn.stream.close();
+        self.mutex.lock();
+        if (self.stopped) {
+            self.mutex.unlock();
+            conn.stream.close();
+            return;
+        }
+        self.active_stream = conn.stream;
+        self.mutex.unlock();
+        defer {
+            self.mutex.lock();
+            self.active_stream = null;
+            self.mutex.unlock();
+            conn.stream.close();
+        }
         var rbuf: [8192]u8 = undefined;
         var wbuf: [8192]u8 = undefined;
         var sr = conn.stream.reader(&rbuf);
@@ -439,6 +459,9 @@ const FakeNapcatServer = struct {
             .thread = undefined,
             .replies = replies,
             .gpa = gpa,
+            .mutex = .{},
+            .active_stream = null,
+            .stopped = false,
         };
         self.thread = try std.Thread.spawn(.{}, serve, .{self});
         return self;
@@ -449,7 +472,13 @@ const FakeNapcatServer = struct {
     }
 
     fn stop(self: *FakeNapcatServer) void {
+        self.mutex.lock();
+        self.stopped = true;
         self.listener.deinit();
+        if (self.active_stream) |stream| {
+            std.posix.shutdown(stream.handle, .both) catch {};
+        }
+        self.mutex.unlock();
         self.thread.join();
         self.gpa.destroy(self);
     }
@@ -467,11 +496,13 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     const gpa = std.testing.allocator;
 
     // 两行输入：第一行是全新文本，走完整路径（isTombstoned / exists / nextId
-    // / HSET / ZADD / SADD）；第二行模拟"这条文本对应的合成 id 已经在库里"
-    // （isTombstoned=0, exists=1），代表重复运行 import 时第二次遇到同一行
-    // 会发生的事——deriveId 对同一段文本恒定输出同一个 id 已经在上面的纯
-    // 函数测试里钉住了，这里钉的是"exists 命中时 Store 层面确实会被挡下"。
-    const redis_script = ":0\r\n" ++ ":0\r\n" ++ ":1\r\n" ++ ":15\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":0\r\n" ++ ":1\r\n";
+    // / HSET / ZADD(bylen) / ZADD(byuser) / SADD）；第二行模拟"这条文本对应
+    // 的合成 id 已经在库里"（isTombstoned=0, exists=1），代表重复运行 import
+    // 时第二次遇到同一行会发生的事——deriveId 对同一段文本恒定输出同一个 id
+    // 已经在上面的纯函数测试里钉住了，这里钉的是"exists 命中时 Store 层面
+    // 确实会被挡下"。add() 现在多写一条 hikari:byuser 的 ZADD（见
+    // store.zig），脚本因此比改动前多一条 ":1\r\n"。
+    const redis_script = ":0\r\n" ++ ":0\r\n" ++ ":1\r\n" ++ ":15\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":0\r\n" ++ ":1\r\n";
     const redis_srv = try FakeRedisServer.start(gpa, redis_script);
     defer {
         redis_srv.stop();
@@ -497,7 +528,8 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 123456,
+        // import 的归属只由显式 --user 决定；观察全员时同样可导入。
+        .observed_qqs = &.{},
         .admin_qqs = &.{},
         .group_ids = &.{10001},
     };
@@ -507,7 +539,7 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     const path = try writeTempInput(gpa, &tmp, "新的一行文本\n已经入库过的文本\n");
     defer gpa.free(path);
 
-    const summary = try run(deps, path, 1_700_000_000);
+    const summary = try run(deps, path, 123456, 1_700_000_000);
 
     // 文件以 '\n' 结尾，splitScalar 会多切出一段末尾空段，所以 total_lines
     // 是 3（两条真实文本 + 一段末尾空段）、blank_skipped 是 1。
@@ -525,6 +557,7 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     // summary.added==1 钉不住 commit_from 有没有被正确改写成 "import"。
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "import") != null);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "新的一行文本") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:byuser:123456") != null);
     const want_id = try std.fmt.allocPrint(gpa, "{d}", .{deriveId("新的一行文本")});
     defer gpa.free(want_id);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, want_id) != null);
@@ -561,7 +594,7 @@ test "run 端到端：群归属解析不出来就整体中止，一条候选都�
         .gpa = gpa,
         .nap = &nap,
         .st = &st,
-        .observed_qq = 123456,
+        .observed_qqs = &.{123456},
         .admin_qqs = &.{},
         .group_ids = &.{10001},
     };
@@ -571,7 +604,7 @@ test "run 端到端：群归属解析不出来就整体中止，一条候选都�
     const path = try writeTempInput(gpa, &tmp, "这一行永远不该被写进去\n");
     defer gpa.free(path);
 
-    try std.testing.expectError(error.AttributionUnavailable, run(deps, path, 1_700_000_000));
+    try std.testing.expectError(error.AttributionUnavailable, run(deps, path, 123456, 1_700_000_000));
 
     c.deinit();
     redis_srv.stop();

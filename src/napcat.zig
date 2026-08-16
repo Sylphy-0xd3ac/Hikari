@@ -6,6 +6,18 @@ pub const star_emoji_id = "10024";
 /// 数值形式由字符串形式在 comptime 推导，两者不可能漂移。
 const star_emoji_id_num: i64 = std.fmt.parseInt(i64, star_emoji_id, 10) catch unreachable;
 
+/// 🔥 = U+1F525，同样以十进制码点做 emoji_id。用于"链式收录"：被观察者把一句话
+/// 拆成几条发，群友额外贴 🔥（在 ✨ 之外）标记它们应当拼成一条语录。
+pub const fire_emoji_id = "128293";
+/// 数值形式由字符串形式在 comptime 推导，两者不可能漂移——同 star_emoji_id_num
+/// 一样，这个模式此前真的漂移过一次。
+const fire_emoji_id_num: i64 = std.fmt.parseInt(i64, fire_emoji_id, 10) catch unreachable;
+
+/// 💤 = U+1F4A4 = 十进制 128164。管理员发一条只有 💤 的消息、再由本人给这条
+/// 消息点一个 💤 表情回应，才构成“这个群这一轮不收录”的双重确认。
+pub const sleep_emoji_id = "128164";
+const sleep_emoji_id_num: i64 = std.fmt.parseInt(i64, sleep_emoji_id, 10) catch unreachable;
+
 pub const Error = error{
     NapCatError,
     BadResponse,
@@ -13,9 +25,9 @@ pub const Error = error{
     RequestFailed,
 };
 
-/// 在 get_msg 的 data 里判断有没有 ✨ 表情回应。
-/// emoji_id 可能是字符串也可能是数字；likes_cnt 缺省视为 1。
-pub fn hasStarReaction(data: std.json.Value) bool {
+/// hasStarReaction / hasFireReaction 共用的判定逻辑：emoji_id 可能是字符串也可能是
+/// 数字；likes_cnt 缺省视为 1。
+fn hasReaction(data: std.json.Value, id_str: []const u8, id_num: i64) bool {
     const obj = switch (data) {
         .object => |o| o,
         else => return false,
@@ -31,12 +43,53 @@ pub fn hasStarReaction(data: std.json.Value) bool {
         };
         const idv = io.get("emoji_id") orelse continue;
         const matches = switch (idv) {
-            .string => |s| std.mem.eql(u8, s, star_emoji_id),
-            else => if (onebot.asInt(idv)) |n| n == star_emoji_id_num else false,
+            .string => |s| std.mem.eql(u8, s, id_str),
+            else => if (onebot.asInt(idv)) |n| n == id_num else false,
         };
         if (!matches) continue;
         const cnt = if (io.get("likes_cnt")) |cv| (onebot.asInt(cv) orelse 1) else 1;
         if (cnt > 0) return true;
+    }
+    return false;
+}
+
+/// 在 get_msg 的 data 里判断有没有 ✨ 表情回应。
+pub fn hasStarReaction(data: std.json.Value) bool {
+    return hasReaction(data, star_emoji_id, star_emoji_id_num);
+}
+
+/// 在 get_msg 的 data 里判断有没有 🔥 表情回应。跟 hasStarReaction 读的是同一个
+/// get_msg 响应体，不需要额外调用。
+pub fn hasFireReaction(data: std.json.Value) bool {
+    return hasReaction(data, fire_emoji_id, fire_emoji_id_num);
+}
+
+/// 在 get_msg 的 data 里判断有没有 💤 表情回应。这里只确认“至少有人点过”；
+/// 回应者是谁要再用 NapCat 的 `get_emoji_likes` 查询，见 hasEmojiLikeFromUser。
+pub fn hasSleepReaction(data: std.json.Value) bool {
+    return hasReaction(data, sleep_emoji_id, sleep_emoji_id_num);
+}
+
+/// `get_emoji_likes` 的 data 形如
+/// `{ "emoji_like_list": [{ "user_id": "123", ... }] }`。NapCat 推荐 ID 用
+/// 字符串，但兼容层和既有 get_msg 一样也接受数字，避免部署版本差异让确认命令
+/// 静默失效。
+pub fn hasEmojiLikeFromUser(data: std.json.Value, user_id: u64) bool {
+    const obj = switch (data) {
+        .object => |o| o,
+        else => return false,
+    };
+    const list = switch (obj.get("emoji_like_list") orelse return false) {
+        .array => |a| a,
+        else => return false,
+    };
+    for (list.items) |item| {
+        const like = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const uid = onebot.asInt(like.get("user_id") orelse continue) orelse continue;
+        if (uid >= 0 and @as(u64, @intCast(uid)) == user_id) return true;
     }
     return false;
 }
@@ -212,6 +265,85 @@ test "hasStarReaction 缺省 likes_cnt 按 1 计（视为存在但未计数）" 
     const a = ar.allocator();
     const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"10024\"}]}");
     try std.testing.expect(hasStarReaction(v));
+}
+
+test "hasFireReaction 识别 🔥 表情回应，与 ✨ 互不干扰" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const both = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"10024","emoji_type":"2","likes_cnt":1},
+        \\                     {"emoji_id":"128293","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(hasStarReaction(both));
+    try std.testing.expect(hasFireReaction(both));
+
+    const star_only = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"10024","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(hasStarReaction(star_only));
+    try std.testing.expect(!hasFireReaction(star_only));
+
+    const fire_only = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"128293","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(!hasStarReaction(fire_only));
+    try std.testing.expect(hasFireReaction(fire_only));
+
+    const neither = try parseVal(a, "{\"emoji_likes_list\":[]}");
+    try std.testing.expect(!hasFireReaction(neither));
+}
+
+test "hasFireReaction 接受数字形式的 emoji_id" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":128293}]}");
+    try std.testing.expect(hasFireReaction(v));
+}
+
+test "hasFireReaction 忽略 likes_cnt 为 0 的条目" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const v = try parseVal(a, "{\"emoji_likes_list\":[{\"emoji_id\":\"128293\",\"likes_cnt\":0}]}");
+    try std.testing.expect(!hasFireReaction(v));
+}
+
+test "hasSleepReaction 识别 💤 表情回应且不与 ✨/🔥 混淆" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const sleep_only = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":"128164","emoji_type":"2","likes_cnt":1}]}
+    );
+    try std.testing.expect(hasSleepReaction(sleep_only));
+    try std.testing.expect(!hasStarReaction(sleep_only));
+    try std.testing.expect(!hasFireReaction(sleep_only));
+
+    const zero = try parseVal(a,
+        \\{"emoji_likes_list":[{"emoji_id":128164,"likes_cnt":0}]}
+    );
+    try std.testing.expect(!hasSleepReaction(zero));
+}
+
+test "hasEmojiLikeFromUser 从 get_emoji_likes 结果核对点击者，兼容字符串和数字 ID" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+
+    const data = try parseVal(a,
+        \\{"emoji_like_list":[
+        \\  {"user_id":"20001","nick_name":"管理员"},
+        \\  {"user_id":30001,"nick_name":"群员"}
+        \\]}
+    );
+    try std.testing.expect(hasEmojiLikeFromUser(data, 20001));
+    try std.testing.expect(hasEmojiLikeFromUser(data, 30001));
+    try std.testing.expect(!hasEmojiLikeFromUser(data, 40001));
+    try std.testing.expect(!hasEmojiLikeFromUser(try parseVal(a, "{}"), 20001));
 }
 
 test "emojiIdsSummary 列出全部 emoji_id 与计数（首次实跑核对 star_emoji_id 用）" {

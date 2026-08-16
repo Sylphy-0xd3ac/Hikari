@@ -1,45 +1,119 @@
 # Hikari
 
-Hikari 是一个用 Zig 写的常驻进程：每天定时扫描指定 QQ 群的历史消息，把群友认可的话收录成语录存进
-Redis，再通过一个与 [Hitokoto 一言 API](https://developer.hitokoto.cn/sentence/) 兼容的 HTTP
-接口随机吐出来。上游依赖 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的 HTTP 接口（OneBot 11 +
-NapCat 扩展）。
+Hikari 是一个用 Zig 写的常驻进程，零第三方依赖。每天定时扫描指定 QQ 群的历史消息，把群友用 ✨ 认可
+（或管理员手动补录）的话收进 Redis，再通过一个与 [Hitokoto 一言 API](https://developer.hitokoto.cn/sentence/)
+兼容的 HTTP 接口随机吐出来。扫描结果会以一条合并转发消息发回群里当运行日志。上游依赖
+[NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的 HTTP 接口（OneBot 11 + NapCat 扩展）。
 
-完整设计（NapCat 接口细节、message_id 的哈希性质与 LRU 反查限制、扫描窗口与翻页算法、字段映射等）见
-[`docs/superpowers/specs/2026-08-15-hikari-design.md`](docs/superpowers/specs/2026-08-15-hikari-design.md)。
-本文档只覆盖运行一个实例所需的信息。
+## 快速开始
 
-## 三条收录路径与 💦 作废规则
+需要 Zig 0.15.2、一个可用的 Redis、一个已经登录好目标账号的 NapCat 实例。
 
-每天 `SCAN_TIME` 触发一次，扫描窗口 `[上次这个群成功扫描的时刻, 这次触发时刻)`——窗口起点逐群
-独立、按各自的 `hikari:lastrun:{group_id}` 算，不是固定回看 24 小时；首次运行（没有基线）时
-退化成 `[触发时刻 - 24h, 触发时刻)`。跨度超过 7 天会截断并打警告，详见「构建与运行」一节。
-命中以下任一路径即成为候选：
+```bash
+# 构建（生产用 ReleaseSafe：见下方「构建」一节）
+zig build -Doptimize=ReleaseSafe
 
-1. **直接表情回应**：被观察者（`OBSERVED_QQ`）发的消息被贴了 ✨ 表情回应 → 候选是那条消息本身。
-2. **引用 ✨**：别人引用被观察者的一条消息，除引用外只回一个 `✨` → 候选是被引用的那条消息。
-3. **管理员手动收录**：管理员（`ADMIN_QQS` 之一）发一条不含引用、以 `✨` 开头的消息 → 候选是这条消息，
-   正文取 `✨` 之后的部分。
+# 配置
+cp .env.example .env
+# 编辑 .env，填入 NapCat/Redis 的真实地址与目标群号
 
-三条路径互不冲突时按 `message_id` 去重；被观察者本人若同时是管理员，路径 3 优先于路径 1（详见设计文档
-§4.5.1）。
+# 起 daemon：HTTP 服务 + 每日定时扫描
+./zig-out/bin/hikari
 
-**💦 作废**：管理员引用一条消息、除引用外只回 `💦`（trim 后恰为 `💦`），且被引用的消息是「被观察者发的」
-或「符合路径 3 格式的管理员消息」，就把该消息对应的语录从 Redis 删除并写入 tombstone 集合
-（`hikari:tomb`）。tombstone 永久生效——之后任何一次扫描再次看到这条消息都不会重新入库，
-这样跨扫描窗口的 💦 也能作废前几天已经收录的语录。作废判定（Pass A）先于收录判定（Pass B）执行，且落盘
-先于收录：同一次扫描里先处理完所有作废，再处理收录。
+# 另开一个终端验证
+curl 'http://127.0.0.1:8080/'
+```
+
+任一必填环境变量缺失或格式非法，进程启动即打印具体是哪一个变量并以非零状态退出，不会带着半残
+配置起来。
+
+## 收录规则
+
+每天 `SCAN_TIME`（本地时区）触发一次扫描，窗口起点是这个群上次成功扫描的时刻，不是固定回看
+24 小时；首次运行没有基线时退化为 `[触发时刻 − 24h, 触发时刻)`。命中以下任一路径即成为候选：
+
+| 路径 | 触发条件 | 收录内容 |
+|---|---|---|
+| 1. 直接表情回应 | 被观察者（`OBSERVED_QQS`；留空表示观察所有人）发的消息被贴了 ✨ 表情回应 | 那条消息本身 |
+| 2. 引用 ✨ | 别人引用被观察者的一条消息，除引用外只回一个 `✨` | 被引用的那条消息 |
+| 3. 管理员手动收录 | 管理员（`ADMIN_QQS` 之一）发一条不含引用、以 `✨` 开头的消息 | `✨` 之后的正文；写成 `✨ @某人 内容` 时作者记在被 at 的那个人名下 |
+| 4. 🔥 链式收录 | 一段**不间断**带 🔥 的消息里，被观察者同时带 ✨ 和 🔥 的那几条（≥2 条、同一个人）| 那几条按时间顺序拼成一条，用空格连接 |
+
+优先级：**已确认的 💤 > 路径 4 > 路径 3 > 路径 1**。路径 3 优先于路径 1，因为它是更具体的「作者本人手动指定」
+信号；路径 4 优先于路径 3 和路径 1，因为它是一个分组信号——「这几条消息是同一句话」这件事，没有
+别的路径能表达。已确认的 💤（见下）不是「又一条路径」，它是一道更前置的闸门：路径 1–4 回答「这条消息该不该
+被收录」，💤 回答「这个群这一轮要不要落库」。
+
+**`✨ @某人 内容`：管理员补录别人说过的话**。路径 3 的可选语法，向后兼容：
+
+```
+✨ @某人 内容   → 作者（from_who / ?user_id=）= 被 at 的那个人，正文 = 内容
+✨ 内容         → 不变：作者 = 敲这条指令的管理员
+```
+
+管理员补录的本来就多半是**别人**说过的话，而改动之前作者被记成了管理员自己，`/?user_id=` 因此永远
+查不到手动补录的语录归在真正说这句话的人名下。两条规则：**只有紧跟 `✨` 的那个 at 是作者标记**
+（`✨ 你好 @某人` 里的 at 是普通正文，照常渲染成 `@昵称`；作者标记之后再出现的 at 同样是普通正文）；
+**`creator`/`creator_uid` 仍然是那位管理员**——Hitokoto 语义下 creator 是「把这条语录加进来的人」，
+跟「说这句话的人」是两回事。被 at 的人不要求在 `OBSERVED_QQS` 里（管理员是在显式断言作者）；
+`✨ @某人` 后面没有正文时仍形成一条路径 3 候选：作者标记会被剥掉，候选在「正文为空」关卡计入
+`skipped`；它不会跌回路径 1。光杆 `✨` 保持旧行为，不形成候选。这保证路径优先级与日志计数都诚实。
+
+**🔥 链的两种角色**：🔥 的含义是"这条消息和下一条属于同一句话"，🔥 必须构成一段**不间断**的连续
+标记——走到第一条没有 🔥 的消息，这一段就结束（没有"最多隔几条"这种间距上限，那是旧规则）。段里
+的消息分两种：**内容**（✨ + 🔥 + 作者是被观察者）的正文进语录；**桥**（带 🔥 但不是内容）的正文
+**不**进语录，它只表示"这句话还没说完"，而且**可以是任何人发的**——桥的全部意义就是让一条链跨过
+别人的插话。一条链的内容消息必须同属一个人（作者由第一条内容消息确定；中途冒出另一个被观察者的
+内容消息就在那里断开、由它另起一条链），且至少两条，否则不成链、退回路径 1。
+
+**💦 作废**：管理员引用一条消息、除引用外只回 `💦`，且被引用的消息符合路径 1 或路径 3，就把对应
+语录从 Redis 删除并永久 tombstone——之后任何一次扫描再次看到这条消息都不会重新入库。💦 引用到
+🔥 链上任意一个**内容成员**都会作废整条链，全部内容成员都会被 tombstone，不只是被引用的那一条；
+💦 引用一座**桥不**作废这条链（桥的正文一个字都没进这条语录，而且它可以是任何人发的——把"恰好被
+贴了 🔥"变成"可以撤掉别人的语录"是一条谁都能踩到的越权路径），退化成对桥自己的一次普通撤稿。
+
+**💦 引用那条 `✨` 也算**：路径 2 收录的语录，主键是**被引用的原消息**，但管理员在群里翻记录时看得见
+的是第三方发的那条 `✨`——它就贴在原消息下面，是「这条被收录了」唯一的可见痕迹。所以 💦 的目标若
+本身是一条路径 2 的 `✨` 触发消息（含引用、除引用外只有一个 `✨`，且发送者不是原消息作者），就**多解析一跳**，撤掉那条 `✨`
+引用的消息，然后所有既有规则（含 🔥 链展开）原样适用。只跳一次；跳到的东西解析不出来、或本身不是
+一个可作废的目标时，跟改动之前一样什么都不发生。
+
+**💤 今天先不收**：管理员先发一条**只有 💤** 的消息（不含引用、没有别的段、trim 之后逐字节等于 `💤`，
+`💤💤` / `睡了💤` / `💤 明天见` 都不算）作为锚点，再由**发锚点的同一个管理员本人**给这条消息点一个
+💤 QQ 表情回应，才算确认：**这个群**这一轮一条都不收录。单独发出锚点没有任何效果，别人代点 💤 也
+不算；`get_msg` / `get_emoji_likes` 暂时核验失败也按未确认处理，不能让一句随手 💤 卡住扫描。其它群不受影响；这个群照样扫、照样发它那条七行合并转发，结果行会明确说明因已确认的 💤 命令
+暂停，并把全部候选如实计进 `skipped`（`Added 0 messages, skipped N messages. Collection paused by confirmed 💤 reaction.`）——一个安静发不出东西
+的群，跟一个死掉的服务，在群里必须长得不一样。**💦 撤稿照常执行**（💤 的意思是「今天别加东西」，
+不是「忽略撤稿」），**`lastrun` 照常前移**（不前移的话下一次触发会重扫同一个窗口、看到同一条已确认的
+💤、再跳过一次，是个自我持续的永久停摆）。反悔了就用 💦 引用那条锚点消息，本轮照常收录。
+
+**归属（`from` / `from_who`）**：`from` 是群名，`from_who` 是**语录作者自己**的群名片
+（不是固定的某一个人）——`OBSERVED_QQS` 允许留空表示"观察所有人"，一个群不再有唯一的"那个
+被观察者"可以整群问一次名片，改成按候选各自的作者查、每次扫描内按作者缓存（同一个人一天说好
+几句只问一次）。这两者都是**渲染时解析**的：语录入库时把当时问到的名字写进 hash 当快照，同时
+把最新值刷新进 `hikari:username:{user_id}` / `hikari:groupname:{group_id}`；下次有人改名或群改
+名，只要这个人 / 这个群后续还被扫描到，`GET /` 之类的接口会优先用这两个键的实时值覆盖 hash 里
+的旧快照，一次改名就能反映到这个人说过的全部历史语录，不需要逐条改写。这两个键缺失时（导入的
+语录、从未被扫描到过的作者、已经离群且从未刷新成功过）落回 hash 里存的快照。管理员手动收录
+（路径 3）额外把 `creator`/`creator_uid` 覆盖成那位管理员自己的信息，而不是其余三条路径固定的
+`"Hikari"`/`0`；用了 `✨ @某人 内容` 语法时 `from_who` 是被 at 的作者、`creator` 仍是管理员，两个人
+的 `hikari:username:{qq}` 都会在这一轮刷新。
 
 ## 环境变量
 
-复制 [`.env.example`](.env.example) 为 `.env` 并填入真实值。任一必填项缺失或格式非法，进程启动即打印
-具体是哪一个变量并以非零状态退出——不会带着半残配置起来。
+复制 `.env.example` 为 `.env` 并填入真实值。Hikari 会自动读取**当前工作目录**下的 `.env`，无需先
+`source`；文件不存在也不报错，只要真正的进程环境已经给齐配置。优先级固定为
+**进程环境变量 > `.env`**，因此 systemd `EnvironmentFile`、容器注入或命令行临时覆盖都能压过文件值。
+
+`.env` 支持空行、`#` 注释、可选的 `export` 前缀，以及单双引号包住的值。值里含空白、`#` 或 shell
+元字符时应加引号；外层引号会被剥掉，反斜杠保持字面量。它不是 shell，**不会展开** `$VAR` 或
+`${VAR}`，避免同一份配置随启动进程的其它变量悄悄改变含义。文件语法错误时配置项会报为 `.env`。
 
 | Env | 必填 | 说明 | 示例 |
 |---|---|---|---|
 | `NAPCAT_HTTP_URL` | 是 | NapCat HTTP 接口 base URL | `http://127.0.0.1:3000` |
 | `NAPCAT_TOKEN` | 是 | NapCat access token，以 `Authorization: Bearer <token>` 发送 | |
-| `OBSERVED_QQ` | 是 | 被观察的 QQ 号 | `10001` |
+| `OBSERVED_QQS` | 否 | 被观察的 QQ 号，逗号分隔；留空 = 观察所有人 | `10001,10002` |
 | `QQ_GROUP_IDS` | 是 | 逗号分隔的目标群号，扫描与日志都作用于这些群 | `123456,789012` |
 | `ADMIN_QQS` | 是 | 逗号分隔的管理员 QQ 号 | `20001,20002` |
 | `SCAN_TIME` | 是 | 每日扫描时刻，24 小时制 `HH:MM`，本地时区 | `03:00` |
@@ -47,82 +121,93 @@ NapCat 扩展）。
 | `HTTP_PORT` | 是 | 一言服务监听端口 | `8080` |
 | `REDIS_URL` | 是 | `redis://[:password@]host:port/db` | `redis://127.0.0.1:6379/0` |
 
-## 构建与运行
+## CLI
 
-Zig 版本固定 0.15.2。
+| 命令 | 行为 |
+|---|---|
+| `hikari` | 常驻：起 HTTP 服务 + 每日定时扫描 |
+| `hikari run` | 立刻执行一次扫描后退出，不起 HTTP 服务；窗口计算、`lastrun` 写回都跟定时路径完全一致 |
+| `hikari run --last <时长>` | 忽略本次窗口起点的 `lastrun`，强制重扫最近一段时间；支持正整数 `m`/`h`/`d`，最大 `7d` |
+| `hikari import --user <qq> <file>` | 从换行分隔的文本文件批量导入语录；`--user` 必填，全部导入内容明确归到这个 QQ 名下 |
+| `hikari reindex` | 把 `hikari:index` 里已有的语录逐条补进作者维度的索引 `hikari:byuser:{user_id}`，然后退出。幂等、可重复跑；只读语录 hash，绝不创造或改动语录。只有显式敲这条命令才会跑——启动、定时扫描、HTTP 读路径都不碰它 |
 
 ```bash
-# 构建（生产用 ReleaseSafe：保留边界检查，去掉调试断言）
-zig build -Doptimize=ReleaseSafe
-
-# 跑测试
-zig build test
-
-# 运行
-set -a && source .env && set +a
-./zig-out/bin/hikari
+./zig-out/bin/hikari run
+./zig-out/bin/hikari run --last 24h
+./zig-out/bin/hikari import --user 10001 seed.txt
+./zig-out/bin/hikari reindex
 ```
 
-进程内部开两条独立的 Redis 连接：一条给 HTTP 服务用，一条给每日扫描用。两者各自持有自己的连接，不跨
-线程共享——`redis.Client` 内部的 reader/writer 持有指向自身的指针，`Store` 的锁只保护单个 `Store`
-对自己那条连接的访问，并不能让一条连接被多个线程安全共享。HTTP 服务跑在一个 detached 线程上；主线程
-跑每日调度循环，持有进程生命周期。
+`run --last` 是补漏/重扫入口。例如 `--last 1h`、`--last 3h`、`--last 24h` 分别强制使用
+`[现在−1h, 现在)`、`[现在−3h, 现在)`、`[现在−24h, 现在)`，但不删除 Redis 里的进度。
+已有语录会被 `hikari:index` 去重，已作废消息会被 `hikari:tomb` 拦住，已经属于 🔥 链的成员也不会
+被拆开重复收录；因此它只补进窗口内尚未入库的候选。成功后仍把 `lastrun` 前移到本次的 `now`，
+下一轮定时扫描继续正常衔接。
 
-每条连接都能自愈：遇到传输层失败（socket 断开、读写失败、协议错乱、接收超时）会自动重连并把这条命令
-**重试一次**，第二次仍失败才把错误交出去。所以 Redis 重启、空闲超时、NAT 连接跟踪过期都不需要重启
-Hikari。扫描线程一天里有约 23.99 小时是闲着的，这条路径实际上每天都会被走到。重连时会重新执行
-`AUTH` / `SELECT`，并整个丢弃读缓冲——半条没读完的回复留在缓冲里会让之后每一条回复都错位一格，那是
-静默的数据错误。代价是一条已经被服务端执行过的命令可能被重放一次；本仓库里唯一非幂等的命令是
-`INCR hikari:seq`，重放只是白烧一个 id（`id` 允许有空洞）。
-
-每条连接的 socket 上还带了 `SO_RCVTIMEO`（`redis.Client.recv_timeout_s`，默认 30 秒）：一个接受了
-TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙——它只在内核报传输层错误时才触发，卡住
-的连接内核什么错都不会报。有了这个超时，卡住的读最多阻塞 30 秒就会失败，走上面同一条自愈路径。
-
-调度循环每一轮都会重新计算一次本地时区相对 UTC 的偏移（`scheduler.localOffsetSeconds`），而不是在循环
-外算一次复用——夏令时切换会改变这个偏移，进程一次起来常常要跑几个月，缓存旧偏移会导致跨越 DST 边界之后
-触发时刻整体偏移一小时。
-
-扫描窗口起点逐群独立、按各自的 `hikari:lastrun:{group_id}` 算（见「三条收录路径与 💦 作废规则」一节），
-不是固定回看 24 小时，所以夏令时「回拨」那种本地一天长达 25 小时的日子，窗口也会自然覆盖到完整的
-25 小时，不会像固定 24h 窗口那样把最早的 1 小时截掉。跨度超过 7 天（`scheduler.max_lookback_seconds`）
-会截断到 7 天并打警告，点名是哪个群、丢了哪一段——截断掉的那部分不会再被任何一次扫描覆盖到，其中的
-💦 撤稿指令因此永久不可恢复。
-
-进程重启时会额外判断「今天该跑的时刻是否已经过去但还没跑」（`missedRun`），逐群判断（每个群各自的
-`hikari:lastrun:{group_id}`，见下方键结构）：只要有一个群漏跑，就立即用最早的那个漏跑时刻补跑一次；
-已经跟上的群这时候拿到的是空窗口（`last_run >= run_at`），不会再做任何多余的重扫。某个群首次启动
-没有基线（它自己的 `hikari:lastrun:{group_id}` 不存在），这个群的补跑判断直接跳过，等下一个正常
-触发时刻——这个群自己那次会退化成固定 24h 窗口。
-
-一个群这一轮里出岔子（作废没落盘、语录没入库、归属信息问不出来）不会写它自己的 `hikari:lastrun:{group_id}`，
-所以它不需要等到进程重启：下一次正常触发时，窗口起点仍然停在上一次成功的位置，会自动把漏掉的这段（含
-其中的 💦 撤稿）重新覆盖到，直到 7 天回看上限。
+`import --user` 不再从 `OBSERVED_QQS` 猜作者：观察多人时不存在唯一答案，观察所有人时更没有可猜的
+值。命令使用 `QQ_GROUP_IDS` 的第一个群取得群名和该 QQ 的群名片；任一归属信息取不到就整次失败、
+一条也不写。重复导入同一正文仍然幂等，已存在或已 tombstone 的行会如实计入摘要。
 
 ## HTTP 接口
 
-`GET /`，返回随机一条语录，参数遵循 Hitokoto 规范：
+**`GET /`** —— 返回随机一条语录，参数遵循 Hitokoto 规范：
 
 | 参数 | 支持情况 |
 |---|---|
 | `encode` | `json`（默认）/ `text` / `js` |
-| `min_length` | 支持，走 `hikari:bylen` 有序集合 |
-| `max_length` | 支持，走 `hikari:bylen` 有序集合 |
-| `callback` | 支持，存在时输出 JSONP：`{callback}({json})`，Content-Type 为 `application/javascript`。回调名只接受 `[A-Za-z0-9_$.]`，拒绝其他字符以防 JSONP 注入 |
+| `min_length` / `max_length` | 支持，按语录长度（UTF-8 码点数）过滤 |
+| `user_id` | 支持，按作者（QQ 号）过滤，可与 `min_length`/`max_length` 组合；非法值（非数字/负数/溢出）→ 400 |
+| `callback` | 支持，存在时输出 JSONP：`{callback}({json})`，回调名只接受 `[A-Za-z0-9_$.]` |
 | `select` | 支持，`encode=js` 时的 DOM 选择器，默认 `.hitokoto` |
-| `c` | **接受但忽略**——全库只有一个类型，`type` 恒为 `"g"` |
-| `charset` | **仅支持 `utf-8`**（大小写不敏感，`utf8` / `utf-8` 均可）。传其他值返回 400。这是一处明确、有意的规范偏离：GBK 转码需要内嵌一张完整码表，为一个自用接口引入这个体积不划算 |
+| `charset` | 仅支持 `utf-8`（大小写不敏感），其他值返回 400——本库没有内嵌 GBK 码表 |
+| `c` | 接受但忽略——全库只有一个类型，`type` 恒为 `"g"` |
 
-**响应形态**
+错误：库空 / 过滤（长度和/或 `user_id`）后无结果 → 404；参数非法（`charset` 非 utf-8、
+`min_length` > `max_length`、数字解析失败、`callback` 非法、`user_id` 非法）→ 400；方法非 `GET`
+→ 405；Redis 不可用 → 500。均为 JSON 错误体。
 
-- `encode=json`：`Content-Type: application/json; charset=utf-8`，返回完整字段对象
-- `encode=text`：`Content-Type: text/plain; charset=utf-8`，只返回 `hitokoto` 正文
-- `encode=js`：`Content-Type: application/javascript; charset=utf-8`，返回把正文写入 `select` 选中
-  元素的自执行脚本
+**`hikari reindex` 跑之前，`/?user_id=` 对整个存量语录库都是空的**：136 条历史语录早于按作者
+过滤的索引（`hikari:byuser`，见下）存在，从未被补进这份索引；而它们**同属一个作者**，所以这不是
+"部分作者查不到"，是这个参数对上线前的**全部**语录一律返回"这个人没有语录"（404）——即使
+`GET /`（不带 `user_id`）明明能随机到它们。跑一次 `hikari reindex` 即可修复，详见 Redis 键结构
+一节 `hikari:byuser` 的说明。
 
-**错误**：库空 / 长度过滤后无结果 → 404；`charset` 非 `utf-8`、`min_length` > `max_length`、参数非
-数字、`callback` 非法 → 400；路径非 `/` → 404；方法非 `GET` → 405；Redis 不可用 → 500。均为 JSON
-错误体。
+**`GET /extra/all`** 与 **`GET /extra/batch/:count`** 是超出 Hitokoto 协议范围的自定义扩展，落在
+`/extra/` 前缀下，响应是一个 JSON 数组。除 `select`（被接受但忽略，`encode=js` 在这两个端点上不
+支持，`select` 没有对应的用武之地）外，其余参数都跟 `/` 同构：
+
+| 参数 | 支持情况 |
+|---|---|
+| `user_id` | 按作者过滤，同 `/` |
+| `min_length` / `max_length` | 按语录长度过滤，同 `/` |
+| `encode=json`（默认）| `[{完整对象}, ...]` |
+| `encode=text` | `["正文1", "正文2", ...]`——只有 `hitokoto` 正文的字符串数组 |
+| `encode=js` | **400**，不是静默降级成 `json`——`js` 编码是"把正文写进一个 DOM 元素"的脚本，这个概念要求恰好一条语录对应一个 DOM 目标，对一个数组没有自然的定义；宁可让客户端明确看到"这个形状不支持"，也不要在它以为拿到 `js` 时悄悄换一种完全不同的响应形态，这跟 `charset=gbk` 被拒绝而不是悄悄当 `utf-8` 处理是同一个原则 |
+| `callback` | 支持，把**整个数组**包进 `{callback}(...)` 这层 JSONP 壳；跟 `/` 不同的是，这里 `callback` 不会覆盖 `encode` 的选择——两者正交，`callback` 只决定要不要包一层函数调用 |
+| `charset` | 仅支持 `utf-8`，同 `/` |
+| `c` | 接受但忽略，同 `/` |
+| `select` | 接受但忽略 |
+
+`Content-Type`：`encode=json`/`encode=text` 都是 `application/json; charset=utf-8`；带 `callback`
+时是 `application/javascript; charset=utf-8`。
+
+| 端点 | 行为 |
+|---|---|
+| `GET /extra/all` | 返回全部（或过滤后）的语录，无上限 |
+| `GET /extra/batch/:count` | 随机返回 `count` 条语录，允许重复；`count` 须为 1–1000 的整数，否则 400——这条上限不受 `user_id` 过滤影响，`count` 是"要抽多少次"，跟候选集合大小是两回事 |
+
+库空、或者过滤后无结果，这两个端点返回 `[]` + 200，不是 404——空数组本身就是一个成功的答案，跟
+`/` 那种「没有可服务的单条语录」是不同的语义。
+
+```bash
+curl 'http://127.0.0.1:8080/'
+curl 'http://127.0.0.1:8080/?encode=text'
+curl 'http://127.0.0.1:8080/?user_id=10001'
+curl 'http://127.0.0.1:8080/extra/all'
+curl 'http://127.0.0.1:8080/extra/all?user_id=10001&encode=text'
+curl 'http://127.0.0.1:8080/extra/batch/5'
+curl 'http://127.0.0.1:8080/extra/batch/5?user_id=10001'
+```
 
 ## Redis 键结构
 
@@ -133,143 +218,81 @@ TCP 连接却从不回复的 Valkey，不会让上面这套重连逻辑帮上忙
 | `hikari:bylen` | ZSET | score = 语录长度（UTF-8 码点数），member = `message_id` |
 | `hikari:tomb` | SET | 被作废的 `message_id`（永久） |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` 生成 `id` 字段 |
-| `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立；既用于重启补跑判断，也是下一次扫描窗口的起点 |
+| `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立 |
+| `hikari:username:{user_id}` | STRING | 这个人当前的群名片（或昵称），每次扫描按遇到的候选作者刷新；渲染时覆盖语录 hash 里冻结的 `from_who` 快照 |
+| `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，每次扫描刷新；渲染时覆盖语录 hash 里冻结的 `from` 快照 |
+| `hikari:byuser:{user_id}` | ZSET | score = 语录长度（UTF-8 码点数），member = `message_id`——作者维度的索引，`/?user_id=` 在全部三个 HTTP 端点上都靠它 |
 
-## 联调 Runbook
+**`hikari:byuser` 是后加的键，136 条此前收录的生产语录不在里面；修复手段是 `hikari reindex`**：
+这份索引在它们收录时还不存在。后果是整体性的而不是局部的——这 136 条同属一个作者，所以在 reindex
+跑之前 `/?user_id=` 对**整个存量语录库**都是空的；`GET /`（不带 `user_id`）等所有其它读路径不受
+影响，新语录从收录那一刻起也会正确地进入这份索引。
 
-首次针对真实 NapCat + Redis 联调时按这个顺序走。这里原本有四处 NapCat 线上行为仓库内验证不了，
-2026-08-15 首次生产运行 + 两次针对真实 NapCat 的手工探测（一次对 `get_group_msg_history` 用
-`count=5` 分别探测不带锚点 / `reverse_order=false` / `reverse_order=true` 三种调用，一次直接对
-`get_msg` 探测）已经把全部四条坐实，详见下面小节；仍按下面的方法核对，出问题时照着改代码。
+"重新收录一遍就好"行不通（文档里一度这么写过，是错的）：扫描器与 `hikari import` 都在
+`Store.exists()` 那道关卡上就返回了，`add()`/`addChain()` 根本走不到，重放多少次都补不上索引。
+`hikari reindex` 就是那条只回填索引、不改动语录本身的路径：`SMEMBERS hikari:index` → 逐 id
+`HMGET hikari:quote:{id} user_id length` → `ZADD hikari:byuser:{user_id} {length} {id}`，跑完打
+一行摘要。它幂等、可重复跑，且只在运营方显式敲它时才运行。
 
-### 步骤
+## 构建
 
-1. 复制 `.env.example` 为 `.env`，填真实值，把 `SCAN_TIME` 设成两三分钟后的时刻。
-2. `set -a && source .env && set +a && ./zig-out/bin/hikari`
-3. 在目标群里造数据：
-   - 被观察者发一句话，给它贴 ✨ 表情回应（路径 1）；
-   - 另一个人引用被观察者的另一句话，只回 `✨`（路径 2）；
-   - 管理员发 `✨ 手动补录测试`（路径 3）；
-   - 管理员引用其中一条候选，只回 `💦`（作废）。
-4. 等定时触发，确认每个群收到**一条**合并转发（聊天记录）消息，点开后是七行（横幅三行 +
-   `Processing...` + `Will process N messages.` + `Added X messages, skipped Y messages.` +
-   `Successfully in {d}s.`，秒数是这个群自己这一轮扫描花的时长，不是整个运行的总时长）且计数
-   合理；这七行不再是七条独立消息，是 `send_group_forward_msg` 打包发的一条消息里的七个 node，
-   发送时机是这个群扫描全部跑完之后，不是边扫边发——扫描本身仍然要跑 1–2 分钟，这段时间群里
-   不会有任何提示。
-   这一轮出过岔子时最后一行不是 `Successfully in {d}s.` 而是 `Failed: ...`（不带耗时——一次
-   失败跑的耗时不提供任何信息），原因串里会分别列出作废失败、入库失败、群归属信息拿不到各多少
-   条——三者任一发生都会压掉 `Successfully in {d}s.`，也会跳过**这个群自己**的
-   `hikari:lastrun:{group_id}` 更新，好让它下一次扫描（不管是下一个
-   正常触发时刻还是重启补跑）的窗口起点仍然停在上一次成功的位置、自动把这一轮漏掉的都补上；
-   `hikari:lastrun:{group_id}` 是逐群独立的键，不受同一轮里其他群成不成功影响——一个群
-   失败不会被跑成功的兄弟群掩盖。扫描中途真的崩溃（不是"落库遇到几条失败"那种软失败）时，
-   这个群仍然会收到一条合并转发，只是行数可能少于七行（`Will process` / `Added, skipped`
-   这两行要等对应阶段跑到才会有）、最后一行是 `Failed: <原因>`——不会因为崩溃就什么都不发。
-   合并转发里每个 node 的头像是机器人自己的 QQ（`runOnce` 每轮调一次 `get_login_info` 取到，
-   取不到时退回 `OBSERVED_QQ` 并打警告，纯观感问题，不影响这一轮判定成不成功）。
-5. 用 curl 核对 HTTP 接口：
-   ```bash
-   curl 'http://127.0.0.1:8080/'
-   curl 'http://127.0.0.1:8080/?encode=text'
-   curl 'http://127.0.0.1:8080/?min_length=1&max_length=5'
-   curl -i 'http://127.0.0.1:8080/?charset=gbk'   # 应为 400
-   ```
-6. 记录联调结果备查。
+Zig 版本固定 0.15.2。生产构建：
 
-### 五个 NapCat 线上假设：全部已被坐实
+```bash
+zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
+```
 
-核对全靠进程自己的 stderr 日志。**按上面推荐的 `-Doptimize=ReleaseSafe` 构建时 `std.log` 的默认
-级别恰好是 `info`**，下面用到的 `info` 行开箱即可见；用 `ReleaseFast` / `ReleaseSmall` 构建则只剩
-`err`，这些行会全部消失，联调期间不要用那两档。
+用 `ReleaseSafe` 而不是 `ReleaseFast` / `ReleaseSmall`：后两者会把 `std.log` 的默认级别从 `info`
+降到 `err`，扫描过程、重连、DST 偏移这些诊断信息会全部消失，出问题时排查不了。
 
-1. **翻页锚点吃的确实是 `message_id`，但方向必须是 `reverse_order: true`——已确认，且已修复。**
-   本项目把上一页最老一条的 `message_id` 作为下一页 `get_group_msg_history` 的 `message_seq`
-   入参，这部分假设成立：手工探测证实 `get_msg` 返回的 `id`/`seq` 是同一个值。但首次生产运行的
-   日志暴露了另一个问题——第 1 页和第 2 页完全相同：
+## 部署
 
-   ```
-   info: group ...: history page 0: 194 message(s); oldest message_id=1809600761 time=1786785467; newest message_id=1344602200 time=1786790521
-   info: group ...: history page 1: 194 message(s); oldest message_id=1809600761 time=1786785467; newest message_id=1344602200 time=1786790521
-   warning: group ...: history window NOT fully covered — stopped after 2 page(s) ... reason: pagination anchor stopped advancing (NapCat returned the same page again).
-   ```
+以非 root 用户运行，交给 systemd 管理：
 
-   针对真实 NapCat 用 `count=5` 手工探测（不带锚点 / 带锚点 `reverse_order=false` / 带锚点
-   `reverse_order=true`）确认了原因：`reverse_order` 的语义是"从锚点朝哪个方向走"，不是"结果要不要
-   倒序"——`reverse_order: false` 是"从锚点往新（更晚）的方向走"，拿上一页最老一条的 `message_id`
-   当锚点配 `false` 传给 NapCat，等于让 NapCat 把上一页原样再吐一遍，翻页永远卡在窗口最新的那一段。
-   往回（更早）翻必须传 `reverse_order: true`。`src/scan/runner.zig` 的 `fetchPage` 已经改过来：
-   带锚点的分支现在传 `reverse_order: true`；没有锚点的首页调用仍是 `reverse_order: false`——NapCat
-   对不带 `message_seq` 的请求走的是 `getAioFirstViewLatestMsgs`，不看这个字段，不受这次修复影响。
-   `grep 'history page'` 仍然是核对相邻两页有没有正常往更早的方向推进的办法：现在应看到相邻两页
-   `time` 依次变旧、首尾相接，不应再出现两页完全相同。
+```ini
+[Unit]
+Description=Hikari
+After=network-online.target redis.service
+Wants=network-online.target
 
-2. **`message_seq` 边界是闭区间——已确认。** 手工探测证实：带锚点、`reverse_order: true` 时，
-   返回的一页里锚点消息本身会作为**最新**的一条出现（其余是比它更早的消息）。后果：每一页（除第
-   一页外）都会把上一页最老的一条重复收进 `pool`，`Will process N messages.` 会比实际值多报最多
-   「页数 − 1」条。这不会污染数据——`rules.appendCandidate` 按 `message_id` 去重会挡住重复——是
-   刻意接受的行为，**不需要**在 `fetchPage` / 翻页循环里另外去重，看日志时知道这个数会偏高即可。
+[Service]
+Type=simple
+User=hikari
+WorkingDirectory=/opt/hikari
+ExecStart=/opt/hikari/hikari
+Restart=always
+RestartSec=5
 
-3. **`get_msg` 是否返回顶层 `user_id`——已确认，针对生产 NapCat 手工探测坐实。** `onebot.parseMessage`
-   解析 `get_msg` 的返回时，如果找不到顶层 `user_id` 会直接返回 null，导致所有需要单独 `get_msg`
-   才能解析出发送者的引用目标（窗口外、走 LRU 反查那条路，即路径 2 的跨窗口情形）都无法解析，日志
-   会看到大量「unresolvable」警告，且与正常的 LRU 淘汰情形从日志上无法区分。首次生产运行没有触发
-   这条路径（窗口内的引用都能直接从池子里解出发送者），因此另外对真实 NapCat 的 `get_msg` 做了一次
-   直接探测：对一条真实群消息调用 `get_msg`，返回的顶层 key 为
+[Install]
+WantedBy=multi-user.target
+```
 
-   ```
-   ['emoji_likes_list', 'font', 'group_id', 'group_name', 'message', 'message_format',
-    'message_id', 'message_seq', 'message_type', 'post_type', 'raw_message', 'real_id',
-    'real_seq', 'self_id', 'sender', 'sub_type', 'time', 'user_id']
-   ```
+上例由 Hikari 自己读取 `/opt/hikari/.env`，所以 `WorkingDirectory` 不能省。如果仍想用 systemd 管理
+配置，也可以加 `EnvironmentFile=/opt/hikari/hikari.env`；这些进程环境变量会按上述优先级覆盖 `.env`。
 
-   顶层 `user_id`（本次探测中为 `3303289608`）与 `sender.user_id` 一致，`message_id` / `time` /
-   `message_type` / `emoji_likes_list` 也均在顶层出现。假设成立：跨窗口的路径 2 反查可以正常工作。
+日志走 journal：
 
-4. **✨ 的 `emoji_id` 是 `"10024"`——已确认，由生产数据坐实。** 定义在 `src/napcat.zig` 的
-   `star_emoji_id` 常量，全仓库只这一处。首次生产运行通过 ✨ 收到了 6 条真实语录（`10024` 匹配
-   成功），同一轮里另有一条消息被贴了 😰，日志打出
+```bash
+journalctl -u hikari -f
+```
 
-   ```
-   none matched star_emoji_id=10024: 128560x1
-   ```
+## 开发
 
-   128560 = 0x1F630（😰 的 Unicode 码点），证实 NapCat 把 emoji 表情回应上报为十进制码点，
-   `star_emoji_id = "10024"`（✨ = U+2728 的十进制形式）是对的，不需要改。核对方法（供以后接入
-   新群/新环境时复查）：找一条被观察者发的消息贴上 ✨，等这一轮扫描跑过去，确认没有打出
-   `none matched star_emoji_id=10024: ...` 这一行；若打出了，冒号后面是这条消息上实际出现过的
-   全部 `emoji_id`（`id×次数`），✨ 的真实 id 会在那串里。
+```bash
+zig build test          # 完整测试套件
+```
 
-5. **`send_group_forward_msg` 的请求体结构——已确认，针对生产 NapCat 手工探测坐实。** 运行日志
-   从逐条 `send_group_msg` 改成合并转发（见 7 节）之前，针对真实 NapCat 手工发过一次
-   `send_group_forward_msg`：
+跑一次真实扫描不需要等到定时触发，也不需要临时改 `SCAN_TIME` 再改回去：`hikari run` 用跟常驻路径
+完全同一套装配（同一个 config、同一种独立 Redis 连接）立刻跑一次并退出。
 
-   ```json
-   {"group_id": 1039716984, "messages": [
-     {"type":"node","data":{"user_id":"2131597992","nickname":"Hikari","content":[{"type":"text","data":{"text":"Hikari!"}}]}},
-     {"type":"node","data":{"user_id":"2131597992","nickname":"Hikari","content":[{"type":"text","data":{"text":"Successfully."}}]}}
-   ]}
-   ```
+部署目标是 `x86_64-linux-gnu`，本仓库零第三方依赖，`-Dtarget` 交叉编译到其他平台同样适用，只是
+目前只有这一个目标经过实际部署验证。
 
-   NapCat 回了 `{"status":"ok","retcode":0,"data":{"message_id":242408478,"res_id":"...","forward_id":"..."}}`，
-   确认 `user_id` 要传字符串、`node → data → content[]` 的三层嵌套、以及每个 node 会在合并转发里
-   独立成一行。（这次探测比第七行加上耗时那次改动更早，探测记录里的 `"Successfully."` 是当时
-   的原文，不代表现在这一行的实际文案——现在是 `"Successfully in {d}s."`；这里保留原始探测
-   记录不做事后改写，验证的是请求体结构，不是文案本身。）`get_login_info` 取机器人自己 QQ 的
-   返回形状（`data.user_id` 是数字）沿用 OneBot 11
-   标准接口，未单独针对这次改动重新探测。
+涉及所有权转移的代码（谁在错误路径上该释放哪块内存）容易在 OOM 分支上出岔子，本仓库的约定是这类
+代码都配一条 `std.testing.checkAllAllocationFailures` 测试，逐次让分配失败、确认每条路径都不泄漏
+也不重复释放。
 
-## 本仓库中实际验证过的部分
+## 设计文档
 
-- `zig build` 产出二进制、`zig build test` 201/201 通过。
-- 不设任何环境变量运行，进程以非零状态退出并在日志里点名具体缺失哪个环境变量。
-- 故意设置非法值（如 `SCAN_TIME=25:00`）运行，进程点名的是那个变量本身，不是别的。
-- 有本地 Redis 可用时，用合法 Redis 配置 + 不存在的 NapCat 地址运行，HTTP 服务仍能正常启动；对空库
-  发请求返回 404 JSON 错误体。
-
-**没有验证过的部分**：需要真实 NapCat 实例、真实 QQ 账号与群权限的联调（上面 Runbook 的步骤 3、4，
-即在真实群里造数据、亲眼确认发出的合并转发消息与计数）——这需要人工执行，见上面的 Runbook。「五个
-NapCat 线上假设」小节列出的五条均已被坐实，不再属于这里的未验证部分。合并转发这条改动本身只做到了单元测试
-级别（起假 HTTP server 验证 `send_group_forward_msg`/`get_login_info` 请求体与 runOnce 的调用
-时序，见 `src/scan/runner.zig`），还没有对着真实群跑过一轮、亲眼确认收到的是一条折叠起来的合并
-转发消息而不是七条独立消息。
+NapCat 接口细节、message_id 的哈希性质、扫描窗口与翻页算法、字段映射等完整设计见
+[`docs/superpowers/specs/2026-08-15-hikari-design.md`](docs/superpowers/specs/2026-08-15-hikari-design.md)。
