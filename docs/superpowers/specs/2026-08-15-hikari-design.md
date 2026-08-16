@@ -277,34 +277,41 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 | `hikari:chain:{message_id}` | SET | 仅 🔥 链使用，key 里的 `{message_id}` 是链**主键**：成员是这条链的全部 `message_id`（含主键自己） |
 | `hikari:username:{user_id}` | STRING | 这个人当前的群名片（群名片优先，否则昵称）。每次扫描按窗口内**遇到的候选作者**刷新（不是固定的被观察者），同一次扫描内同一个作者只刷新一次。渲染语录时（`GET /`、`/extra/*`）覆盖 hash 里冻结的 `from_who` 快照——这是"改名一次性反映到这个人说过的全部历史语录"的落点 |
 | `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，用法和理由跟 `hikari:username` 对称，覆盖的字段是 `from` |
+| `hikari:byuser:{user_id}` | ZSET | score = `length`（码点数），member = `message_id`（🔥 链只有主键在里面，跟 `hikari:bylen` 完全对称）。作者维度的索引，`/?user_id=` 在 `/`、`/extra/all`、`/extra/batch/:count` 三个端点上都靠它——用 ZSET 而不是 SET 是为了让"这个人 + 长度区间"和"全库 + 长度区间"共用同一条 `ZRANGEBYSCORE key min max`，只是 key 换了 |
+
+**已知缺口，刻意接受，不是迁移遗漏**：这份索引是本次改动新增的键，**136 条本次改动之前收录的生产语录不在里面**——它们的 hash 早就有 `user_id` 字段（`hashFields`/`quoteFromPairs` 一直在读写它），但从来没人把它们写进 `hikari:byuser`，因为这个键在它们收录的时候压根不存在。本仓库唯一认可的状态修复手段是幂等重放（`exists() == false` 触发下一次扫描原样重做），而这 136 条语录早已 `exists() == true`，不会再被任何一次扫描重新处理一遍，所以也不会自动补上 `hikari:byuser` 的成员资格。这里刻意不做迁移脚本、也不做进程启动时的自动回填——两者都会在这次改动范围之外引入新的状态机（"读路径要不要顺手触发一次写"、"启动时要不要跑一遍全量扫描"），风险跟收益不成比例。**后果**：对这 136 条语录的作者发 `/?user_id={their_id}`，`GET /` 返回 404，`/extra/all`/`/extra/batch/:count` 返回 `[]`，即便这个人确实说过话、`GET /`（不带 `user_id`）确实能随机到他的语录——这些语录仍然完整地存在于 `hikari:index`/`hikari:bylen`，不带 `user_id` 的请求行为不受任何影响。运营方如果需要修复，可以把这些语录重新收录一遍（新的收录会走完整的 `add()`/`addChain()`，自然带上 `hikari:byuser` 成员资格）；本次改动不提供专门的"只回填索引、不改动语录本身"的路径。
 
 **渲染时的名字解析（`Store.fetchById`，`randomAny`/`randomByLength`/`allQuotes`/`randomMany` 的共同入口）**：`HGETALL` 拿到 hash 之后，紧接着一次 `MGET hikari:username:{user_id} hikari:groupname:{group_id}`（key 里的 `user_id`/`group_id` 就是这条语录 hash 自己存的两个字段——136 条现存生产语录早就带着它们，不需要任何迁移）。**哪个赢**：`MGET` 命中（哪怕命中的值本身是空串）就覆盖 hash 里的旧值，因为命中代表"这个 user_id / group_id 最近一次被成功刷新过"，是比收录当时冻结进 hash 的快照更新的事实；未命中（nil）——导入的语录、这个人从没在任何一次扫描里当过候选作者、或者他已经离群且这份映射从来没写成功过——退回 hash 里存的旧值，这正是"没有映射就保底"的 fallback 语义。`MGET` 本身失败（Redis I/O/协议错误）直接向上传播成 500，跟这一层其它读路径的失败语义一致，不单独吞掉。
 
-**写入（普通语录，路径1/2/3）**（按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `SADD hikari:index {id}`
+**写入（普通语录，路径1/2/3）**（按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `ZADD hikari:byuser:{user_id} {length} {id}` → `SADD hikari:index {id}`
 
-顺序即事务语义。`exists()` 查的是 `hikari:index`，所以 `SADD` 是提交点、必须最后发：任何一次部分失败留下的状态都满足 `exists() == false`，下一次扫描原样重做一遍就修好了（三条命令都幂等）。反过来若 `SADD` 先于 `ZADD`，"`HSET`+`SADD` 成功、`ZADD` 失败" 会让这条语录 `exists() == true` 却永远不在 `hikari:bylen` 里——`GET /` 能随机到，任何带 `min_length`/`max_length` 的查询都永远看不见，且不会自愈。
+顺序即事务语义。`exists()` 查的是 `hikari:index`，所以 `SADD` 是提交点、必须最后发：任何一次部分失败留下的状态都满足 `exists() == false`，下一次扫描原样重做一遍就修好了（四条命令都幂等）。反过来若 `SADD` 排在任何一条 `ZADD` 前面，"其余命令成功、某条 `ZADD` 失败" 会让这条语录 `exists() == true` 却永远不在对应的索引里——`GET /` 能随机到，任何带 `min_length`/`max_length`（或 `/?user_id=`）的查询都永远看不见，且不会自愈。`hikari:byuser` 跟 `hikari:bylen` 是同一类东西（提交点之前必须就位的索引），排在同一段里、同样在 `SADD` 之前。
 
-**写入（🔥 链语录，路径4，`Store.addChain`）**（按此顺序逐条发送）：对链的每个成员 `m`（含主键）依次发 `SET hikari:chainmember:{m} {主键}` → `SADD hikari:chain:{主键} {member1} {member2} ...`（一条命令带全部成员）→ 接下来跟普通语录写入完全一样的三步：`HSET hikari:quote:{主键} ...` → `ZADD hikari:bylen {length} {主键}` → `SADD hikari:index {主键}`。
+**写入（🔥 链语录，路径4，`Store.addChain`）**（按此顺序逐条发送）：对链的每个成员 `m`（含主键）依次发 `SET hikari:chainmember:{m} {主键}` → `SADD hikari:chain:{主键} {member1} {member2} ...`（一条命令带全部成员）→ 接下来跟普通语录写入完全一样的四步：`HSET hikari:quote:{主键} ...` → `ZADD hikari:bylen {length} {主键}` → `ZADD hikari:byuser:{user_id} {length} {主键}` → `SADD hikari:index {主键}`。`hikari:byuser` 只记主键，跟 `hikari:bylen` 一致——整条链是一条语录，作者是全体成员共同的那一个人（`rules.buildChains` 强制一条链的全部成员同属一个 `user_id`），不存在"该记谁"的歧义。
 
 映射（`chainmember`/`chain`）先于 `hikari:index` 的提交点落盘，方向刻意跟"`SADD` 必须最后发"这条原则保持一致但理由不同：若映射写在提交点**之后**，"`hikari:index` 提交成功、映射写失败"会让 `exists(主键) == true`（今后重扫时被跳过、永不重试），但非主键成员逃过了下面 `isChainMember` 那道关卡——往后一次窗口若把它单独判定成候选，会被当成一条全新的独立语录再收一遍，制造碎句与整句同时入库的重复。映射写在提交点之前，任何一步失败都仍然满足 `exists(主键) == false`，下一次扫描原样重做（`SET`/`SADD`/`HSET`/`ZADD` 全部幂等）。
 
 **入库前的第三道关卡**：候选按 4.6 节过了 `hikari:tomb`（tombstone）、`hikari:index`（`exists`）两道关之后，还要再查一次 `EXISTS hikari:chainmember:{message_id}`（`Store.isChainMember`）——一条 🔥 链的非主键成员永远不会出现在 `hikari:index` 里，单靠 `exists()` 拦不住它们被后续某次扫描（比如因为其它候选写入失败导致这个群这一轮判失败、`lastrun` 没有前移，下一次触发时窗口原样重扫，而中间群里的 🔥 被增减，链的组成算出来跟第一次不一样）当成独立消息、或者另一条不同的链重新收录。这份映射一旦写下就是这条消息最终的归属：它不会因为后续扫描把它算进另一种链的组合而改变，除非这条链先被 💦 撤稿（下面段落）。
 
-**删除（普通语录）**（同样按此顺序）：`SADD hikari:tomb {id}` → `SREM hikari:index {id}` → `ZREM hikari:bylen {id}` → `DEL hikari:quote:{id}`
+**删除（普通语录）**（同样按此顺序）：先 `HGET hikari:quote:{id} user_id`（纯读，问出这条语录的作者，必须在下面的 `DEL` 抹掉 hash 之前问，问完之后就再也无处可查——撤稿请求只给了一个 `message_id`，不带 `user_id`）→ `SADD hikari:tomb {id}` → `SREM hikari:index {id}` → `ZREM hikari:bylen {id}` → 问到作者才发的 `ZREM hikari:byuser:{user_id} {id}`（问不到——hash 已经不存在、或者压根没有这个字段——就跳过，是无害的"没什么可清理"，不是错误）→ `DEL hikari:quote:{id}`
 
-tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 hash 都只是它的后果。这样最坏留下一个孤儿 hash（没人索引得到，只占空间），而不是 `hikari:index` 里一个没有 hash 的悬空 id——后者会被 `SRANDMEMBER` 抽中、`HGETALL` 回空，让一个非空的库对外返回 404，且永远不会自愈。
+tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 hash 都只是它的后果。这样最坏留下一个孤儿 hash（没人索引得到，只占空间），而不是 `hikari:index` 里一个没有 hash 的悬空 id——后者会被 `SRANDMEMBER` 抽中、`HGETALL` 回空，让一个非空的库对外返回 404，且永远不会自愈。开头那条 `HGET` 是纯读，不写任何东西，排在最前面不影响这条不变式。不清理 `hikari:byuser` 的话，一条已撤稿语录的 id 会继续留在这个人的候选集合里，被 `/?user_id=` 抽中后 `HGETALL` 回空——重蹈 `hikari:index` 悬空 id 的覆辙，只是范围小到一个人身上。
 
 **删除（`Store.revoke` 的完整逻辑，覆盖普通语录与 🔥 链）**：先 `GET hikari:chainmember:{id}`。
 
-- 查不到（nil，最常见：路径1/2/3 的语录，或压根没被这份映射记录过的任意 id）→ 走上面"删除（普通语录）"那四步，原样不变。
-- 查到（value 是链主键 `p`）→ 说明 `id` 是某条 🔥 链的成员（不论是不是主键自己）：`SMEMBERS hikari:chain:{p}` 拿到全部成员 → `SADD hikari:tomb {member1} {member2} ...`（一条命令，全部成员一起 tombstone，tombstone 仍然先落盘）→ `SREM hikari:index {member1} ...` / `ZREM hikari:bylen {member1} ...`（对非主键成员是无害空操作）→ `DEL hikari:quote:{p}`（只有主键有 hash）→ 最后 `DEL hikari:chainmember:{member1} hikari:chainmember:{member2} ... hikari:chain:{p}`，把这条链的映射连同 chain 成员集本身一并清理——不清理的话，一条已经撤稿的链会在 Redis 里永久留下一份不再对应任何真实语录的映射。
+- 查不到（nil，最常见：路径1/2/3 的语录，或压根没被这份映射记录过的任意 id）→ 走上面"删除（普通语录）"那五步，原样不变。
+- 查到（value 是链主键 `p`）→ 说明 `id` 是某条 🔥 链的成员（不论是不是主键自己）：`SMEMBERS hikari:chain:{p}` 拿到全部成员 → `HGET hikari:quote:{p} user_id`（整条链只有主键有 hash，作者也只能从主键那份 hash 上问出来，同样必须在 `DEL` 之前）→ `SADD hikari:tomb {member1} {member2} ...`（一条命令，全部成员一起 tombstone，tombstone 仍然先落盘）→ `SREM hikari:index {member1} ...` / `ZREM hikari:bylen {member1} ...`（对非主键成员是无害空操作）→ 问到作者才发的 `ZREM hikari:byuser:{user_id} {member1} {member2} ...`（同样带上全部成员，非主键成员对它也是无害空操作）→ `DEL hikari:quote:{p}`（只有主键有 hash）→ 最后 `DEL hikari:chainmember:{member1} hikari:chainmember:{member2} ... hikari:chain:{p}`，把这条链的映射连同 chain 成员集本身一并清理——不清理的话，一条已经撤稿的链会在 Redis 里永久留下一份不再对应任何真实语录的映射。
 
 `rules.zig` 的窗口内展开（4.3 节）与这里靠 `hikari:chainmember` 解析的路径是两条独立、都保留的路径：前者是当次窗口能重建出链时的快路径（`outcome.revoked` 已经带全了链的全部成员，不需要额外 Redis 往返）；后者是撤稿正确性的最终保障，覆盖前者天然覆盖不到的跨窗口情形。`runner.zig` 对 `outcome.revoked` 里的每个 id 各自单独调用一次 `Store.revoke`，两条路径同时命中同一条链时，第一次调用完成整条链的清理，之后几次调用落在已经不属于任何链（映射已清理）的 id 上，退化成一串幂等的空操作，不产生错误。
 
-**随机取一条**：
+**随机取一条 / 取全部 / 取一批（`Filter{user_id, min_length, max_length}`，`Store.randomFiltered`/`allFiltered`/`randomManyFiltered`）**：`user_id` 与 `min_length`/`max_length` 组合过滤的入口，三个 HTTP 端点共用同一个 `Filter` 结构，不存在"某个端点漏接了某个过滤参数"这类偏差。
 
-- 无长度过滤 → `SRANDMEMBER hikari:index` 后 `HGETALL`
-- 有 `min_length` / `max_length` → `ZRANGEBYSCORE hikari:bylen {min} {max}` 拿到候选 id 列表，本地随机选一个后 `HGETALL`
+- 完全不过滤 → 逐字节委托给下面这些改动前就有的路径，命令序列跟改动之前完全相同：
+  - 随机一条 → `SRANDMEMBER hikari:index` 后 `HGETALL`
+  - 取全部 → `SMEMBERS hikari:index` 后逐个 `HGETALL`
+  - 取一批（允许重复）→ `SRANDMEMBER hikari:index -{count}`（负数形式）后逐个 `HGETALL`
+- 只有长度过滤、没有 `user_id` → `ZRANGEBYSCORE hikari:bylen {min} {max}` 拿到候选 id 列表（随机一条时本地挑一个，取全部/取一批时逐个/有放回抽样后 `HGETALL`）
+- 带 `user_id`（可选再叠加长度）→ key 换成 `hikari:byuser:{user_id}`，其余跟"只有长度过滤"那一支完全同构：`ZRANGEBYSCORE hikari:byuser:{user_id} {min} {max}`（`min`/`max` 缺省时分别是 `0` / `4294967295`），随机一条本地挑一个，取一批在候选集合上**有放回**地抽 `count` 次——`SRANDMEMBER` 的负数形式做不到"只从这个人的候选里抽"，所以带过滤的批量请求一律先把候选集合读到本地，再在本地维持"允许重复"这条语义，不能因为换了实现路径就悄悄变成去重
 
 `hikari:lastrun:{group_id}` 有两个用途，都是逐群独立的：进程重启后判断是否漏跑（对每个群
 分别检查，如果当前时间已越过今天的 `SCAN_TIME` 而这个群自己的 `lastrun` 早于它，就判定这个
@@ -322,8 +329,9 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 | 参数 | 支持情况 |
 |---|---|
 | `encode` | `json`（默认）/ `text` / `js` |
-| `min_length` | 支持，走 `hikari:bylen` |
-| `max_length` | 支持，走 `hikari:bylen` |
+| `min_length` | 支持，走 `hikari:bylen`（带 `user_id` 时改走 `hikari:byuser:{user_id}`，见下） |
+| `max_length` | 同上 |
+| `user_id` | 支持，按作者过滤，走 `hikari:byuser:{user_id}`，可与 `min_length`/`max_length` 组合。非数字/负数/溢出 u64 → 400；136 条本次改动之前收录的历史语录没有对应的索引成员，见第 5 节 `hikari:byuser` 的说明——这类作者的 `/?user_id=` 恒定 404，是一个已知、写进文档的行为，不是间歇性故障 |
 | `callback` | 支持，存在时输出 JSONP：`{callback}({json})`，Content-Type 为 `application/javascript` |
 | `select` | 支持，`encode=js` 时的 DOM 选择器，默认 `.hitokoto` |
 | `c` | 接受但忽略——全库只有一个类型，`type` 恒为 `g` |
@@ -339,41 +347,71 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 
 **错误**
 
-- 库空 / 长度过滤后无结果 → 404，JSON 错误体
-- `charset` 非 `utf-8`、`min_length` > `max_length`、参数非数字 → 400，JSON 错误体
+- 库空 / 过滤（长度和/或 `user_id`）后无结果 → 404，JSON 错误体
+- `charset` 非 `utf-8`、`min_length` > `max_length`、长度或 `user_id` 参数非数字 → 400，JSON 错误体
 - 路径非 `/`、`/extra/all`、`/extra/batch/:count` 之一 → 404
 
 ### 6.1 `/extra/all` 与 `/extra/batch/:count`：两个自定义扩展端点
 
 Hitokoto 协议本身没有"一次要多条语录"的形态。这两个端点落在 `/extra/` 前缀下就是在承认这一点——
-它们是本项目对协议的扩展，不是协议本身的一部分，因此**不认** `/` 的那套查询参数：`encode` /
-`min_length` / `max_length` / `callback` / `select` 全部被忽略，query string 整体不解析。响应固定
-`Content-Type: application/json; charset=utf-8`，body 是一个 JSON 数组，元素跟 `GET /?encode=json`
-产出的对象逐字段同构（第 4.7 节的完整字段集）。方法非 `GET` → 405，Redis I/O 失败 → 500 + JSON
-错误体，均与 `GET /` 一致。
+它们是本项目对协议的扩展，不是协议本身的一部分。运营方的指示是"把 `/` 的参数同步到这两个端点"，
+但保留两处明确的例外：
 
-**`GET /extra/all`**：返回全部语录，`SMEMBERS hikari:index` 拿到全部 id 后逐个 `HGETALL`，**不设
-上限**——这条端点的响应规模由语录库大小决定，不是由请求本身决定，不是需要防的那类暴露面。库空时
-返回 `[]` + **200**，不是 404：数组端点返回空数组本身就是一个成功的答案（"这就是全部，全部是零
-条"），跟 `GET /` 那种"没有可服务的单条语录"是不同的语义——`GET /` 的 404 表达的是"没有东西可以
-给你"，`/extra/all` 的 `[]` 表达的是"我把全部都给你了，全部是零条"，两者不能共用一个状态码。
+| 参数 | `/extra/all` 与 `/extra/batch/:count` 上的行为 |
+|---|---|
+| `user_id` | 按作者过滤，跟 `/` 完全同构（走 `hikari:byuser:{user_id}`），可与长度组合 |
+| `min_length` / `max_length` | 支持，语义跟 `/` 相同 |
+| `encode=json`（默认）| `[{完整对象}, ...]`——第 4.7 节全部字段，逐元素跟 `GET /?encode=json` 同构 |
+| `encode=text` | `["正文1", "正文2", ...]`——只有 `hitokoto`，是同一批语录的另一种投影，不是另一批数据 |
+| `encode=js` | **400**，不是静默降级成 `json` |
+| `callback` | 支持，把**整个数组**（不管 `encode` 选的是哪种形状）包进 `{callback}({数组的 JSON})` 这层 JSONP 壳；`callback` 不像 `/` 那样覆盖 `encode` 的选择——这两个端点没有对应 `/` 那条"callback 恒定输出完整对象"的既有 Hitokoto 约定，两者索性正交：`callback` 只管要不要包一层函数调用，不改变数组本身的形状 |
+| `charset` | 仅支持 `utf-8`，同 `/` |
+| `c` | 接受但忽略，同 `/` |
+| `select` | **接受但忽略**——不解码、不校验、不占任何分配 |
+
+`select` 被忽略的理由：它只在 `encode=js` 时才有意义（指定要把正文写进哪个 DOM 元素），而
+`encode=js` 这两个端点根本不支持——`js` 编码产出的是"往一个 DOM 元素里写一条正文"的自执行脚本，
+这个概念本身要求恰好一条语录对应恰好一个 DOM 目标；一个数组里有零到一千条语录，`js` 在这里没有
+自然的定义（该往哪个元素写哪一条？）。`encode=js` 因此是明确的 **400**，不是悄悄换成 `json`
+返回：静默地用一种跟客户端要求不同的形状作答，比直接告诉它"这个形状不支持"更容易在客户端那边
+造成难以定位的解析错误——这条原则跟 `charset=gbk` 被拒绝、而不是悄悄当 `utf-8` 处理是同一个道理，
+`/` 与 `/extra/*` 在"宁可 400 也不要静默换一种形状"这件事上是一致的。
+
+方法非 `GET` → 405，Redis I/O 失败 → 500 + JSON 错误体，均与 `GET /` 一致。
+
+**`GET /extra/all`**：无过滤时，`SMEMBERS hikari:index` 拿到全部 id 后逐个 `HGETALL`，**不设
+上限**——这条端点的响应规模由语录库大小决定，不是由请求本身决定，不是需要防的那类暴露面；带
+`user_id` 和/或长度过滤时改走 `ZRANGEBYSCORE`（key 是 `hikari:byuser:{user_id}` 或
+`hikari:bylen`，见第 5 节），过滤后的规模只会比全量更小，同样不需要上限。库空、或者过滤后无匹配，
+都返回 `[]` + **200**，不是 404：数组端点返回空数组本身就是一个成功的答案（"这就是（过滤后的）
+全部，全部是零条"），跟 `GET /` 那种"没有可服务的单条语录"是不同的语义——`GET /` 的 404 表达的是
+"没有东西可以给你"，`/extra/all` 的 `[]` 表达的是"我把全部都给你了，全部是零条"，两者不能共用一个
+状态码。
 
 **`GET /extra/batch/:count`**：随机返回 `count` 条语录，**允许重复**——这是运营方明确选择的语义。
-实现上依赖 `SRANDMEMBER hikari:index -count`（**负数**形式）：Redis 的 `SRANDMEMBER key <n>` 在
+无过滤时依赖 `SRANDMEMBER hikari:index -count`（**负数**形式）：Redis 的 `SRANDMEMBER key <n>` 在
 `n` 为正数时只返回互不相同的成员，`n` 为负数时允许重复且恰好返回 `|n|` 个结果。正数形式对这条端点
 是错的：一是它会静默去重，"允许重复"这个承诺不成立；二是 `count` 超过库大小时它会静默把结果截断到
-库大小，调用方拿到的条数会少于请求的 `count` 却拿不到任何提示。`count` 必须是 1–1000 之间的整数，
-否则 400——上限卡在 1000 不是保守起见：`count` 直接来自 URL，是任何人都能触碰到的输入，不设上限的
-话 `/extra/batch/999999999` 是一次谁都能发起的分配 / Redis 命令规模耗尽攻击，这条护栏是这条端点
-独有的暴露面。`/extra/all` 没有对应的上限，因为它的响应规模由库大小决定，不受用户输入控制，攻击面
-不存在。库空时同样返回 `[]` + 200，理由同上。
+库大小，调用方拿到的条数会少于请求的 `count` 却拿不到任何提示。带 `user_id` 和/或长度过滤时，
+`SRANDMEMBER` 的负数形式做不到"只从过滤后的候选里抽"（它只认一整个 SET），于是先
+`ZRANGEBYSCORE` 把候选集合读到本地，再在本地**有放回**地抽 `count` 次——"允许重复"这条承诺对
+带过滤的请求同样成立，不能因为换了一条实现路径就悄悄变成去重语义。`count` 必须是 1–1000 之间的
+整数，否则 400，这条护栏**不受 `user_id` 影响**——即便过滤后候选集合很小，`count` 依然是"要抽多少
+次"，抽样次数本身就是分配规模，跟候选集合大小是两回事。上限卡在 1000 不是保守起见：`count`
+直接来自 URL，是任何人都能触碰到的输入，不设上限的话 `/extra/batch/999999999` 是一次谁都能发起的
+分配 / Redis 命令规模耗尽攻击，这条护栏是这条端点独有的暴露面。`/extra/all` 没有对应的上限，因为
+它的响应规模由库大小（或过滤后的子集大小）决定，不受用户输入直接控制，攻击面不存在。库空、或者
+过滤后候选为空，都同样返回 `[]` + 200，理由同上。
 
 路由上，`/extra/batch/:count` 是"前缀 + 单一路径段"的匹配：`/extra/batch/` 后面必须恰好一段、不能
 再带 `/`。`/extra/batch`（缺 count，没有尾随斜杠）、`/extra/batch/1/2`（count 之后还有多余路径段）
 落进跟 `/nope` 相同的通用 404——这两种情况在路径结构上就不是这条路由能表达的形状，是"这个资源压根
 不存在"，不是"资源存在但参数有误"。`/extra/batch/`（尾随斜杠、count 段为空）仍然命中这条路由，只是
 校验 `count` 时把空串当非法数字处理，产出 400——空字符串结构上确实是"这条路由 + 一个空的 count 段"，
-跟 `/extra/batch/abc` 走的是同一条错误路径，不是路由层面的缺失。
+跟 `/extra/batch/abc` 走的是同一条错误路径，不是路由层面的缺失。`count` 本身的校验（路径段）先于
+query string 的校验（`encode`/`user_id`/长度/`callback`/`charset`）：`count` 不合法时一步都不碰
+Redis 也不解析 query string，跟 `count` 合法但 query string 不合法（比如 `encode=js`）是两条独立
+的 400 来源，谁先谁后只影响两者都错时报出的是哪一条消息，不影响最终都是 400 这件事。
 
 ## 7. 运行日志
 

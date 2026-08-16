@@ -32,6 +32,48 @@ pub const key_username_prefix = "hikari:username";
 /// `hikari:groupname:{group_id}` STRING，这个群当前的群名快照，用法和理由
 /// 跟 `key_username_prefix` 对称，只是覆盖的字段是 `from` 而不是 `from_who`。
 pub const key_groupname_prefix = "hikari:groupname";
+/// `hikari:byuser:{user_id}` ZSET，score = 语录长度（UTF-8 码点数），member =
+/// `message_id`（🔥 链只有主键在里面，跟 `hikari:bylen` 完全对称）。作者维度
+/// 的索引，`/?user_id=` 在全部三个端点上都靠它。
+///
+/// 为什么是 ZSET 不是 SET：`user_id` 需要能跟 `min_length`/`max_length`
+/// 组合过滤。ZSET 让"这个人 + 长度区间"和"全库 + 长度区间"是同一条
+/// `ZRANGEBYSCORE key min max`，只是 key 换了——组合过滤因此不是一条单独
+/// 维护的代码路径，见 `Filter`/`rangeKeyLocked`。
+///
+/// 写入顺序（`add`/`addChain`）：跟 `hikari:bylen` 同一段，在
+/// `SADD hikari:index`（提交点）之前——任何一步部分失败都仍然满足
+/// `exists() == false`，下一次扫描原样重做即可（ZADD 幂等）。放到提交点
+/// 之后会出现"语录已提交、但 `/?user_id=` 永远查不到它"这种不会自愈的偏差。
+///
+/// 撤稿（`revoke`）：`message_id` 本身不带 `user_id`，`revokeSingleLocked`/
+/// `revokeChainLocked` 靠 `quoteUserIdLocked`（`HGET hikari:quote:{id}
+/// user_id`）在 `DEL` 之前把作者问出来，再对这个人的 ZSET 发一次
+/// `ZREM`——问不到（hash 已经不存在、或者压根没有这个字段）就跳过，不是
+/// 错误，跟 `SREM index`/`ZREM bylen` 对非主键链成员的处理一样，是无害
+/// 空操作。
+///
+/// **136 条现存生产语录不在任何 `hikari:byuser` 里，这是本次改动刻意接受的
+/// 已知缺口，不是迁移遗漏**：这些语录早于这份索引存在，`hikari:index`/
+/// `hikari:bylen` 从收录当时就写好了，但 `hikari:byuser` 是全新的键，
+/// 历史数据当然不会自己出现在一个当初根本不存在的索引里。它们不会因为
+/// `/?user_id=` 这次改动而"迁移失败"——本仓库的原则是任何状态修复都必须
+/// 靠幂等重放自愈（`exists()==false` 触发重做），而这些语录已经
+/// `exists()==true`，不会再被任何一次扫描重新写一遍，所以自然也不会补上
+/// `hikari:byuser` 的成员资格。选择不做迁移脚本、也不做启动时自动回填，
+/// 是因为"读路径悄悄触发写"、"新增一个只在进程启动时跑一次的隐藏步骤"
+/// 都会引入这次改动范围之外的新状态机，风险和收益不成比例——这 136 条
+/// 语录本来就仍然完整地存在于 `hikari:index`/`hikari:bylen`，`GET /`、
+/// `/extra/all`、`/extra/batch/:count` 在不带 `user_id` 时行为完全不变；
+/// 唯一的、已知的、写进文档的后果是：对这 136 条语录的作者发
+/// `/?user_id={their_id}` 永远得到"这个人没有语录"（`/` 404，
+/// `/extra/*` 返回 `[]`），即使这个人明明说过话、语录也明明能被
+/// `GET /` 随机到。运营方如果需要修复，`hikari import` 之类的工具将来
+/// 可以按 `user_id` 重新收录一遍达到同样效果（`add()` 对已存在的语录是
+/// 幂等的 `exists()` 关卡挡住，不会重复；但对从来没进过 `hikari:byuser`
+/// 的旧 id，目前没有一条只回填索引、不改动语录本身的路径——这正是"不做
+/// 迁移"这条约束下留出的、需要将来专门决定要不要做的选项，本次改动不做）。
+pub const key_byuser_prefix = "hikari:byuser";
 
 pub const Quote = struct {
     id: u64,
@@ -95,6 +137,39 @@ pub fn usernameKey(buf: *[64]u8, user_id: u64) []const u8 {
 pub fn groupNameKey(buf: *[64]u8, group_id: u64) []const u8 {
     return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_groupname_prefix, group_id }) catch unreachable;
 }
+
+pub fn byUserKey(buf: *[64]u8, user_id: u64) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}:{d}", .{ key_byuser_prefix, user_id }) catch unreachable;
+}
+
+/// 读取端的过滤条件，三个 HTTP 端点（`/`、`/extra/all`、
+/// `/extra/batch/:count`）共用同一个结构，避免"某个端点漏接了某个过滤
+/// 参数"这类只在某一条路径上出现的偏差。
+///
+/// 全空（`isUnfiltered`）时，`randomFiltered`/`allFiltered`/
+/// `randomManyFiltered` 分别委托给改动前就有的 `randomAny`/`randomByLength`/
+/// `allQuotes`/`randomMany`，命令序列跟改动前逐字节相同；一旦带上任何一项
+/// （`user_id` 和/或长度），就统一走一条 `ZRANGEBYSCORE {key} {min} {max}`：
+/// `user_id` 决定用哪个 ZSET（`hikari:byuser:{u}` 还是全库的
+/// `hikari:bylen`），长度决定 score 区间。组合与单项因此是同一条代码
+/// 路径，不存在"组合起来没人测过"的分支。
+pub const Filter = struct {
+    user_id: ?u64 = null,
+    min_length: ?usize = null,
+    max_length: ?usize = null,
+
+    pub fn isUnfiltered(self: Filter) bool {
+        return self.user_id == null and self.min_length == null and self.max_length == null;
+    }
+
+    fn minScore(self: Filter) usize {
+        return self.min_length orelse 0;
+    }
+
+    fn maxScore(self: Filter) usize {
+        return self.max_length orelse std.math.maxInt(u32);
+    }
+};
 
 fn dupInt(gpa: std.mem.Allocator, v: anytype) ![]const u8 {
     return std.fmt.allocPrint(gpa, "{d}", .{v});
@@ -330,18 +405,23 @@ pub const Store = struct {
         const ids = std.fmt.bufPrint(&idb, "{d}", .{q.message_id}) catch unreachable;
         var lenb: [32]u8 = undefined;
         const lens = std.fmt.bufPrint(&lenb, "{d}", .{q.length}) catch unreachable;
+        var ubuf: [64]u8 = undefined;
 
         self.mutex.lock();
         defer self.mutex.unlock();
         // 顺序即事务语义：exists() 查的是 hikari:index，所以 SADD 是提交点，
-        // 必须最后发。这样三种部分失败（只有 HSET 成功 / HSET+ZADD 成功）
-        // 留下的状态都满足 exists() == false，下一次扫描原样重做一遍即可修复
-        // （三条命令都幂等）。若把 SADD 提到 ZADD 前面，"HSET+SADD 成功、
-        // ZADD 失败" 会让这条语录 exists() == true 而永远不在 hikari:bylen 里：
-        // GET / 随机得到它，任何 min_length/max_length 查询都永远看不见它，
-        // 而且再也不会被修复。
+        // 必须最后发。这样几种部分失败（只有 HSET 成功 / HSET+ZADD(bylen)
+        // 成功 / HSET+ZADD(bylen)+ZADD(byuser) 成功）留下的状态都满足
+        // exists() == false，下一次扫描原样重做一遍即可修复（全部命令都
+        // 幂等）。若把 SADD 提到任何一条 ZADD 前面，"其余命令成功、某条
+        // ZADD 失败" 会让这条语录 exists() == true 而永远不在对应的索引
+        // 里：GET / 随机得到它，任何 min_length/max_length（或
+        // /?user_id=）查询都永远看不见它，而且再也不会被修复。
         try self.client.commandOk(args);
         try self.client.commandOk(&.{ "ZADD", key_bylen, lens, ids });
+        // 作者维度的索引跟 hikari:bylen 是同一类东西：都是"提交点之前必须
+        // 就位的索引"，所以排在同一段里、同样在 SADD hikari:index 之前。
+        try self.client.commandOk(&.{ "ZADD", byUserKey(&ubuf, q.user_id), lens, ids });
         try self.client.commandOk(&.{ "SADD", key_index, ids });
     }
 
@@ -379,6 +459,7 @@ pub const Store = struct {
         const lens = std.fmt.bufPrint(&lenb, "{d}", .{q.length}) catch unreachable;
         var ckb: [64]u8 = undefined;
         const chain_key = chainKey(&ckb, q.message_id);
+        var ubuf: [64]u8 = undefined;
 
         const member_strs = try formatIds(self.gpa, member_ids);
         defer freeIdStrings(self.gpa, member_strs);
@@ -398,6 +479,10 @@ pub const Store = struct {
 
         try self.client.commandOk(args);
         try self.client.commandOk(&.{ "ZADD", key_bylen, lens, primary_s });
+        // 链只有主键进 hikari:byuser（跟 hikari:bylen 一致）：整条链是一条
+        // 语录，作者是全体成员共同的那一个人——buildChains 强制一条链的
+        // 全部成员同属一个 user_id，这里不存在"该记谁"的歧义。
+        try self.client.commandOk(&.{ "ZADD", byUserKey(&ubuf, q.user_id), lens, primary_s });
         try self.client.commandOk(&.{ "SADD", key_index, primary_s });
     }
 
@@ -431,6 +516,23 @@ pub const Store = struct {
         }
     }
 
+    /// `HGET hikari:quote:{id} user_id`，解析成数字。hash 不存在、字段缺失、
+    /// 值不是数字，一律返回 null（都表示"问不出这条语录的作者"，不是错误：
+    /// revoke() 完全可能收到一个从未真正入过库的 id）。撤稿路径靠这个反查
+    /// "该清理哪一个人的 hikari:byuser:{user_id}"——message_id 本身不带
+    /// user_id，撤稿请求只给了一个 id，唯一还能问到作者的地方就是这条语录
+    /// 自己的 hash，而且必须在 DEL 把这份 hash 删掉**之前**问，问完之后
+    /// 就再也无处可查了。假定调用方已经持有 self.mutex。
+    fn quoteUserIdLocked(self: *Store, message_id: i64) Error!?u64 {
+        var kb: [64]u8 = undefined;
+        const v = try self.client.command(&.{ "HGET", quoteKey(&kb, message_id), "user_id" });
+        defer v.deinit(self.client.gpa);
+        return switch (v) {
+            .bulk => |b| if (b) |raw| (std.fmt.parseInt(u64, raw, 10) catch null) else null,
+            else => null,
+        };
+    }
+
     /// 原来 revoke() 的全部内容，改名后专门处理"这个 id 不属于任何链"的情形。
     /// 假定调用方已经持有 self.mutex。
     fn revokeSingleLocked(self: *Store, message_id: i64) Error!void {
@@ -438,6 +540,11 @@ pub const Store = struct {
         const qk = quoteKey(&kb, message_id);
         var idb: [32]u8 = undefined;
         const ids = std.fmt.bufPrint(&idb, "{d}", .{message_id}) catch unreachable;
+
+        // 这一步是纯读，不写任何东西，放在最前面不影响下面"tombstone 先
+        // 落盘"这条不变式——它只是为了在 DEL 抹掉 hash 之前，把
+        // hikari:byuser 该清理哪个键问出来。
+        const owner = try self.quoteUserIdLocked(message_id);
 
         // tombstone 先落盘：它是这次作废唯一持久的事实（"这条消息永远不再入库"），
         // 而删索引、删 hash 都只是它的后果。这样任何一次部分失败最坏留下一个
@@ -448,6 +555,13 @@ pub const Store = struct {
         try self.client.commandOk(&.{ "SADD", key_tomb, ids });
         try self.client.commandOk(&.{ "SREM", key_index, ids });
         try self.client.commandOk(&.{ "ZREM", key_bylen, ids });
+        // 问到作者才发这条 ZREM：问不到（hash 已经不存在、或者压根没有
+        // user_id 字段——理论上不该发生，防御性处理）就跳过，是无害的
+        // "没什么可清理"，不是错误。
+        if (owner) |uid| {
+            var ubuf: [64]u8 = undefined;
+            try self.client.commandOk(&.{ "ZREM", byUserKey(&ubuf, uid), ids });
+        }
         try self.client.commandOk(&.{ "DEL", qk });
     }
 
@@ -492,6 +606,13 @@ pub const Store = struct {
         const member_strs = try formatIds(self.gpa, members.items);
         defer freeIdStrings(self.gpa, member_strs);
 
+        // 整条链只有主键有 hash，作者也只能从主键那份 hash 上问出来——跟
+        // revokeSingleLocked 一样，必须在下面的 DEL 之前问。非主键成员
+        // 从来没进过 hikari:byuser，对它们发 ZREM 是无害空操作（member_strs
+        // 里带上全部成员一起发，理由跟 SREM index / ZREM bylen 对它们的
+        // 处理一致：反正是空操作，没必要为了"只清理主键"单独拆一条命令）。
+        const owner = try self.quoteUserIdLocked(pid);
+
         {
             const args = try buildMultiArgs(self.gpa, "SADD", key_tomb, member_strs);
             defer self.gpa.free(args);
@@ -504,6 +625,12 @@ pub const Store = struct {
         }
         {
             const args = try buildMultiArgs(self.gpa, "ZREM", key_bylen, member_strs);
+            defer self.gpa.free(args);
+            try self.client.commandOk(args);
+        }
+        if (owner) |uid| {
+            var ubuf: [64]u8 = undefined;
+            const args = try buildMultiArgs(self.gpa, "ZREM", byUserKey(&ubuf, uid), member_strs);
             defer self.gpa.free(args);
             try self.client.commandOk(args);
         }
@@ -797,6 +924,134 @@ pub const Store = struct {
                     q.deinit(gpa);
                     return e;
                 };
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// `ZRANGEBYSCORE {key} {min} {max}`，`key` 是 `hikari:byuser:{uid}` 还是
+    /// 全库的 `hikari:bylen` 由调用方决定。三个过滤过的读方法（
+    /// `randomFiltered`/`allFiltered`/`randomManyFiltered`）的 `user_id`
+    /// 分支与"只有长度过滤"分支因此共用同一段查询逻辑，"user_id 和长度
+    /// 组合起来"不是一条单独维护的路径。假定调用方已经持有 self.mutex。
+    fn scoreRangeAtLocked(self: *Store, key: []const u8, min: usize, max: usize) Error!resp.Value {
+        var minb: [32]u8 = undefined;
+        var maxb: [32]u8 = undefined;
+        const mins = std.fmt.bufPrint(&minb, "{d}", .{min}) catch unreachable;
+        const maxs = std.fmt.bufPrint(&maxb, "{d}", .{max}) catch unreachable;
+        return self.client.command(&.{ "ZRANGEBYSCORE", key, mins, maxs });
+    }
+
+    /// `filter` 里 `user_id` 决定 key，是 null 时落回全库的 `hikari:bylen`；
+    /// 假定调用方已经持有 self.mutex。
+    fn rangeKeyLocked(filter: Filter, buf: *[64]u8) []const u8 {
+        return if (filter.user_id) |uid| byUserKey(buf, uid) else key_bylen;
+    }
+
+    /// `GET /` 的统一入口，供 server.zig 在 `user_id` 存在时使用。
+    ///
+    /// `filter.user_id == null` 时**逐字节委托**给改动前就有的
+    /// `randomAny`/`randomByLength`——不是重新实现同样的逻辑，是直接调用
+    /// 它们：这样不带 `user_id` 的请求命令序列跟这次改动之前完全相同，
+    /// 那两个函数已有的测试不需要跟着改，也不需要为"没有 user_id 时行为
+    /// 不变"这件事另外证明什么。只有 `user_id` 非 null 时才会走下面全新的
+    /// `hikari:byuser` 路径。
+    pub fn randomFiltered(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!?Quote {
+        if (filter.user_id == null) {
+            if (filter.min_length != null or filter.max_length != null) {
+                return self.randomByLength(gpa, filter.minScore(), filter.maxScore());
+            }
+            return self.randomAny(gpa);
+        }
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var kb: [64]u8 = undefined;
+        const key = rangeKeyLocked(filter, &kb);
+        const v = try self.scoreRangeAtLocked(key, filter.minScore(), filter.maxScore());
+        defer v.deinit(self.client.gpa);
+        const items = switch (v) {
+            .array => |a| a orelse return null,
+            else => return null,
+        };
+        if (items.len == 0) return null;
+        const pick = items[std.crypto.random.uintLessThan(usize, items.len)];
+        const id_str = switch (pick) {
+            .bulk => |b| b orelse return null,
+            else => return null,
+        };
+        return self.fetchById(gpa, id_str);
+    }
+
+    /// `/extra/all` 的统一入口。`filter.isUnfiltered()` 时逐字节委托给
+    /// `allQuotes`（理由同 `randomFiltered`）；带任何过滤（`user_id` 和/或
+    /// 长度）时走 `ZRANGEBYSCORE` + `fetchMany`——`/extra/all` 在这次改动
+    /// 之前完全不支持长度过滤，所以"只有长度、没有 user_id"这个分支对它
+    /// 而言也是新代码，跟 `user_id` 分支共用同一个 `rangeKeyLocked`。
+    pub fn allFiltered(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error![]Quote {
+        if (filter.isUnfiltered()) return self.allQuotes(gpa);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var kb: [64]u8 = undefined;
+        const key = rangeKeyLocked(filter, &kb);
+        const v = try self.scoreRangeAtLocked(key, filter.minScore(), filter.maxScore());
+        defer v.deinit(self.client.gpa);
+        const items: []const resp.Value = switch (v) {
+            .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+            else => &[_]resp.Value{},
+        };
+        return self.fetchMany(gpa, items);
+    }
+
+    /// `/extra/batch/:count` 的统一入口。`filter.isUnfiltered()` 时逐字节
+    /// 委托给 `randomMany`（理由同 `randomFiltered`）；带任何过滤时先
+    /// `ZRANGEBYSCORE` 拿到候选集合，再在本地**有放回**地抽 `count`
+    /// 次——`randomMany` 的 `SRANDMEMBER` 负数形式做不到"从这个人的语录
+    /// 里"这件事（`SRANDMEMBER` 只能整个 SET 一起抽，不能先按 `user_id`
+    /// 或长度过滤），所以过滤路径必须先把候选集合读到本地，"允许重复"这条
+    /// 承诺靠 `fetchSampled` 的有放回抽样维持，不能因为换了实现路径就悄悄
+    /// 变成去重语义。
+    pub fn randomManyFiltered(self: *Store, gpa: std.mem.Allocator, filter: Filter, count: usize) Error![]Quote {
+        if (filter.isUnfiltered()) return self.randomMany(gpa, count);
+
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        var kb: [64]u8 = undefined;
+        const key = rangeKeyLocked(filter, &kb);
+        const v = try self.scoreRangeAtLocked(key, filter.minScore(), filter.maxScore());
+        defer v.deinit(self.client.gpa);
+        const items: []const resp.Value = switch (v) {
+            .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+            else => &[_]resp.Value{},
+        };
+        return self.fetchSampled(gpa, items, count);
+    }
+
+    /// 从候选 id 集合（`ZRANGEBYSCORE` 回复里的 bulk string 数组）里**有
+    /// 放回**地抽 `count` 条展开。清理纪律跟 `fetchMany` 逐字相同（同一段
+    /// errdefer + append 失败时就地释放 q，理由见 `fetchMany` 的文档注释）。
+    /// 只在 `randomManyFiltered` 内部调用，此时锁已经被持有。
+    fn fetchSampled(self: *Store, gpa: std.mem.Allocator, ids: []const resp.Value, count: usize) Error![]Quote {
+        var out: std.ArrayList(Quote) = .empty;
+        errdefer {
+            for (out.items) |q| q.deinit(gpa);
+            out.deinit(gpa);
+        }
+        if (ids.len > 0) {
+            var n: usize = 0;
+            while (n < count) : (n += 1) {
+                const pick = ids[std.crypto.random.uintLessThan(usize, ids.len)];
+                const id_str = switch (pick) {
+                    .bulk => |b| b orelse continue,
+                    else => continue,
+                };
+                if (try self.fetchById(gpa, id_str)) |q| {
+                    out.append(gpa, q) catch |e| {
+                        q.deinit(gpa);
+                        return e;
+                    };
+                }
             }
         }
         return out.toOwnedSlice(gpa);
@@ -1146,9 +1401,9 @@ test "isTombstoned 发 SISMEMBER hikari:tomb" {
     try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_tomb) != null);
 }
 
-test "add 依次发 HSET / ZADD / SADD —— hikari:index 是提交点" {
+test "add 依次发 HSET / ZADD(bylen) / ZADD(byuser) / SADD —— hikari:index 是提交点" {
     const gpa = std.testing.allocator;
-    const srv = try FakeServer.start(gpa, ":15\r\n:1\r\n:1\r\n");
+    const srv = try FakeServer.start(gpa, ":15\r\n:1\r\n:1\r\n:1\r\n");
     defer {
         srv.stop();
         srv.received.deinit(gpa);
@@ -1165,23 +1420,27 @@ test "add 依次发 HSET / ZADD / SADD —— hikari:index 是提交点" {
 
     // 顺序不是随便定的：exists() 查的是 hikari:index，所以 SADD 必须是最后
     // 一步，这样任何一次部分失败留下的状态都满足 exists() == false，下一次
-    // 扫描会原样重做一遍（HSET/ZADD/SADD 都幂等）。反过来把 SADD 放在 ZADD
-    // 前面的话，"HSET+SADD 成功、ZADD 失败" 会让这条语录 exists() == true，
-    // 从此每次扫描都跳过它，而它永远进不了 hikari:bylen——GET / 能随机到，
-    // 任何带 min_length/max_length 的查询都永远看不见，且不会自愈。
+    // 扫描会原样重做一遍（HSET/ZADD/ZADD/SADD 都幂等）。反过来把 SADD 放在
+    // 任何一条 ZADD 前面的话，"其余命令成功、某条 ZADD 失败" 会让这条语录
+    // exists() == true，从此每次扫描都跳过它，而它永远进不了对应的索引——
+    // GET / 能随机到，任何带 min_length/max_length（或 /?user_id=）的查询
+    // 都永远看不见，且不会自愈。sampleQuote() 的 user_id 是 10001。
     try expectFrameSequence(srv.received.items, &.{
         "*32\r\n$4\r\nHSET\r\n$18\r\nhikari:quote:12345\r\n",
         "*4\r\n$4\r\nZADD\r\n$12\r\nhikari:bylen\r\n$1\r\n7\r\n$5\r\n12345\r\n",
+        "*4\r\n$4\r\nZADD\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n7\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nSADD\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
     });
 }
 
-test "revoke（非链成员）先 GET chainmember 查不到，再依次发 SADD tomb / SREM / ZREM / DEL —— tombstone 先落盘" {
+test "revoke（非链成员）先 GET chainmember 查不到，HGET 问出作者，再依次发 SADD tomb / SREM / ZREM(bylen) / ZREM(byuser) / DEL —— tombstone 先落盘" {
     const gpa = std.testing.allocator;
     // 第一条回复是 GET hikari:chainmember:12345 的结果：nil，表示这个 id
-    // 不属于任何链，revoke() 据此走 revokeSingleLocked，后面四条回复跟改动前
-    // 完全一样。
-    const srv = try FakeServer.start(gpa, "$-1\r\n:1\r\n:1\r\n:1\r\n:1\r\n");
+    // 不属于任何链，revoke() 据此走 revokeSingleLocked。第二条回复是
+    // HGET hikari:quote:12345 user_id 的结果："10001"——revokeSingleLocked
+    // 在 DEL 之前先问出作者，才知道该清理 hikari:byuser 的哪个键；后面
+    // 五条回复是 SADD tomb / SREM index / ZREM bylen / ZREM byuser / DEL。
+    const srv = try FakeServer.start(gpa, "$-1\r\n$5\r\n10001\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n");
     defer {
         srv.stop();
         srv.received.deinit(gpa);
@@ -1196,16 +1455,19 @@ test "revoke（非链成员）先 GET chainmember 查不到，再依次发 SADD 
     c.deinit();
     srv.stop();
 
-    // tombstone 是这次作废唯一持久的事实：它一旦落盘，即使后面三步全失败，
+    // tombstone 是这次作废唯一持久的事实：它一旦落盘，即使后面几步全失败，
     // 下一次扫描的 isTombstoned 也会挡住重新入库，而运营方看到的是"还能查到
     // 这条语录"这种可见、可重试的故障。反过来先 DEL 再 SREM 的话，DEL 成功、
     // SREM 失败会在 hikari:index 里留下一个没有 hash 的悬空 id：randomAny
-    // 抽中它，HGETALL 回空，非空库对外返回 404，而且永远不会自愈。
+    // 抽中它，HGETALL 回空，非空库对外返回 404，而且永远不会自愈。HGET 本身
+    // 是纯读，排在最前面不影响这条不变式。
     try expectFrameSequence(srv.received.items, &.{
         "*2\r\n$3\r\nGET\r\n$24\r\nhikari:chainmember:12345\r\n",
+        "*3\r\n$4\r\nHGET\r\n$18\r\nhikari:quote:12345\r\n$7\r\nuser_id\r\n",
         "*3\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n",
+        "*3\r\n$4\r\nZREM\r\n$19\r\nhikari:byuser:10001\r\n$5\r\n12345\r\n",
         "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
     });
 }
@@ -1217,9 +1479,9 @@ test "revoke（非链成员）先 GET chainmember 查不到，再依次发 SADD 
 // get_msg 回补（窗口外），chainOf 必然返回 null；这里验证的是 Store 层
 // 不依赖窗口、单靠 Redis 里持久化的映射就能把同样的作废展开到全部成员。
 
-test "addChain 依次发每个成员的 SET 映射 / SADD chain 集 / HSET / ZADD / SADD —— 映射先于 index 提交点落盘" {
+test "addChain 依次发每个成员的 SET 映射 / SADD chain 集 / HSET / ZADD(bylen) / ZADD(byuser) / SADD —— 映射先于 index 提交点落盘" {
     const gpa = std.testing.allocator;
-    const srv = try FakeServer.start(gpa, "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    const srv = try FakeServer.start(gpa, "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
     defer {
         srv.stop();
         srv.received.deinit(gpa);
@@ -1230,27 +1492,30 @@ test "addChain 依次发每个成员的 SET 映射 / SADD chain 集 / HSET / ZAD
     var store = Store.init(gpa, &c);
 
     // sampleQuote() 的 message_id 是 12345（链主键）；999 是链的第二个成员。
+    // sampleQuote() 的 user_id 是 10001。
     try store.addChain(sampleQuote(), &.{ 12345, 999 });
 
     c.deinit();
     srv.stop();
 
     // 顺序原则跟 add() 反过来：映射（每个成员一条 SET，外加 chain 成员集的
-    // SADD）必须先于 HSET/ZADD/SADD 落盘，理由见 addChain 的文档注释——
+    // SADD）必须先于 HSET/ZADD/ZADD/SADD 落盘，理由见 addChain 的文档注释——
     // "index 提交成功、映射写失败" 会让非主键成员逃过 isChainMember 守卫。
+    // hikari:byuser 只记主键，跟 hikari:bylen 一致。
     try expectFrameSequence(srv.received.items, &.{
         "*3\r\n$3\r\nSET\r\n$24\r\nhikari:chainmember:12345\r\n$5\r\n12345\r\n",
         "*3\r\n$3\r\nSET\r\n$22\r\nhikari:chainmember:999\r\n$5\r\n12345\r\n",
         "*4\r\n$4\r\nSADD\r\n$18\r\nhikari:chain:12345\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*32\r\n$4\r\nHSET\r\n$18\r\nhikari:quote:12345\r\n",
         "*4\r\n$4\r\nZADD\r\n$12\r\nhikari:bylen\r\n$1\r\n7\r\n$5\r\n12345\r\n",
+        "*4\r\n$4\r\nZADD\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n7\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nSADD\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
     });
 }
 
 fn checkAddChainAlloc(gpa: std.mem.Allocator) !void {
     const net_gpa = std.testing.allocator;
-    const srv = try FakeServer.start(net_gpa, "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    const srv = try FakeServer.start(net_gpa, "+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
     defer {
         srv.stop();
         srv.received.deinit(net_gpa);
@@ -1272,9 +1537,14 @@ test "revoke：💦 引用一条跨窗口链的非主键成员——GET 查到�
     // 窗口里已经看不到 12345/999 本身了（chainOf 在内存里重建不出这条链），
     // 💦 引用的是非主键成员 999——revoke(999) 必须只靠 Redis 里的映射就能
     // 解析出整条链并作废，这正是本次改动要补的 gap。
+    // HGET hikari:quote:12345 user_id -> "10001"（revokeChainLocked 在
+    // DEL 之前问出主键那份 hash 的作者，才知道清理 hikari:byuser 的哪个
+    // 键）之后是 SADD tomb / SREM index / ZREM bylen / ZREM byuser / DEL
+    // quote / DEL 映射清理。
     const script = "$5\r\n12345\r\n" ++ // GET hikari:chainmember:999 -> "12345"
         "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n" ++ // SMEMBERS hikari:chain:12345 -> {12345, 999}
-        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n"; // SADD tomb / SREM index / ZREM bylen / DEL quote / DEL 映射清理
+        "$5\r\n10001\r\n" ++ // HGET hikari:quote:12345 user_id -> "10001"
+        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
     const srv = try FakeServer.start(gpa, script);
     defer {
         srv.stop();
@@ -1293,9 +1563,13 @@ test "revoke：💦 引用一条跨窗口链的非主键成员——GET 查到�
     try expectFrameSequence(srv.received.items, &.{
         "*2\r\n$3\r\nGET\r\n$22\r\nhikari:chainmember:999\r\n",
         "*2\r\n$8\r\nSMEMBERS\r\n$18\r\nhikari:chain:12345\r\n",
+        "*3\r\n$4\r\nHGET\r\n$18\r\nhikari:quote:12345\r\n$7\r\nuser_id\r\n",
         "*4\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*4\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*4\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        // byuser 的 ZREM 带上链的全部成员（12345、999），跟 index/bylen 的
+        // 处理一致——非主键成员对它是无害空操作。
+        "*4\r\n$4\r\nZREM\r\n$19\r\nhikari:byuser:10001\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
         // 映射清理不能省：这一步删掉两个成员各自的 chainmember 键与 chain
         // 成员集本身，"mapping 必须不泄漏" 靠这一帧钉死——只查子串存在性会让
@@ -1308,7 +1582,8 @@ test "revoke：💦 引用链的主键本身——同样走 GET/SMEMBERS 展开�
     const gpa = std.testing.allocator;
     const script = "$5\r\n12345\r\n" ++ // GET hikari:chainmember:12345 -> "12345"（主键映射到自己）
         "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n" ++
-        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+        "$5\r\n10001\r\n" ++ // HGET hikari:quote:12345 user_id -> "10001"
+        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
     const srv = try FakeServer.start(gpa, script);
     defer {
         srv.stop();
@@ -1327,9 +1602,11 @@ test "revoke：💦 引用链的主键本身——同样走 GET/SMEMBERS 展开�
     try expectFrameSequence(srv.received.items, &.{
         "*2\r\n$3\r\nGET\r\n$24\r\nhikari:chainmember:12345\r\n",
         "*2\r\n$8\r\nSMEMBERS\r\n$18\r\nhikari:chain:12345\r\n",
+        "*3\r\n$4\r\nHGET\r\n$18\r\nhikari:quote:12345\r\n$7\r\nuser_id\r\n",
         "*4\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*4\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*4\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        "*4\r\n$4\r\nZREM\r\n$19\r\nhikari:byuser:10001\r\n$5\r\n12345\r\n$3\r\n999\r\n",
         "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
         "*4\r\n$3\r\nDEL\r\n$24\r\nhikari:chainmember:12345\r\n$22\r\nhikari:chainmember:999\r\n$18\r\nhikari:chain:12345\r\n",
     });
@@ -1339,7 +1616,8 @@ fn checkRevokeChainAlloc(gpa: std.mem.Allocator) !void {
     const net_gpa = std.testing.allocator;
     const script = "$5\r\n12345\r\n" ++
         "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n" ++
-        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+        "$5\r\n10001\r\n" ++
+        ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
     const srv = try FakeServer.start(net_gpa, script);
     defer {
         srv.stop();
@@ -1434,7 +1712,7 @@ test "revoke：hikari:chain 集合意外为空时兜底用原始 id 完成撤稿
     // 模拟数据异常/上一次撤稿留下的半成品状态。revokeChainLocked 的兜底
     // 应该退回用 revoke() 最初收到的 id（这里是 12345 自己）继续走完
     // tombstone/清理，而不是对着空 members 发出参数个数为 0 的非法 SADD。
-    const script = "$5\r\n12345\r\n" ++ "*0\r\n" ++ ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+    const script = "$5\r\n12345\r\n" ++ "*0\r\n" ++ "$5\r\n10001\r\n" ++ ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
     const srv = try FakeServer.start(gpa, script);
     defer {
         srv.stop();
@@ -1453,9 +1731,12 @@ test "revoke：hikari:chain 集合意外为空时兜底用原始 id 完成撤稿
     try expectFrameSequence(srv.received.items, &.{
         "*2\r\n$3\r\nGET\r\n$24\r\nhikari:chainmember:12345\r\n",
         "*2\r\n$8\r\nSMEMBERS\r\n$18\r\nhikari:chain:12345\r\n",
+        "*3\r\n$4\r\nHGET\r\n$18\r\nhikari:quote:12345\r\n$7\r\nuser_id\r\n",
         "*3\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$5\r\n12345\r\n",
         "*3\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$5\r\n12345\r\n",
+        // 兜底路径同样只把 fallback_id（12345 自己）纳入 byuser 的清理。
+        "*3\r\n$4\r\nZREM\r\n$19\r\nhikari:byuser:10001\r\n$5\r\n12345\r\n",
         "*2\r\n$3\r\nDEL\r\n$18\r\nhikari:quote:12345\r\n",
         // 兜底只把 fallback_id（12345 自己）纳入清理，所以最后这条 DEL 只有
         // 两个 key：它自己的 chainmember 键 + chain 集合本身，不是三个成员。
@@ -1635,6 +1916,143 @@ test "randomByLength 候选为空数组时返回 null" {
     defer c.deinit();
     var store = Store.init(gpa, &c);
     try std.testing.expectEqual(@as(?Quote, null), try store.randomByLength(gpa, 1, 100));
+}
+
+// ---------------------------------------------------------------------------
+// Filter / randomFiltered / allFiltered / randomManyFiltered —— `/?user_id=`
+// 在三个端点上的统一实现。`isUnfiltered()` 时逐字节委托给改动前就有的
+// randomAny/randomByLength/allQuotes/randomMany（那几个函数的测试已经钉死
+// 了这条路径，这里不重复钉），只有真的带 user_id 和/或长度时才会走下面
+// 这条全新的 ZRANGEBYSCORE 路径。
+
+test "randomFiltered 带 user_id 时走 hikari:byuser（不是 hikari:index），命令帧钉死" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // ZRANGEBYSCORE hikari:byuser:10001 0 4294967295 -> {"12345"}，接着
+    // HGETALL + MGET（resolveDisplayNames，命中 nil，回退 hash 快照）。
+    const script = try std.mem.concat(gpa, u8, &.{ "*1\r\n$5\r\n12345\r\n", hgetall_reply, mget_nil_reply });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomFiltered(gpa, .{ .user_id = 10001 })).?;
+    defer q.deinit(gpa);
+    try std.testing.expectEqualStrings("今天也是好天气", q.hitokoto);
+
+    c.deinit();
+    srv.stop();
+    // 整条命令帧钉死，不是分别 indexOf——key/min/max 换位不能悄悄通过。
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        srv.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n0\r\n$10\r\n4294967295\r\n",
+    ) != null);
+    // hikari:index/hikari:bylen 完全没有被碰过——user_id 存在时不会退回
+    // 全库索引。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:index") == null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:bylen") == null);
+}
+
+test "randomFiltered 带 user_id + 长度区间：score 范围跟着 min/max 走，key 仍是 hikari:byuser" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    const script = try std.mem.concat(gpa, u8, &.{ "*1\r\n$5\r\n12345\r\n", hgetall_reply, mget_nil_reply });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomFiltered(gpa, .{ .user_id = 10001, .min_length = 5, .max_length = 10 })).?;
+    defer q.deinit(gpa);
+    try std.testing.expectEqualStrings("今天也是好天气", q.hitokoto);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        srv.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n5\r\n$2\r\n10\r\n",
+    ) != null);
+}
+
+test "randomFiltered：user_id 对应的候选集合为空（含 136 条无索引的历史语录这种情形）返回 null" {
+    const gpa = std.testing.allocator;
+    // ZRANGEBYSCORE 对一个从未被 ZADD 过的 key（这个人从来没在
+    // hikari:byuser 里出现过——不管是因为他真的没有语录，还是因为他的
+    // 语录属于本次改动之前收录、从未被回填过的 136 条历史语录之一）跟
+    // "存在但恰好被过滤空了"在协议层面是同一个回复：一个空数组，不是
+    // nil、不是错误。randomFiltered 因此对两种成因给出完全相同的结果——
+    // 404（经 server.zig），这正是 store.zig 顶部 key_byuser_prefix 注释
+    // 里记录的、本次改动刻意接受的已知行为。
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+    try std.testing.expectEqual(@as(?Quote, null), try store.randomFiltered(gpa, .{ .user_id = 99999 }));
+}
+
+test "randomFiltered 只有长度、没有 user_id 时委托给 randomByLength（跟改动前逐字节相同）" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+    try std.testing.expectEqual(@as(?Quote, null), try store.randomFiltered(gpa, .{ .min_length = 1, .max_length = 100 }));
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:bylen") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:byuser") == null);
+}
+
+test "randomFiltered 全空（无 user_id 无长度）时委托给 randomAny" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "$-1\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+    try std.testing.expectEqual(@as(?Quote, null), try store.randomFiltered(gpa, .{}));
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SRANDMEMBER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, key_index) != null);
 }
 
 // ---------------------------------------------------------------------------
@@ -2033,4 +2451,231 @@ fn checkAllQuotesAlloc(gpa: std.mem.Allocator) !void {
 
 test "allQuotes 在多条语录构建过程中任意一步分配失败都不泄漏、不重复释放（checkAllAllocationFailures）" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkAllQuotesAlloc, .{});
+}
+
+// ---------------------------------------------------------------------------
+// allFiltered / randomManyFiltered / fetchSampled —— `/extra/all` 与
+// `/extra/batch/:count` 上的 `user_id`/长度过滤。跟上面 randomFiltered 一样，
+// `isUnfiltered()` 时逐字节委托给 allQuotes/randomMany；带任何过滤时才会走
+// ZRANGEBYSCORE + fetchMany/fetchSampled 这条全新的路径。
+
+test "allFiltered 带 user_id 时走 hikari:byuser + 逐个 HGETALL 展开，命令帧" {
+    const gpa = std.testing.allocator;
+    var q2 = sampleQuote();
+    q2.message_id = 999;
+    q2.hitokoto = "第二条语录";
+    q2.length = 5;
+
+    const args1 = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args1);
+    const args2 = try hashFields(gpa, q2);
+    defer freeHashFields(gpa, args2);
+    const h1 = try encodeArrayReply(gpa, args1[2..]);
+    defer gpa.free(h1);
+    const h2 = try encodeArrayReply(gpa, args2[2..]);
+    defer gpa.free(h2);
+
+    // ZRANGEBYSCORE hikari:byuser:10001 0 4294967295 -> {"12345", "999"}
+    // （sampleQuote 与 q2 都是作者 10001 的语录）。
+    const script = try std.mem.concat(gpa, u8, &.{
+        "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        h1,
+        mget_nil_reply,
+        h2,
+        mget_nil_reply,
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.allFiltered(gpa, .{ .user_id = 10001 });
+    defer {
+        for (quotes) |q| q.deinit(gpa);
+        gpa.free(quotes);
+    }
+    try std.testing.expectEqual(@as(usize, 2), quotes.len);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        srv.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n0\r\n$10\r\n4294967295\r\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:quote:12345") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:quote:999") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SMEMBERS") == null);
+}
+
+test "allFiltered 全空时委托给 allQuotes（逐字节相同）" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.allFiltered(gpa, .{});
+    defer gpa.free(quotes);
+    try std.testing.expectEqual(@as(usize, 0), quotes.len);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SMEMBERS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "ZRANGEBYSCORE") == null);
+}
+
+test "allFiltered：user_id 过滤后候选为空返回长度 0 的切片（对应无索引的历史语录场景）" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.allFiltered(gpa, .{ .user_id = 99999 });
+    defer gpa.free(quotes);
+    try std.testing.expectEqual(@as(usize, 0), quotes.len);
+}
+
+test "randomManyFiltered 带 user_id 时有放回抽样——同一个 id 被抽中 3 次，各自单独 HGETALL（允许重复）" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // 候选集合只有一个 id（"12345"），count=3：uintLessThan(1) 恒为 0，
+    // 三次抽样确定性地都落在同一个 id 上，脚本据此重复三份 HGETALL+MGET。
+    const one_fetch = try std.mem.concat(gpa, u8, &.{ hgetall_reply, mget_nil_reply });
+    defer gpa.free(one_fetch);
+    const script = try std.mem.concat(gpa, u8, &.{
+        "*1\r\n$5\r\n12345\r\n",
+        one_fetch,
+        one_fetch,
+        one_fetch,
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.randomManyFiltered(gpa, .{ .user_id = 10001 }, 3);
+    defer {
+        for (quotes) |q| q.deinit(gpa);
+        gpa.free(quotes);
+    }
+    try std.testing.expectEqual(@as(usize, 3), quotes.len);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        srv.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n0\r\n$10\r\n4294967295\r\n",
+    ) != null);
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, srv.received.items, "HGETALL"));
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SRANDMEMBER") == null);
+}
+
+test "randomManyFiltered 全空时委托给 randomMany（逐字节相同，负数 SRANDMEMBER）" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.randomManyFiltered(gpa, .{}, 5);
+    defer gpa.free(quotes);
+    try std.testing.expectEqual(@as(usize, 0), quotes.len);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SRANDMEMBER") != null);
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "-5") != null);
+}
+
+test "randomManyFiltered：user_id 过滤后候选为空返回长度 0 的切片，不崩" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const quotes = try store.randomManyFiltered(gpa, .{ .user_id = 99999 }, 5);
+    defer gpa.free(quotes);
+    try std.testing.expectEqual(@as(usize, 0), quotes.len);
+}
+
+/// checkAllAllocationFailures 专用：跟 checkAllQuotesAlloc 同一套纪律（网络层
+/// 全部用不参与失败注入的 net_gpa），这里专门覆盖 fetchSampled——它是这次
+/// 改动新增的函数，虽然清理逻辑跟 fetchMany 逐字同构，但复制出来的这份
+/// 代码没有理由假定它"自动"继承 fetchMany 已经测过的保证，必须单独证明。
+fn checkFetchSampledAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+
+    const args = try hashFields(net_gpa, sampleQuote());
+    defer freeHashFields(net_gpa, args);
+    const h = try encodeArrayReply(net_gpa, args[2..]);
+    defer net_gpa.free(h);
+
+    const one_fetch = try std.mem.concat(net_gpa, u8, &.{ h, mget_nil_reply });
+    defer net_gpa.free(one_fetch);
+    const script = try std.mem.concat(net_gpa, u8, &.{
+        "*1\r\n$5\r\n12345\r\n",
+        one_fetch,
+        one_fetch,
+    });
+    defer net_gpa.free(script);
+
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(net_gpa, &c);
+
+    const quotes = try st.randomManyFiltered(gpa, .{ .user_id = 10001 }, 2);
+    for (quotes) |q| q.deinit(gpa);
+    gpa.free(quotes);
+}
+
+test "fetchSampled（经 randomManyFiltered）在分配失败时不泄漏、不重复释放（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFetchSampledAlloc, .{});
 }

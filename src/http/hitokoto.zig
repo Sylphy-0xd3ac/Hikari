@@ -9,6 +9,7 @@ pub const QueryError = error{
     InvalidNumber,
     InvalidEncode,
     InvalidCallback,
+    InvalidUserId,
     OutOfMemory,
 };
 
@@ -18,6 +19,7 @@ pub const Query = struct {
     max_length: ?usize = null,
     callback: ?[]u8 = null,
     select: []u8,
+    user_id: ?u64 = null,
 
     pub fn deinit(self: Query, gpa: std.mem.Allocator) void {
         if (self.callback) |c| gpa.free(c);
@@ -105,6 +107,11 @@ pub fn parseQuery(gpa: std.mem.Allocator, target: []const u8) QueryError!Query {
             q.min_length = std.fmt.parseInt(usize, v_raw, 10) catch return error.InvalidNumber;
         } else if (std.mem.eql(u8, k, "max_length")) {
             q.max_length = std.fmt.parseInt(usize, v_raw, 10) catch return error.InvalidNumber;
+        } else if (std.mem.eql(u8, k, "user_id")) {
+            // QQ 号是非负整数；语法上不合法（负号、非数字、溢出 u64）一律
+            // 400，不是"这个人没有语录"——后者是一个合法的空结果（404/[]]），
+            // 前者是一个格式错误的请求，两者不能混为一谈。
+            q.user_id = std.fmt.parseInt(u64, v_raw, 10) catch return error.InvalidUserId;
         } else if (std.mem.eql(u8, k, "callback")) {
             // 先解码出新值、校验 + 成功了再释放旧值：如果 percentDecodeAlloc
             // 失败，或者解码出来的值没通过 isValidCallback 校验，q.callback
@@ -124,6 +131,98 @@ pub fn parseQuery(gpa: std.mem.Allocator, target: []const u8) QueryError!Query {
             q.select = decoded;
         }
         // 其余参数（含 c）接受但忽略
+    }
+
+    if (q.min_length) |lo| {
+        if (q.max_length) |hi| {
+            if (lo > hi) return error.BadLengthRange;
+        }
+    }
+    return q;
+}
+
+/// `/extra/all` 与 `/extra/batch/:count` 认的数组形态编码——没有 `js`：
+/// `js` 是"往 `select` 选中的 DOM 元素里写正文"的自执行脚本，这个概念
+/// 本身要求"恰好一条语录、恰好一个 DOM 目标"，对一个数组没有意义（往哪个
+/// 元素写哪一条？），`select` 参数因此在这两个端点上也被忽略。
+pub const ExtraEncode = enum { json, text };
+
+pub const ExtraQueryError = error{
+    UnsupportedCharset,
+    BadLengthRange,
+    InvalidNumber,
+    InvalidEncode,
+    /// `encode=js` 语法上合法（`/` 认得这个值），但这两个数组端点不支持
+    /// 它——故意用一个跟 `InvalidEncode`（值本身就不认识，比如 `encode=xml`）
+    /// 不同的错误名字，好让 server.zig 能给出一条更精确的消息："js 不是
+    /// 数组端点支持的编码"而不是笼统的"不认识这个 encode"。两者都映射到
+    /// 400，区别只在错误消息的措辞。
+    UnsupportedEncode,
+    InvalidCallback,
+    InvalidUserId,
+    OutOfMemory,
+};
+
+pub const ExtraQuery = struct {
+    encode: ExtraEncode = .json,
+    min_length: ?usize = null,
+    max_length: ?usize = null,
+    user_id: ?u64 = null,
+    callback: ?[]u8 = null,
+
+    pub fn deinit(self: ExtraQuery, gpa: std.mem.Allocator) void {
+        if (self.callback) |c| gpa.free(c);
+    }
+};
+
+/// `/extra/all` 与 `/extra/batch/:count` 的查询串解析。跟 `parseQuery`
+/// （`/` 用的那个）结构上几乎是镜像，但故意是一个独立的函数、独立的
+/// 结构体，不是共用一份代码加 if 分支：两个端点认的参数集合、`encode`
+/// 的合法取值、`select` 要不要处理，这些都不一样，共用一份实现只会把
+/// "这个端点到底支不支持这个参数"这件事变成运行时才能确定的东西。
+///
+/// `select` 被有意跳过、不解码也不校验——它落进最后"其余参数接受但忽略"
+/// 那一支，不占用任何分配，这也是它跟 `parseQuery` 里 `select` 处理
+/// 唯一的区别所在。
+pub fn parseExtraQuery(gpa: std.mem.Allocator, target: []const u8) ExtraQueryError!ExtraQuery {
+    var q: ExtraQuery = .{};
+    errdefer q.deinit(gpa);
+
+    const qmark = std.mem.indexOfScalar(u8, target, '?') orelse return q;
+    const qs = target[qmark + 1 ..];
+
+    var it = std.mem.tokenizeScalar(u8, qs, '&');
+    while (it.next()) |kv| {
+        const eq = std.mem.indexOfScalar(u8, kv, '=') orelse continue;
+        const k = kv[0..eq];
+        const v_raw = kv[eq + 1 ..];
+
+        if (std.mem.eql(u8, k, "encode")) {
+            if (std.mem.eql(u8, v_raw, "json")) {
+                q.encode = .json;
+            } else if (std.mem.eql(u8, v_raw, "text")) {
+                q.encode = .text;
+            } else if (std.mem.eql(u8, v_raw, "js")) {
+                return error.UnsupportedEncode;
+            } else return error.InvalidEncode;
+        } else if (std.mem.eql(u8, k, "charset")) {
+            if (!std.ascii.eqlIgnoreCase(v_raw, "utf-8") and !std.ascii.eqlIgnoreCase(v_raw, "utf8")) {
+                return error.UnsupportedCharset;
+            }
+        } else if (std.mem.eql(u8, k, "min_length")) {
+            q.min_length = std.fmt.parseInt(usize, v_raw, 10) catch return error.InvalidNumber;
+        } else if (std.mem.eql(u8, k, "max_length")) {
+            q.max_length = std.fmt.parseInt(usize, v_raw, 10) catch return error.InvalidNumber;
+        } else if (std.mem.eql(u8, k, "user_id")) {
+            q.user_id = std.fmt.parseInt(u64, v_raw, 10) catch return error.InvalidUserId;
+        } else if (std.mem.eql(u8, k, "callback")) {
+            const decoded = try percentDecodeAlloc(gpa, v_raw);
+            errdefer gpa.free(decoded);
+            if (!isValidCallback(decoded)) return error.InvalidCallback;
+            if (q.callback) |old| gpa.free(old);
+            q.callback = decoded;
+        }
+        // 其余参数（含 c、select）接受但忽略
     }
 
     if (q.min_length) |lo| {
@@ -241,6 +340,48 @@ pub fn jsonArrayBody(gpa: std.mem.Allocator, quotes: []const store.Quote) ![]u8 
     return aw.toOwnedSlice();
 }
 
+/// `encode=text` 在 `/extra/all` 与 `/extra/batch/:count` 上的形态：一个
+/// JSON 字符串数组，只有 `hitokoto` 正文，跟 `encode=json` 的完整对象数组
+/// 是同一批语录的两种不同投影。空切片产出 `[]`，跟 `jsonArrayBody` 一致。
+pub fn textArrayBody(gpa: std.mem.Allocator, quotes: []const store.Quote) ![]u8 {
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    errdefer aw.deinit();
+
+    const strs = try gpa.alloc([]const u8, quotes.len);
+    defer gpa.free(strs);
+    for (quotes, 0..) |q, i| strs[i] = q.hitokoto;
+
+    try writeJson(strs, &aw.writer, .{});
+    return aw.toOwnedSlice();
+}
+
+/// `encode` 决定数组元素的形状（`json` 的完整对象 / `text` 的纯字符串），
+/// `extraArrayBody` 只是把这个选择收敛成一处，`renderExtra` 与调用方都不用
+/// 各自维护一份 switch。
+fn extraArrayBody(gpa: std.mem.Allocator, quotes: []const store.Quote, encode: ExtraEncode) ![]u8 {
+    return switch (encode) {
+        .json => jsonArrayBody(gpa, quotes),
+        .text => textArrayBody(gpa, quotes),
+    };
+}
+
+/// `/extra/all` 与 `/extra/batch/:count` 的统一渲染入口，跟 `render`（`/`
+/// 用的那个）结构对称：`encode` 决定数组元素的形状，`callback` 存在时把
+/// **整个数组**——不管是对象数组还是字符串数组——包进 `{callback}({body})`
+/// 的 JSONP 壳。跟 `/` 的 `render` 不同的是，这里 `callback` 不会覆盖
+/// `encode` 的选择（`/` 的 Hitokoto 语义里 callback 恒定输出完整对象，
+/// 数组端点没有对应的既有约定，选择让两者正交：callback 只管"要不要包一层
+/// 函数调用"，不改变数组本身的形状）。
+pub fn renderExtra(gpa: std.mem.Allocator, quotes: []const store.Quote, query: ExtraQuery) !Rendered {
+    const body = try extraArrayBody(gpa, quotes, query.encode);
+    if (query.callback) |cb| {
+        defer gpa.free(body);
+        const out = try std.fmt.allocPrint(gpa, "{s}({s})", .{ cb, body });
+        return .{ .body = out, .content_type = "application/javascript; charset=utf-8" };
+    }
+    return .{ .body = body, .content_type = "application/json; charset=utf-8" };
+}
+
 pub fn errorBody(gpa: std.mem.Allocator, message: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
@@ -353,6 +494,29 @@ test "parseQuery 拒绝非法 encode 与非数字长度" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidEncode, parseQuery(gpa, "/?encode=xml"));
     try std.testing.expectError(error.InvalidNumber, parseQuery(gpa, "/?min_length=abc"));
+}
+
+test "parseQuery 解析 user_id" {
+    const gpa = std.testing.allocator;
+    const q = try parseQuery(gpa, "/?user_id=10001");
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(@as(?u64, 10001), q.user_id);
+}
+
+test "parseQuery 不带 user_id 时是 null" {
+    const gpa = std.testing.allocator;
+    const q = try parseQuery(gpa, "/");
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(@as(?u64, null), q.user_id);
+}
+
+test "parseQuery 拒绝非法 user_id（负数、非数字、溢出 u64）—— 400 而不是当成\"这个人没有语录\"" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=-1"));
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=abc"));
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id="));
+    // u64 最大值是 18446744073709551615，多一位数字就溢出。
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=184467440737095516150"));
 }
 
 test "parseQuery 拒绝 min > max" {
@@ -602,4 +766,193 @@ test "jsonArrayBody 在多条语录序列化时分配失败不泄漏（checkAllA
     const gpa = std.testing.allocator;
     const quotes = [_]store.Quote{ sample(), sample2() };
     try std.testing.checkAllAllocationFailures(gpa, checkJsonArrayBodyAlloc, .{quotes[0..]});
+}
+
+// ---------------------------------------------------------------------------
+// textArrayBody / extraArrayBody / renderExtra —— `/extra/all` 与
+// `/extra/batch/:count` 的 `encode=text` 数组形态、以及两个端点共用的渲染
+// 入口。
+
+test "textArrayBody 产出跟元素个数一致的字符串数组，只有 hitokoto 正文" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    const body = try textArrayBody(gpa, &quotes);
+    defer gpa.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("今天也是好天气", arr[0].string);
+    try std.testing.expectEqualStrings("第二条语录", arr[1].string);
+}
+
+test "textArrayBody 空切片产出 []" {
+    const gpa = std.testing.allocator;
+    const body = try textArrayBody(gpa, &.{});
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("[]", body);
+}
+
+fn checkTextArrayBodyAlloc(gpa: std.mem.Allocator, quotes: []const store.Quote) !void {
+    const b = try textArrayBody(gpa, quotes);
+    gpa.free(b);
+}
+
+test "textArrayBody 在多条语录序列化时分配失败不泄漏（checkAllAllocationFailures）" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    try std.testing.checkAllAllocationFailures(gpa, checkTextArrayBodyAlloc, .{quotes[0..]});
+}
+
+test "parseExtraQuery 默认值：json 编码，没有过滤，没有 callback" {
+    const gpa = std.testing.allocator;
+    const q = try parseExtraQuery(gpa, "/extra/all");
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(ExtraEncode.json, q.encode);
+    try std.testing.expectEqual(@as(?usize, null), q.min_length);
+    try std.testing.expectEqual(@as(?usize, null), q.max_length);
+    try std.testing.expectEqual(@as(?u64, null), q.user_id);
+    try std.testing.expectEqual(@as(?[]u8, null), q.callback);
+}
+
+test "parseExtraQuery 解析 user_id / 长度 / encode=text / callback" {
+    const gpa = std.testing.allocator;
+    const q = try parseExtraQuery(gpa, "/extra/all?user_id=10001&min_length=3&max_length=20&encode=text&callback=moe");
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(ExtraEncode.text, q.encode);
+    try std.testing.expectEqual(@as(?usize, 3), q.min_length);
+    try std.testing.expectEqual(@as(?usize, 20), q.max_length);
+    try std.testing.expectEqual(@as(?u64, 10001), q.user_id);
+    try std.testing.expectEqualStrings("moe", q.callback.?);
+}
+
+test "parseExtraQuery：encode=js 是 error.UnsupportedEncode，不是静默降级成 json" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.UnsupportedEncode, parseExtraQuery(gpa, "/extra/all?encode=js"));
+    // 跟"这个 encode 压根不认识"（比如 xml）区分开：一个是"合法值、这个
+    // 端点不支持"，一个是"这个值本身就不认识"，映射到 400 的同时给不同
+    // 的错误消息（server.zig）。
+    try std.testing.expectError(error.InvalidEncode, parseExtraQuery(gpa, "/extra/all?encode=xml"));
+}
+
+test "parseExtraQuery：select 被接受但完全忽略，不解码也不占分配、不出现在结构体上" {
+    const gpa = std.testing.allocator;
+    // 恶意/畸形的 select 值（企图闭合脚本的双引号）在这两个端点上不该有
+    // 任何效果——它不是 ExtraQuery 的字段，压根不会被读到。
+    const q = try parseExtraQuery(gpa, "/extra/all?select=%22evil");
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(ExtraEncode.json, q.encode);
+}
+
+test "parseExtraQuery 拒绝非法 user_id / 非法 encode / 非数字长度 / min>max / 非 utf-8 charset" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/all?user_id=abc"));
+    try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/all?user_id=-1"));
+    try std.testing.expectError(error.InvalidEncode, parseExtraQuery(gpa, "/extra/all?encode=xml"));
+    try std.testing.expectError(error.InvalidNumber, parseExtraQuery(gpa, "/extra/all?min_length=abc"));
+    try std.testing.expectError(error.BadLengthRange, parseExtraQuery(gpa, "/extra/all?min_length=10&max_length=3"));
+    try std.testing.expectError(error.UnsupportedCharset, parseExtraQuery(gpa, "/extra/all?charset=gbk"));
+    const ok = try parseExtraQuery(gpa, "/extra/all?charset=utf-8");
+    defer ok.deinit(gpa);
+}
+
+test "parseExtraQuery 接受但忽略 c 参数" {
+    const gpa = std.testing.allocator;
+    const q = try parseExtraQuery(gpa, "/extra/all?c=a&c=b");
+    defer q.deinit(gpa);
+    try std.testing.expectEqual(ExtraEncode.json, q.encode);
+}
+
+test "parseExtraQuery 拒绝非法字符集或为空的 callback（跟 parseQuery 共用同一套 JSONP 校验）" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidCallback,
+        parseExtraQuery(gpa, "/extra/all?callback=alert(document.cookie);%2F%2F"),
+    );
+    try std.testing.expectError(error.InvalidCallback, parseExtraQuery(gpa, "/extra/all?callback="));
+}
+
+fn checkParseExtraQueryAlloc(gpa: std.mem.Allocator, target: []const u8) !void {
+    const q = try parseExtraQuery(gpa, target);
+    q.deinit(gpa);
+}
+
+test "parseExtraQuery 在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        checkParseExtraQueryAlloc,
+        .{"/extra/all?callback=moe&callback=nya"},
+    );
+}
+
+test "renderExtra：encode=json（默认）产出完整对象数组，Content-Type 固定 application/json" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    const q = try parseExtraQuery(gpa, "/extra/all");
+    defer q.deinit(gpa);
+    const r = try renderExtra(gpa, &quotes, q);
+    defer r.deinit(gpa);
+    try std.testing.expectEqualStrings("application/json; charset=utf-8", r.content_type);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, r.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+}
+
+test "renderExtra：encode=text 产出字符串数组，Content-Type 仍是 application/json" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    const q = try parseExtraQuery(gpa, "/extra/all?encode=text");
+    defer q.deinit(gpa);
+    const r = try renderExtra(gpa, &quotes, q);
+    defer r.deinit(gpa);
+    try std.testing.expectEqualStrings("application/json; charset=utf-8", r.content_type);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, r.body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("今天也是好天气", parsed.value.array.items[0].string);
+}
+
+test "renderExtra：callback 存在时把整个数组包进 JSONP，Content-Type 变成 application/javascript" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    const q = try parseExtraQuery(gpa, "/extra/all?callback=moe");
+    defer q.deinit(gpa);
+    const r = try renderExtra(gpa, &quotes, q);
+    defer r.deinit(gpa);
+    try std.testing.expectEqualStrings("application/javascript; charset=utf-8", r.content_type);
+    try std.testing.expect(std.mem.startsWith(u8, r.body, "moe(["));
+    try std.testing.expect(std.mem.endsWith(u8, r.body, "])"));
+}
+
+test "renderExtra：callback + encode=text 组合，JSONP 包的是字符串数组" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{sample()};
+    const q = try parseExtraQuery(gpa, "/extra/all?callback=moe&encode=text");
+    defer q.deinit(gpa);
+    const r = try renderExtra(gpa, &quotes, q);
+    defer r.deinit(gpa);
+    try std.testing.expectEqualStrings("application/javascript; charset=utf-8", r.content_type);
+    try std.testing.expect(std.mem.indexOf(u8, r.body, "\"今天也是好天气\"") != null);
+}
+
+test "renderExtra：空切片仍然产出合法的 [] / callback([])" {
+    const gpa = std.testing.allocator;
+    const q = try parseExtraQuery(gpa, "/extra/all");
+    defer q.deinit(gpa);
+    const r = try renderExtra(gpa, &.{}, q);
+    defer r.deinit(gpa);
+    try std.testing.expectEqualStrings("[]", r.body);
+}
+
+fn checkRenderExtraAlloc(gpa: std.mem.Allocator, quotes: []const store.Quote, query: ExtraQuery) !void {
+    const r = try renderExtra(gpa, quotes, query);
+    r.deinit(gpa);
+}
+
+test "renderExtra(callback) 在分配失败时不泄漏中间的数组 body（checkAllAllocationFailures）" {
+    const gpa = std.testing.allocator;
+    const quotes = [_]store.Quote{ sample(), sample2() };
+    const query = try parseExtraQuery(gpa, "/extra/all?callback=moe");
+    defer query.deinit(gpa);
+    try std.testing.checkAllAllocationFailures(gpa, checkRenderExtraAlloc, .{ quotes[0..], query });
 }

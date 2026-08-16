@@ -478,11 +478,13 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     const gpa = std.testing.allocator;
 
     // 两行输入：第一行是全新文本，走完整路径（isTombstoned / exists / nextId
-    // / HSET / ZADD / SADD）；第二行模拟"这条文本对应的合成 id 已经在库里"
-    // （isTombstoned=0, exists=1），代表重复运行 import 时第二次遇到同一行
-    // 会发生的事——deriveId 对同一段文本恒定输出同一个 id 已经在上面的纯
-    // 函数测试里钉住了，这里钉的是"exists 命中时 Store 层面确实会被挡下"。
-    const redis_script = ":0\r\n" ++ ":0\r\n" ++ ":1\r\n" ++ ":15\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":0\r\n" ++ ":1\r\n";
+    // / HSET / ZADD(bylen) / ZADD(byuser) / SADD）；第二行模拟"这条文本对应
+    // 的合成 id 已经在库里"（isTombstoned=0, exists=1），代表重复运行 import
+    // 时第二次遇到同一行会发生的事——deriveId 对同一段文本恒定输出同一个 id
+    // 已经在上面的纯函数测试里钉住了，这里钉的是"exists 命中时 Store 层面
+    // 确实会被挡下"。add() 现在多写一条 hikari:byuser 的 ZADD（见
+    // store.zig），脚本因此比改动前多一条 ":1\r\n"。
+    const redis_script = ":0\r\n" ++ ":0\r\n" ++ ":1\r\n" ++ ":15\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":0\r\n" ++ ":1\r\n";
     const redis_srv = try FakeRedisServer.start(gpa, redis_script);
     defer {
         redis_srv.stop();

@@ -152,6 +152,7 @@ pub const Server = struct {
                 error.InvalidNumber => "min_length and max_length must be integers",
                 error.InvalidEncode => "encode must be one of json, text, js",
                 error.InvalidCallback => "callback must be non-empty and match [A-Za-z0-9_$.]",
+                error.InvalidUserId => "user_id must be a non-negative integer",
                 error.OutOfMemory => return e,
             };
             const b = try hitokoto.errorBody(gpa, msg);
@@ -160,10 +161,15 @@ pub const Server = struct {
         };
         defer query.deinit(gpa);
 
-        const maybe = if (query.min_length != null or query.max_length != null)
-            self.st.randomByLength(gpa, query.min_length orelse 0, query.max_length orelse std.math.maxInt(u32))
-        else
-            self.st.randomAny(gpa);
+        // randomFiltered 在过滤条件全空（没有 user_id 也没有长度约束）时
+        // 逐字节委托给 randomAny；只带长度时委托给 randomByLength——两种
+        // 情况发给 Redis 的命令序列跟这次改动之前完全相同。只有 user_id
+        // 非 null 时才会走 hikari:byuser 这条新路径。
+        const maybe = self.st.randomFiltered(gpa, .{
+            .user_id = query.user_id,
+            .min_length = query.min_length,
+            .max_length = query.max_length,
+        });
 
         // 区分两类失败：Redis 返回“没有匹配”（null）是正常的 404；Redis
         // 本身连不上/协议错误/读写失败是另一类——不能让它原样从 handle
@@ -197,14 +203,40 @@ pub const Server = struct {
         });
     }
 
-    /// `GET /extra/all`：返回全部语录，JSON 数组。不认 `encode`/`min_length`/
-    /// `max_length`/`callback`/`select`——一言协议没有多条语录的形态，这条
-    /// 路径落在 `/extra/` 前缀下就是在承认它是自定义扩展，query string 整个
-    /// 被忽略，不解析。
+    /// `parseExtraQuery` 失败时的错误消息映射，`handleExtraAll` /
+    /// `handleExtraBatch` 共用——两个端点认的参数集合、错误名字完全相同
+    /// （都来自同一个 `ExtraQuery`），只维护一份映射，不给两处各自漂移的
+    /// 机会。
+    fn extraQueryErrorMessage(e: hitokoto.ExtraQueryError) []const u8 {
+        return switch (e) {
+            error.UnsupportedCharset => "only utf-8 charset is supported",
+            error.BadLengthRange => "min_length must not exceed max_length",
+            error.InvalidNumber => "min_length and max_length must be integers",
+            error.InvalidEncode => "encode must be one of json, text",
+            // encode=js 在 /extra/all 与 /extra/batch/:count 上是 400，不是
+            // 静默降级成 json：这两个端点的响应形态是一个数组，js 编码产出
+            // 的是"往 DOM 里写正文"的自执行脚本，这个概念要求恰好一条语录
+            // 和一个 DOM 目标，对一个数组没有自然的定义（应该往哪个元素写
+            // 哪一条？）。跟客户端要求的形状不一样时默默换一种形状返回，
+            // 比明确告诉它"这个形状不支持"更容易在客户端那边造成静默的
+            // 解析错误——这条原则跟 charset=gbk 拒绝而不是悄悄当 utf-8
+            // 处理是同一个道理。
+            error.UnsupportedEncode => "encode=js is not supported on array endpoints (js targets a single DOM element, not an array); use json or text",
+            error.InvalidCallback => "callback must be non-empty and match [A-Za-z0-9_$.]",
+            error.InvalidUserId => "user_id must be a non-negative integer",
+            error.OutOfMemory => unreachable, // 调用方在这之前已经把 OutOfMemory 单独 return 出去
+        };
+    }
+
+    /// `GET /extra/all`：返回全部语录，数组。支持 `user_id`/`min_length`/
+    /// `max_length`/`encode`（`json`/`text`，`js` 400）/`callback`/
+    /// `charset`（仅 utf-8）/`c`（忽略）；`select` 被接受但忽略——它只对
+    /// `encode=js` 的 DOM 注入有意义，这两个端点不支持 `js`。
     ///
-    /// 库空 → `[]` + 200，不是 404：跟 `/` 的"没有可服务的东西"不是一回事。
-    /// 数组端点返回空数组本身就是一个成功的答案（"这就是全部，全部是零条"），
-    /// 404 意味着"这条资源不存在"，语义不对。`/` 的单条语义不适用于这里。
+    /// 库空、或者过滤后没有匹配 → `[]` + 200，不是 404：跟 `/` 的"没有可
+    /// 服务的东西"不是一回事。数组端点返回空数组本身就是一个成功的答案
+    /// （"这就是全部，全部是零条"），404 意味着"这条资源不存在"，语义不对。
+    /// `/` 的单条语义不适用于这里。
     fn handleExtraAll(self: *Server, req: *std.http.Server.Request) !void {
         const gpa = self.gpa;
 
@@ -214,7 +246,19 @@ pub const Server = struct {
             return respondJson(req, .method_not_allowed, b);
         }
 
-        const quotes = self.st.allQuotes(gpa) catch |e| {
+        const query = hitokoto.parseExtraQuery(gpa, req.head.target) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            const b = try hitokoto.errorBody(gpa, extraQueryErrorMessage(e));
+            defer gpa.free(b);
+            return respondJson(req, .bad_request, b);
+        };
+        defer query.deinit(gpa);
+
+        const quotes = self.st.allFiltered(gpa, .{
+            .user_id = query.user_id,
+            .min_length = query.min_length,
+            .max_length = query.max_length,
+        }) catch |e| {
             if (e == error.OutOfMemory) return e;
             const b = try hitokoto.errorBody(gpa, "storage backend unavailable");
             defer gpa.free(b);
@@ -225,19 +269,27 @@ pub const Server = struct {
             gpa.free(quotes);
         }
 
-        const body = try hitokoto.jsonArrayBody(gpa, quotes);
-        defer gpa.free(body);
-        return respondJson(req, .ok, body);
+        const rendered = try hitokoto.renderExtra(gpa, quotes, query);
+        defer rendered.deinit(gpa);
+        try req.respond(rendered.body, .{
+            .status = .ok,
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "content-type", .value = rendered.content_type }},
+        });
     }
 
-    /// `GET /extra/batch/:count`：随机返回 `count` 条语录，JSON 数组，
-    /// **允许重复**——运营方明确选了这个语义（见 `store.randomMany` 的
-    /// SRANDMEMBER 负数形式）。同样不认 `/` 的那套 query 参数。
+    /// `GET /extra/batch/:count`：随机返回 `count` 条语录，数组，**允许
+    /// 重复**——运营方明确选了这个语义（见 `store.randomMany` 的
+    /// SRANDMEMBER 负数形式，以及带过滤时 `Store.fetchSampled` 的有放回
+    /// 抽样）。支持的参数集合跟 `handleExtraAll` 完全相同。
     ///
     /// `count` 上限钉在 1000：它直接来自 URL，不做上限的话
     /// `/extra/batch/999999999` 是任何人都能触发的分配耗尽攻击——这不是
-    /// 保守，是这条路径独有的暴露面。`/extra/all` 不需要这条护栏，因为它的
-    /// 规模由库大小决定，不是由用户输入决定。
+    /// 保守，是这条路径独有的暴露面，`user_id` 过滤不改变这条护栏：即便
+    /// 过滤之后这个人的候选集合很小，`count` 依然是"要抽多少次"，抽样
+    /// 次数本身就是分配规模，跟候选集合大小是两回事。`/extra/all` 不需要
+    /// 这条护栏，因为它的规模由库大小（或者过滤后的子集大小）决定，不受
+    /// 用户输入直接控制。
     fn handleExtraBatch(self: *Server, req: *std.http.Server.Request, count_str: []const u8) !void {
         const gpa = self.gpa;
 
@@ -261,7 +313,19 @@ pub const Server = struct {
             return respondJson(req, .bad_request, b);
         }
 
-        const quotes = self.st.randomMany(gpa, count) catch |e| {
+        const query = hitokoto.parseExtraQuery(gpa, req.head.target) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            const b = try hitokoto.errorBody(gpa, extraQueryErrorMessage(e));
+            defer gpa.free(b);
+            return respondJson(req, .bad_request, b);
+        };
+        defer query.deinit(gpa);
+
+        const quotes = self.st.randomManyFiltered(gpa, .{
+            .user_id = query.user_id,
+            .min_length = query.min_length,
+            .max_length = query.max_length,
+        }, count) catch |e| {
             if (e == error.OutOfMemory) return e;
             const b = try hitokoto.errorBody(gpa, "storage backend unavailable");
             defer gpa.free(b);
@@ -272,9 +336,13 @@ pub const Server = struct {
             gpa.free(quotes);
         }
 
-        const body = try hitokoto.jsonArrayBody(gpa, quotes);
-        defer gpa.free(body);
-        return respondJson(req, .ok, body);
+        const rendered = try hitokoto.renderExtra(gpa, quotes, query);
+        defer rendered.deinit(gpa);
+        try req.respond(rendered.body, .{
+            .status = .ok,
+            .keep_alive = false,
+            .extra_headers = &.{.{ .name = "content-type", .value = rendered.content_type }},
+        });
     }
 };
 
@@ -928,4 +996,320 @@ test "GET /extra/batch/:count 遇到 Redis 协议错误时是 500 + JSON 错误�
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
     defer parsed.deinit();
     try std.testing.expect(parsed.value.object.get("message") != null);
+}
+
+// ---------------------------------------------------------------------------
+// /?user_id= 与 /extra/{all,batch/:count} 上的全部参数：作者过滤（三个端点）、
+// 跟长度过滤组合、encode=text 的数组形态、encode=js 在数组端点上的 400、
+// callback 包裹数组、count 上限跟 user_id 的组合、以及 136 条无索引历史
+// 语录在 HTTP 层的可见结果。
+
+test "GET /?user_id= 命中时用 hikari:byuser（不是 hikari:index），命令帧钉死" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{ "*1\r\n$5\r\n12345\r\n", hgetallReply(), mget_nil_reply };
+    const fake = try FakeRedis.start(gpa, &replies);
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, srv.port(), "/?user_id=10001", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    thread.join();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("今天也是好天气", parsed.value.object.get("hitokoto").?.string);
+
+    client.deinit();
+    fake.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fake.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n0\r\n$10\r\n4294967295\r\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "hikari:index") == null);
+}
+
+test "GET /?user_id=&min_length=&max_length= 组合：score 区间钉着 min/max，key 仍是 hikari:byuser" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{ "*1\r\n$5\r\n12345\r\n", hgetallReply(), mget_nil_reply };
+    const fake = try FakeRedis.start(gpa, &replies);
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, srv.port(), "/?user_id=10001&min_length=3&max_length=20", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    thread.join();
+
+    client.deinit();
+    fake.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fake.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n3\r\n$2\r\n20\r\n",
+    ) != null);
+}
+
+test "GET /?user_id= 对应候选为空时返回 404 —— 覆盖真的没有语录、以及 136 条无索引历史语录两种成因" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{"*0\r\n"};
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    try std.testing.expectEqual(
+        std.http.Status.not_found,
+        try get(gpa, h.srv.port(), "/?user_id=88888", &body),
+    );
+}
+
+test "GET /?user_id= 非法值（非数字/负数）返回 400，不碰 Redis" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{ "/?user_id=abc", "/?user_id=-1", "/?user_id=" }) |path| {
+        const h = try startHarness(gpa, &[_][]const u8{});
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(std.http.Status.bad_request, try get(gpa, h.srv.port(), path, &body));
+    }
+}
+
+test "GET /extra/all?user_id= 走 hikari:byuser，返回过滤后的数组" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{
+        "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n",
+        hgetallReply(),
+        mget_nil_reply,
+        hgetallReply2(),
+        mget_nil_reply,
+    };
+    const fake = try FakeRedis.start(gpa, &replies);
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, srv.port(), "/extra/all?user_id=10001", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    thread.join();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+
+    client.deinit();
+    fake.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fake.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n0\r\n$10\r\n4294967295\r\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "SMEMBERS") == null);
+}
+
+test "GET /extra/all?user_id= 无匹配时返回 []，200，不是 404" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{"*0\r\n"};
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all?user_id=88888", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    try std.testing.expectEqualStrings("[]", body.written());
+}
+
+test "GET /extra/all?encode=text 返回字符串数组，Content-Type 仍是 application/json" {
+    const gpa = std.testing.allocator;
+    const smembers = "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n";
+    const replies = [_][]const u8{ smembers, hgetallReply(), mget_nil_reply, hgetallReply2(), mget_nil_reply };
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all?encode=text", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    const arr = parsed.value.array.items;
+    try std.testing.expectEqual(@as(usize, 2), arr.len);
+    try std.testing.expectEqualStrings("今天也是好天气", arr[0].string);
+    try std.testing.expectEqualStrings("第二条语录", arr[1].string);
+}
+
+test "GET /extra/all?encode=js 返回 400 —— 数组端点不支持 js，不是静默降级成 json" {
+    const gpa = std.testing.allocator;
+    const h = try startHarness(gpa, &[_][]const u8{});
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all?encode=js", &body);
+    try std.testing.expectEqual(std.http.Status.bad_request, status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("message") != null);
+}
+
+test "GET /extra/all?callback=moe 把整个数组包进 JSONP，Content-Type 变成 application/javascript" {
+    const gpa = std.testing.allocator;
+    const smembers = "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n";
+    const replies = [_][]const u8{ smembers, hgetallReply(), mget_nil_reply, hgetallReply2(), mget_nil_reply };
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/all?callback=moe", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    try std.testing.expect(std.mem.startsWith(u8, body.written(), "moe(["));
+    try std.testing.expect(std.mem.endsWith(u8, body.written(), "])"));
+}
+
+test "GET /extra/batch/:count?user_id= 走 hikari:byuser 有放回抽样，命令帧钉死" {
+    const gpa = std.testing.allocator;
+    // 候选集合只有一个 id，count=2：两次抽样确定性地落在同一个 id 上。
+    const range = "*1\r\n$5\r\n12345\r\n";
+    const replies = [_][]const u8{ range, hgetallReply(), mget_nil_reply, hgetallReply(), mget_nil_reply };
+    const fake = try FakeRedis.start(gpa, &replies);
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, srv.port(), "/extra/batch/2?user_id=10001", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    thread.join();
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+
+    client.deinit();
+    fake.stop();
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        fake.received.items,
+        "*4\r\n$13\r\nZRANGEBYSCORE\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n0\r\n$10\r\n4294967295\r\n",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "SRANDMEMBER") == null);
+}
+
+test "GET /extra/batch/:count?user_id=&encode=text 组合" {
+    const gpa = std.testing.allocator;
+    const range = "*1\r\n$5\r\n12345\r\n";
+    const replies = [_][]const u8{ range, hgetallReply(), mget_nil_reply };
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/batch/1?user_id=10001&encode=text", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("今天也是好天气", parsed.value.array.items[0].string);
+}
+
+test "GET /extra/batch/:count?user_id= 该作者无候选时返回 []，200，不是 404 或 500" {
+    const gpa = std.testing.allocator;
+    const replies = [_][]const u8{"*0\r\n"};
+    const h = try startHarness(gpa, &replies);
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/batch/5?user_id=88888", &body);
+    try std.testing.expectEqual(std.http.Status.ok, status);
+    try std.testing.expectEqualStrings("[]", body.written());
+}
+
+test "count 上限跟 user_id 组合：1000+user_id 放行（命令帧是 ZRANGEBYSCORE 不是 SRANDMEMBER），1001+user_id 400 不碰 Redis" {
+    const gpa = std.testing.allocator;
+    {
+        const replies = [_][]const u8{"*0\r\n"};
+        const fake = try FakeRedis.start(gpa, &replies);
+        defer {
+            fake.stop();
+            fake.destroy(gpa);
+        }
+        var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+        defer client.deinit();
+        var st = store.Store.init(gpa, &client);
+        var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+        defer srv.deinit();
+        const thread = try std.Thread.spawn(.{}, Server.serveOnce, .{&srv});
+
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        const status = try get(gpa, srv.port(), "/extra/batch/1000?user_id=10001", &body);
+        try std.testing.expectEqual(std.http.Status.ok, status);
+        thread.join();
+        try std.testing.expectEqualStrings("[]", body.written());
+
+        client.deinit();
+        fake.stop();
+        try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "ZRANGEBYSCORE") != null);
+        try std.testing.expect(std.mem.indexOf(u8, fake.received.items, "SRANDMEMBER") == null);
+    }
+    {
+        const h = try startHarness(gpa, &[_][]const u8{});
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(
+            std.http.Status.bad_request,
+            try get(gpa, h.srv.port(), "/extra/batch/1001?user_id=10001", &body),
+        );
+    }
+}
+
+test "GET /extra/batch/:count?encode=js 返回 400，不碰 Redis（count 本身合法）" {
+    const gpa = std.testing.allocator;
+    const h = try startHarness(gpa, &[_][]const u8{});
+    defer stopHarness(h);
+
+    var body: std.Io.Writer.Allocating = .init(gpa);
+    defer body.deinit();
+    const status = try get(gpa, h.srv.port(), "/extra/batch/5?encode=js", &body);
+    try std.testing.expectEqual(std.http.Status.bad_request, status);
 }

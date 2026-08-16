@@ -2217,12 +2217,12 @@ test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成
     //   回一个 nil 表示"这个主键从没被任何链吸收过"（放行，见 runner.zig
     //   写前守卫的说明）→ SET hikari:username:10001（authorCard 第一次
     //   问到这条链主键的作者时刷新，链的两个成员同一个作者，只问/只刷新
-    //   一次）→ nextId → addChain 的六条命令（两个成员各一条 SET 映射、
-    //   一条 SADD chain 集、HSET/ZADD/SADD 原有三条）→ 最后是 applyLastRun
-    //   的 SET hikari:lastrun:77（这个群判成功才会补）。
+    //   一次）→ nextId → addChain 的七条命令（两个成员各一条 SET 映射、
+    //   一条 SADD chain 集、HSET/ZADD(bylen)/ZADD(byuser)/SADD 原有四条）→
+    //   最后是 applyLastRun 的 SET hikari:lastrun:77（这个群判成功才会补）。
     const redis_srv = try FakeServer.start(
         gpa,
-        "$-1\r\n+OK\r\n:0\r\n:0\r\n$-1\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n$-1\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
     );
     defer {
         redis_srv.stop();
@@ -2390,14 +2390,14 @@ test "runOnce：空观察集合下多个不同作者各自被正确收录，同�
     // 同一个作者 111：候选1 触发一次 authorCard 未命中缓存，问到名片后
     // SET hikari:username:111；候选2 命中缓存，**不**再发 SET → 候选3
     // 作者 222：同样未命中缓存一次，SET hikari:username:222 → 三次
-    // nextId（1/2/3）与三次 add()（HSET/ZADD/SADD，均非链）→ 最后
-    // applyLastRun 的 SET hikari:lastrun:300。
+    // nextId（1/2/3）与三次 add()（HSET/ZADD(bylen)/ZADD(byuser)/SADD，均
+    // 非链）→ 最后 applyLastRun 的 SET hikari:lastrun:300。
     const redis_srv = try FakeServer.start(
         gpa,
         "$-1\r\n" ++ "+OK\r\n" ++ // GET lastrun / SET groupname
-            ":0\r\n:0\r\n:0\r\n" ++ "+OK\r\n" ++ ":1\r\n" ++ "+OK\r\n+OK\r\n+OK\r\n" ++ // 候选1（新作者 111）
-            ":0\r\n:0\r\n:0\r\n" ++ ":2\r\n" ++ "+OK\r\n+OK\r\n+OK\r\n" ++ // 候选2（缓存命中 111，无 SET username）
-            ":0\r\n:0\r\n:0\r\n" ++ "+OK\r\n" ++ ":3\r\n" ++ "+OK\r\n+OK\r\n+OK\r\n" ++ // 候选3（新作者 222）
+            ":0\r\n:0\r\n:0\r\n" ++ "+OK\r\n" ++ ":1\r\n" ++ "+OK\r\n+OK\r\n+OK\r\n+OK\r\n" ++ // 候选1（新作者 111）
+            ":0\r\n:0\r\n:0\r\n" ++ ":2\r\n" ++ "+OK\r\n+OK\r\n+OK\r\n+OK\r\n" ++ // 候选2（缓存命中 111，无 SET username）
+            ":0\r\n:0\r\n:0\r\n" ++ "+OK\r\n" ++ ":3\r\n" ++ "+OK\r\n+OK\r\n+OK\r\n+OK\r\n" ++ // 候选3（新作者 222）
             "+OK\r\n", // applyLastRun
     );
     defer {
@@ -2483,10 +2483,10 @@ test "runOnce：路径3（admin_manual）候选的 creator/creator_uid 是那位
 
     // GET lastrun(nil) → SET groupname → 单条候选过三道关卡（放行）→
     // authorCard 未命中缓存，SET hikari:username:20001 → nextId → add()
-    // 三条命令 → applyLastRun 的 SET。
+    // 四条命令（HSET/ZADD(bylen)/ZADD(byuser)/SADD）→ applyLastRun 的 SET。
     const redis_srv = try FakeServer.start(
         gpa,
-        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
     );
     defer {
         redis_srv.stop();
@@ -2568,11 +2568,12 @@ test "runOnce：链候选自己映射到自己（上一次 addChain 部分失败
 
     // 跟"🔥链候选走 addChain"那条测试同一个场景，唯一的区别是 chainPrimaryOf
     // 的 GET 回复：这里回"1"（链主键自己），模拟上一次 addChain 已经把
-    // hikari:chainmember:1 写成了 "1"，但紧接着的 HSET/ZADD/SADD 没有提交
-    // 成功——重扫时必须把这当成"原样重试"，而不是"已经被别的链吸收"。
+    // hikari:chainmember:1 写成了 "1"，但紧接着的 HSET/ZADD/ZADD/SADD 没有
+    // 提交成功——重扫时必须把这当成"原样重试"，而不是"已经被别的链吸收"。
+    // addChain 现在是七条命令（多一条 ZADD byuser）。
     const redis_srv = try FakeServer.start(
         gpa,
-        "$-1\r\n+OK\r\n:0\r\n:0\r\n$1\r\n1\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n$1\r\n1\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
     );
     defer {
         redis_srv.stop();
@@ -2710,11 +2711,11 @@ test "runOnce：作者名片解析失败（已经离群）不再让整个群判 
 
     // GET lastrun(nil) → SET groupname(OK) → SISMEMBER tomb(0) / index(0) →
     // isChainMember EXISTS(0，非链候选) → **没有** SET username（authorCard
-    // 拿到 null，根本不会调用 setUsername）→ nextId(1) → add() 三条命令 →
-    // applyLastRun 的 SET。
+    // 拿到 null，根本不会调用 setUsername）→ nextId(1) → add() 四条命令
+    // （HSET/ZADD(bylen)/ZADD(byuser)/SADD）→ applyLastRun 的 SET。
     const redis_srv = try FakeServer.start(
         gpa,
-        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
     );
     defer {
         redis_srv.stop();
@@ -2787,10 +2788,11 @@ test "runOnce：作者名片解析成功但 card/nickname 都是空串时不刷�
 
     // 跟上一条测试同一个 Redis 命令序列——resolved-but-empty 与
     // unresolvable 在 Store 层面的落点完全一样（都不触发 setUsername），
-    // 区别只在 NapCat 那一侧回的是"成功但空白"还是"直接失败"。
+    // 区别只在 NapCat 那一侧回的是"成功但空白"还是"直接失败"。add() 现在是
+    // 四条命令（HSET/ZADD(bylen)/ZADD(byuser)/SADD）。
     const redis_srv = try FakeServer.start(
         gpa,
-        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
     );
     defer {
         redis_srv.stop();

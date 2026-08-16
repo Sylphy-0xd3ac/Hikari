@@ -96,30 +96,56 @@ curl 'http://127.0.0.1:8080/'
 |---|---|
 | `encode` | `json`（默认）/ `text` / `js` |
 | `min_length` / `max_length` | 支持，按语录长度（UTF-8 码点数）过滤 |
+| `user_id` | 支持，按作者（QQ 号）过滤，可与 `min_length`/`max_length` 组合；非法值（非数字/负数/溢出）→ 400 |
 | `callback` | 支持，存在时输出 JSONP：`{callback}({json})`，回调名只接受 `[A-Za-z0-9_$.]` |
 | `select` | 支持，`encode=js` 时的 DOM 选择器，默认 `.hitokoto` |
 | `charset` | 仅支持 `utf-8`（大小写不敏感），其他值返回 400——本库没有内嵌 GBK 码表 |
 | `c` | 接受但忽略——全库只有一个类型，`type` 恒为 `"g"` |
 
-错误：库空 / 长度过滤后无结果 → 404；参数非法（`charset` 非 utf-8、`min_length` > `max_length`、
-数字解析失败、`callback` 非法）→ 400；方法非 `GET` → 405；Redis 不可用 → 500。均为 JSON 错误体。
+错误：库空 / 过滤（长度和/或 `user_id`）后无结果 → 404；参数非法（`charset` 非 utf-8、
+`min_length` > `max_length`、数字解析失败、`callback` 非法、`user_id` 非法）→ 400；方法非 `GET`
+→ 405；Redis 不可用 → 500。均为 JSON 错误体。
+
+**`/?user_id=` 对本次改动之前收录的 136 条历史语录不生效**：这些语录早于按作者过滤的索引
+（`hikari:byuser`，见下）存在，从未被补进这份索引，`/?user_id={这些人的 QQ}` 会得到"这个人没有
+语录"（404）——即使 `GET /`（不带 `user_id`）明明能随机到他们的语录。这是刻意接受、写进文档的
+已知行为，不是间歇性故障，详见 Redis 键结构一节 `hikari:byuser` 的说明。
 
 **`GET /extra/all`** 与 **`GET /extra/batch/:count`** 是超出 Hitokoto 协议范围的自定义扩展，落在
-`/extra/` 前缀下，不认 `/` 的那套查询参数，响应固定是 JSON 数组：
+`/extra/` 前缀下，响应是一个 JSON 数组。除 `select`（被接受但忽略，`encode=js` 在这两个端点上不
+支持，`select` 没有对应的用武之地）外，其余参数都跟 `/` 同构：
+
+| 参数 | 支持情况 |
+|---|---|
+| `user_id` | 按作者过滤，同 `/` |
+| `min_length` / `max_length` | 按语录长度过滤，同 `/` |
+| `encode=json`（默认）| `[{完整对象}, ...]` |
+| `encode=text` | `["正文1", "正文2", ...]`——只有 `hitokoto` 正文的字符串数组 |
+| `encode=js` | **400**，不是静默降级成 `json`——`js` 编码是"把正文写进一个 DOM 元素"的脚本，这个概念要求恰好一条语录对应一个 DOM 目标，对一个数组没有自然的定义；宁可让客户端明确看到"这个形状不支持"，也不要在它以为拿到 `js` 时悄悄换一种完全不同的响应形态，这跟 `charset=gbk` 被拒绝而不是悄悄当 `utf-8` 处理是同一个原则 |
+| `callback` | 支持，把**整个数组**包进 `{callback}(...)` 这层 JSONP 壳；跟 `/` 不同的是，这里 `callback` 不会覆盖 `encode` 的选择——两者正交，`callback` 只决定要不要包一层函数调用 |
+| `charset` | 仅支持 `utf-8`，同 `/` |
+| `c` | 接受但忽略，同 `/` |
+| `select` | 接受但忽略 |
+
+`Content-Type`：`encode=json`/`encode=text` 都是 `application/json; charset=utf-8`；带 `callback`
+时是 `application/javascript; charset=utf-8`。
 
 | 端点 | 行为 |
 |---|---|
-| `GET /extra/all` | 返回全部语录，无上限 |
-| `GET /extra/batch/:count` | 随机返回 `count` 条语录，允许重复；`count` 须为 1–1000 的整数，否则 400 |
+| `GET /extra/all` | 返回全部（或过滤后）的语录，无上限 |
+| `GET /extra/batch/:count` | 随机返回 `count` 条语录，允许重复；`count` 须为 1–1000 的整数，否则 400——这条上限不受 `user_id` 过滤影响，`count` 是"要抽多少次"，跟候选集合大小是两回事 |
 
-库空时这两个端点返回 `[]` + 200，不是 404——空数组本身就是一个成功的答案，跟 `/` 那种「没有可服务
-的单条语录」是不同的语义。
+库空、或者过滤后无结果，这两个端点返回 `[]` + 200，不是 404——空数组本身就是一个成功的答案，跟
+`/` 那种「没有可服务的单条语录」是不同的语义。
 
 ```bash
 curl 'http://127.0.0.1:8080/'
 curl 'http://127.0.0.1:8080/?encode=text'
+curl 'http://127.0.0.1:8080/?user_id=10001'
 curl 'http://127.0.0.1:8080/extra/all'
+curl 'http://127.0.0.1:8080/extra/all?user_id=10001&encode=text'
 curl 'http://127.0.0.1:8080/extra/batch/5'
+curl 'http://127.0.0.1:8080/extra/batch/5?user_id=10001'
 ```
 
 ## Redis 键结构
@@ -134,6 +160,13 @@ curl 'http://127.0.0.1:8080/extra/batch/5'
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立 |
 | `hikari:username:{user_id}` | STRING | 这个人当前的群名片（或昵称），每次扫描按遇到的候选作者刷新；渲染时覆盖语录 hash 里冻结的 `from_who` 快照 |
 | `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，每次扫描刷新；渲染时覆盖语录 hash 里冻结的 `from` 快照 |
+| `hikari:byuser:{user_id}` | ZSET | score = 语录长度（UTF-8 码点数），member = `message_id`——作者维度的索引，`/?user_id=` 在全部三个 HTTP 端点上都靠它 |
+
+**`hikari:byuser` 是本次改动新增的键，136 条此前收录的生产语录不在里面**：这份索引在它们收录时
+还不存在，本仓库不对已经 `exists() == true` 的语录做迁移（唯一认可的状态修复手段是幂等重放，而
+这些语录不会再被任何一次扫描重新处理）。这是刻意接受的已知缺口，不是遗漏——后果只是这些语录的作者
+在 `/?user_id=` 下查不到，`GET /`（不带 `user_id`）等所有其它读路径不受影响。新语录从收录那一刻起
+就会正确地进入这份索引。
 
 ## 构建
 
@@ -178,7 +211,7 @@ journalctl -u hikari -f
 ## 开发
 
 ```bash
-zig build test          # 单元测试，287 个
+zig build test          # 单元测试，333 个
 ```
 
 跑一次真实扫描不需要等到定时触发，也不需要临时改 `SCAN_TIME` 再改回去：`hikari run` 用跟常驻路径
