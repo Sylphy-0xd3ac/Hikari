@@ -50,7 +50,7 @@ Hikari 是一个常驻进程，做两件事：
 | `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]`，只能说明某种回应有几次，**不含回应者身份**；顶层还含 `user_id`（与 `sender.user_id` 一致，`onebot.parseMessage` 依赖这个顶层字段解出发送者）。2026-08-15 针对生产 NapCat 直接探测 `get_msg` 已确认，顶层 key 为 `emoji_likes_list, font, group_id, group_name, message, message_format, message_id, message_seq, message_type, post_type, raw_message, real_id, real_seq, self_id, sender, sub_type, time, user_id` |
 | `get_emoji_likes` | 取某条消息某一种表情回应的点击者 | 入参至少给 `message_id`, `emoji_id`, `count`（`count=0` 取全部；Unicode 💤 的 `emoji_id="128164"`，`emoji_type="2"` 可省略或显式给出），返回 `emoji_like_list: [{user_id, nick_name}]`。只在一条管理员 💤 锚点的 `get_msg` 已显示存在 💤 回应时调用，用返回的 `user_id` 验证是不是锚点发送者本人确认 |
 | `get_group_info` | 取群名 | 刷新 `hikari:groupname:{group_id}`，渲染时覆盖 hitokoto 的 `from`（见 4.7 节、5 节） |
-| `get_group_member_info` | 取**某个作者**的群名片 | 逐候选作者调用（每次扫描内按 `user_id` 缓存，同一个作者只问一次），刷新 `hikari:username:{user_id}`，渲染时覆盖 hitokoto 的 `from_who`（见 4.7 节、5 节）。2026-08-16 起不再是"每群一次、查被观察者"——`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群不再有唯一的"那个被观察者"可查，改成按窗口内每条候选**自己的作者**查 |
+| `get_group_member_info` | 取**某个作者**的 QQ 原始昵称 | 逐候选作者调用（每次扫描内按 `user_id` 缓存，同一个作者只问一次），只读取返回的 `nickname`、绝不使用 `card`，刷新 `hikari:username:{user_id}`，渲染时覆盖 hitokoto 的 `from_who`（见 4.7 节、5 节）。2026-08-16 起不再是"每群一次、查被观察者"——`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群不再有唯一的"那个被观察者"可查，改成按窗口内每条候选**自己的作者**查 |
 | `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
 | `send_group_forward_msg` | 发送运行日志 | 每群一条合并转发消息，七行各占一个 node；见 7 节 |
 
@@ -234,7 +234,7 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 - **`✨ @某人` 后面没有正文** → 作者标记剥完后形成正文为空的路径3候选 → 在 4.6 节文本空关卡计入 `skipped`。光杆 `✨` 保持旧行为，不形成候选。路径3资格已经成立，所以即使发送者同时是被观察者，也由路径3优先级阻止这条消息跌回路径1；否则一条控制指令会被路径1把 `✨ @某人` 本身当语录正文收进去，且日志少算一次 skip。
 - **被 at 的人不要求在 `OBSERVED_QQS` 里。** 管理员是在显式断言"这句话是他说的"；要求目标必须被观察会让这条语法在配置了子集时彻底没法用（生产配置是空集合、观察所有人，这条限制本来也不起作用）。
 - **`at.data.qq` 不是十进制数字**（`@全体成员` 的 `"all"` 就是这种）→ 不当作者标记，退回"没有 at"那一支，这个 at 照旧渲染进正文。
-- 被 at 的作者走 `scan/runner.zig` 里**同一份**每次扫描内的作者名片缓存（`authorCard`），所以 `hikari:username:{被 at 的 QQ}` 也会被刷新；`creator` 需要的管理员名片走同一份缓存的第二次查询（`✨ 内容` 时两者是同一个人，只问一次）。
+- 被 at 的作者走 `scan/runner.zig` 里**同一份**每次扫描内的原始昵称缓存（`authorNickname`），所以 `hikari:username:{被 at 的 QQ}` 也会被刷新；`creator` 需要的管理员原始昵称走同一份缓存的第二次查询（`✨ 内容` 时两者是同一个人，只问一次）。
 - 副作用：链成员若自己满足路径3格式（见 4.5.1 节末尾那条"拼接进 joined 正文时会剥掉成员自己的 `✨` 前缀"），剥前缀走的是同一个 `manualParse`，因此**作者标记的那个 at 也会一并从 joined 正文里剥掉**；链的作者仍由 `buildChains` 的同一发送者约束定死，不受这个 at 影响。这是一个边界里的边界（要求被观察者本人同时在 `ADMIN_QQS` 里、且在链成员里用了 at 语法），取"路径3格式只有一份实现"这条更重要的一致性。
 
 **路径 3b（管理员引用归属）：`reply + ✨ @某人`**
@@ -345,7 +345,7 @@ D  （无 🔥）           → 连续段在这里结束
 **文本提取规则**：
 
 - `text` 段：原样取 `data.text`
-- `at` 段：渲染为 `@` + `data.name`；`data.name` 缺失时退化为 `@` + `data.qq`
+- `at` 段：解析时丢弃 NapCat 的 `data.name`（它是群展示名/可能是群名片）；runner 在规则判定与正文拼接前，对数字 QQ 查询 `get_group_member_info.nickname`，只用这个 QQ 原始昵称渲染为 `@昵称`。查询失败或昵称为空时退化为 `@QQ`，绝不回退到群名片；非数字目标保留其专用标识。
 - `image` 段：保留 `data.file` / `data.url`；带 `emoji_id` 或 `file="marketface"` 时标记为个人/商城表情，供空正文候选的 OCR 回退使用，本身不产生占位符
 - `mface` 段：归一成上述 image 结构；优先保留已有 URL，缺失时用 `emoji_id` 生成 NapCat 同源 `raw300.gif` URL
 - `face` 段：QQ 内置表情，只有语义 ID、没有可交给 OCR 的图片定位信息；直接丢弃，不与个人/商城表情混同
@@ -376,9 +376,9 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 | `hitokoto` | 4.6 提取出的文本（必要时来自本机 OCR），再无分隔符追加 4.5.3 的 💨 补丁 |
 | `type` | 固定 `"g"`（其他） |
 | `from` | 群名。渲染时（`GET /`、`/extra/*`）优先取 `hikari:groupname:{group_id}` 的实时值；这个键缺失才落回收录当时冻结进 hash 的快照 |
-| `from_who` | 语录**作者**（不是固定的被观察者）的群名片。路径3用了 `✨ @某人 内容`、或路径3b用了 `reply + ✨ @某人` 时，作者是**被 at 的那个人**，不是敲指令的管理员。渲染时优先取 `hikari:username:{user_id}` 的实时值；这个键缺失（导入的语录、这个人从未被某次扫描当过候选作者、或者已经离群且从未刷新成功过）才落回 hash 里冻结的快照 |
+| `from_who` | 语录**作者**（不是固定的被观察者）的 QQ 原始昵称。路径3用了 `✨ @某人 内容`、或路径3b用了 `reply + ✨ @某人` 时，作者是**被 at 的那个人**，不是敲指令的管理员。渲染时优先取 `hikari:username:{user_id}` 的实时值；这个键缺失（导入的语录、这个人从未被某次扫描当过候选作者、或者已经离群且从未刷新成功过）才落回 hash 里冻结的快照 |
 | `user_id` | 语录作者的 QQ，数值 JSON 字段；路径3/3b为被 at 的作者，其余路径为原消息作者，与 `from_who` / `?user_id=` 的归属一致 |
-| `creator` | 路径1、2、4固定 `"Hikari"`；路径3/3b是**那位管理员**当时的群名片/昵称——他本人在 Hitokoto 语义下就是这条语录的**添加者**，跟「这句话是谁说的」（`from_who`）是两回事 |
+| `creator` | 路径1、2、4固定 `"Hikari"`；路径3/3b是**那位管理员**当时的 QQ 原始昵称——他本人在 Hitokoto 语义下就是这条语录的**添加者**，跟「这句话是谁说的」（`from_who`）是两回事 |
 | `creator_uid` | 路径1、2、4固定 `0`；路径3/3b是**那位管理员**的 QQ，不是被 at 的作者的 QQ |
 | `reviewer` | 固定 `0` |
 | `commit_from` | 固定 `"hikari"` |
@@ -438,7 +438,7 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次扫描窗口终点的 Unix 秒，逐群独立 |
 | `hikari:chainmember:{message_id}` | STRING | 仅 🔥 链使用：value 是这条链**主键**（第一条内容消息）的 `message_id`。链的每一个**内容成员**——包括主键自己——都写一份，value 都是同一个主键。**桥不写**（桥不是成员，见 4.5 节） |
 | `hikari:chain:{message_id}` | SET | 仅 🔥 链使用，key 里的 `{message_id}` 是链**主键**：成员是这条链的全部**内容** `message_id`（含主键自己），同样不含桥 |
-| `hikari:username:{user_id}` | STRING | 这个人当前的群名片（群名片优先，否则昵称）。每次扫描按窗口内**遇到的候选作者**刷新（不是固定的被观察者），同一次扫描内同一个作者只刷新一次。渲染语录时（`GET /`、`/extra/*`）覆盖 hash 里冻结的 `from_who` 快照——这是"改名一次性反映到这个人说过的全部历史语录"的落点 |
+| `hikari:username:{user_id}` | STRING | 这个人当前的 QQ 原始昵称（只取 `get_group_member_info.nickname`，绝不取群名片 `card`）。每次扫描按窗口内**遇到的候选作者**刷新（不是固定的被观察者），同一次扫描内同一个作者只刷新一次。渲染语录时（`GET /`、`/extra/*`）覆盖 hash 里冻结的 `from_who` 快照——这是"改名一次性反映到这个人说过的全部历史语录"的落点 |
 | `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，用法和理由跟 `hikari:username` 对称，覆盖的字段是 `from` |
 | `hikari:byuser:{user_id}` | ZSET | score = `length`（码点数），member = `message_id`（🔥 链只有主键在里面，跟 `hikari:bylen` 完全对称）。作者维度的索引，`/?user_id=` 在 `/`、`/extra/all`、`/extra/batch/:count` 三个端点上都靠它——用 ZSET 而不是 SET 是为了让"这个人 + 长度区间"和"全库 + 长度区间"共用同一条 `ZRANGEBYSCORE key min max`，只是 key 换了 |
 
@@ -504,7 +504,7 @@ tombstone 先落盘：它是这次作废唯一持久的事实，删索引与删 
 | `min_length` | 支持，走 `hikari:bylen`（带 `user_id` 时改走 `hikari:byuser:{user_id}`，见下） |
 | `max_length` | 同上 |
 | `user_id` | 支持，按作者过滤，走 `hikari:byuser:{user_id}`，可与 `min_length`/`max_length` 组合。非数字/负数/溢出 u64 → 400；136 条本次改动之前收录的历史语录在 `hikari reindex` 跑之前没有对应的索引成员，见第 5 节 `hikari:byuser` 的说明——这 136 条同属一个作者，所以在那之前这个参数对**整个存量语录库**都是空的（恒定 404），是一个已知、写进文档的行为，不是间歇性故障；运营方跑一次 `hikari reindex` 即可修复 |
-| `from_who` | 支持，URL 百分号解码后按当前渲染出的群名片/昵称精确匹配，可与 `user_id`/长度组合；空值或非法 UTF-8 → 400。昵称允许重复，命中同名的多位作者都进入候选集合 |
+| `from_who` | 支持，URL 百分号解码后按当前渲染出的 QQ 原始昵称精确匹配，可与 `user_id`/长度组合；空值或非法 UTF-8 → 400。昵称允许重复，命中同名的多位作者都进入候选集合 |
 | `callback` | 支持，存在时输出 JSONP：`{callback}({json})`，Content-Type 为 `application/javascript` |
 | `select` | 支持，`encode=js` 时的 DOM 选择器，默认 `.hitokoto` |
 | `c` | 接受但忽略——全库只有一个类型，`type` 恒为 `g` |
@@ -533,7 +533,7 @@ Hitokoto 协议本身没有"一次要多条语录"的形态。这两个端点落
 | 参数 | `/extra/all` 与 `/extra/batch/:count` 上的行为 |
 |---|---|
 | `user_id` | 按作者过滤，跟 `/` 完全同构（走 `hikari:byuser:{user_id}`），可与长度组合 |
-| `from_who` | 按当前群名片/昵称精确匹配，跟 `/` 完全同构，可与 `user_id`/长度组合 |
+| `from_who` | 按当前 QQ 原始昵称精确匹配，跟 `/` 完全同构，可与 `user_id`/长度组合 |
 | `min_length` / `max_length` | 支持，语义跟 `/` 相同 |
 | `encode=json`（默认）| `[{完整对象}, ...]`——第 4.7 节全部字段，逐元素跟 `GET /?encode=json` 同构 |
 | `encode=text` | `["正文1", "正文2", ...]`——只有 `hitokoto`，是同一批语录的另一种投影，不是另一批数据 |

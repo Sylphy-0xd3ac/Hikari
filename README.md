@@ -129,7 +129,7 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 控制语法后正文为空。各项之和始终等于前面的 `skipped`，所以重扫时看到 skip 不再需要猜是哪一道去重
 关卡命中。
 
-**归属（`from` / `from_who`）**：`from` 是群名，`from_who` 是**语录作者自己**的群名片
+**归属（`from` / `from_who`）**：`from` 是群名，`from_who` 是**语录作者自己**的 QQ 原始昵称
 （不是固定的某一个人）——`OBSERVED_QQS` 允许留空表示"观察所有人"，一个群不再有唯一的"那个
 被观察者"可以整群问一次名片，改成按候选各自的作者查、每次扫描内按作者缓存（同一个人一天说好
 几句只问一次）。这两者都是**渲染时解析**的：语录入库时把当时问到的名字写进 hash 当快照，同时
@@ -140,6 +140,8 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 （路径 3 / 3b）额外把 `creator`/`creator_uid` 覆盖成那位管理员自己的信息，而不是自动路径固定的
 `"Hikari"`/`0`；用了 `✨ @某人 内容` 语法时 `from_who` 是被 at 的作者、`creator` 仍是管理员，两个人
 的 `hikari:username:{qq}` 都会在这一轮刷新。
+
+所有数字 QQ 的 `at` 段也遵循同一个来源：NapCat 消息自带的 `at.data.name` 会被丢弃（它可能是群名片），只显示 `get_group_member_info.nickname` 返回的 QQ 原始昵称。查不到或昵称为空就显示 `@QQ`，绝不把群名片写进正文或 Redis；`@全体成员` 这类非数字目标保留原有专用表示。
 
 ## 环境变量
 
@@ -189,7 +191,7 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 下一轮定时扫描继续正常衔接。
 
 `import --user` 不再从 `OBSERVED_QQS` 猜作者：观察多人时不存在唯一答案，观察所有人时更没有可猜的
-值。命令使用 `QQ_GROUP_IDS` 的第一个群取得群名和该 QQ 的群名片；任一归属信息取不到就整次失败、
+值。命令使用 `QQ_GROUP_IDS` 的第一个群取得群名和该 QQ 的原始昵称；任一归属信息取不到就整次失败、
 一条也不写。重复导入同一正文仍然幂等，已存在或已 tombstone 的行会如实计入摘要。
 
 ## HTTP 接口
@@ -205,7 +207,7 @@ HTTP 暴露。`/extra/all` 与 `/extra/batch/:count` 的 JSON 数组元素使用
 | `encode` | `json`（默认）/ `text` / `js` |
 | `min_length` / `max_length` | 支持，按语录长度（UTF-8 码点数）过滤 |
 | `user_id` | 支持，按作者（QQ 号）过滤，可与 `min_length`/`max_length` 组合；非法值（非数字/负数/溢出）→ 400 |
-| `from_who` | 支持，按当前渲染出的群名片/昵称精确匹配，可与 `user_id` 和长度组合；值需 URL 编码且必须是非空 UTF-8 |
+| `from_who` | 支持，按当前渲染出的 QQ 原始昵称精确匹配，可与 `user_id` 和长度组合；值需 URL 编码且必须是非空 UTF-8 |
 | `callback` | 支持，存在时输出 JSONP：`{callback}({json})`，回调名只接受 `[A-Za-z0-9_$.]` |
 | `select` | 支持，`encode=js` 时的 DOM 选择器，默认 `.hitokoto` |
 | `charset` | 仅支持 `utf-8`（大小写不敏感），其他值返回 400——本库没有内嵌 GBK 码表 |
@@ -228,7 +230,7 @@ HTTP 暴露。`/extra/all` 与 `/extra/batch/:count` 的 JSON 数组元素使用
 | 参数 | 支持情况 |
 |---|---|
 | `user_id` | 按作者过滤，同 `/` |
-| `from_who` | 按当前群名片/昵称精确匹配，同 `/` |
+| `from_who` | 按当前 QQ 原始昵称精确匹配，同 `/` |
 | `min_length` / `max_length` | 按语录长度过滤，同 `/` |
 | `encode=json`（默认）| `[{完整对象}, ...]` |
 | `encode=text` | `["正文1", "正文2", ...]`——只有 `hitokoto` 正文的字符串数组 |
@@ -275,7 +277,7 @@ curl 'http://127.0.0.1:8080/extra/batch/5?user_id=10001&from_who=%E5%B0%8F%E6%98
 | `hikari:tomb` | SET | 被作废的 `message_id`（永久） |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` 生成 `id` 字段 |
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立 |
-| `hikari:username:{user_id}` | STRING | 这个人当前的群名片（或昵称），每次扫描按遇到的候选作者刷新；渲染时覆盖语录 hash 里冻结的 `from_who` 快照 |
+| `hikari:username:{user_id}` | STRING | 这个人当前的 QQ 原始昵称；每次扫描按遇到的候选作者刷新，渲染时覆盖语录 hash 里冻结的 `from_who` 快照 |
 | `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，每次扫描刷新；渲染时覆盖语录 hash 里冻结的 `from` 快照 |
 | `hikari:byuser:{user_id}` | ZSET | score = 语录长度（UTF-8 码点数），member = `message_id`——作者维度的索引，`/?user_id=` 在全部三个 HTTP 端点上都靠它 |
 

@@ -20,10 +20,10 @@ pub const key_chainmember_prefix = "hikari:chainmember";
 /// （含主键自己）。revoke() 撤一条链时先靠 chainmember 映射拿到主键，再靠
 /// 这个 SET 拿到全部成员，逐个 tombstone。
 pub const key_chain_prefix = "hikari:chain";
-/// `hikari:username:{user_id}` STRING，这个人当前的群名片（群名片优先，
-/// 否则昵称）快照。`scan/runner.zig` 的 `authorCard` 在每次扫描里按**遇到的
-/// 作者**（不是固定的被观察者）刷新它——群名片会改，语录 hash 里冻结的
-/// `from_who` 不会。渲染语录时（`fetchById`/`resolveDisplayNames`）用这个键
+/// `hikari:username:{user_id}` STRING，这个人当前的 QQ 原始昵称快照。
+/// `scan/runner.zig` 的 `authorNickname` 在每次扫描里按**遇到的作者**（不是
+/// 固定的被观察者）刷新它——只接受 NapCat 的 `nickname`，绝不采用群名片。
+/// 渲染语录时（`fetchById`/`resolveDisplayNames`）用这个键
 /// 覆盖 hash 里的旧值，让一次改名同时反映到这个人说过的全部历史语录上；
 /// 这个键缺失（GET/MGET 回 nil）——从未被某次扫描当过候选作者、这个人已经
 /// 离群且从来没成功刷新过、或者语录是 `import` 写进来的——渲染时落回 hash
@@ -161,7 +161,7 @@ pub fn byUserKey(buf: *[64]u8, user_id: u64) []const u8 {
 /// 路径，不存在"组合起来没人测过"的分支。
 pub const Filter = struct {
     user_id: ?u64 = null,
-    /// 当前渲染出的作者名（群名片优先、昵称其次）精确匹配。这里保留字符串，
+    /// 当前渲染出的作者 QQ 原始昵称精确匹配。这里保留字符串，
     /// 不把昵称塞进 `user_id`：昵称允许重复且会变化，QQ 号则是稳定数字标识。
     from_who: ?[]const u8 = null,
     min_length: ?usize = null,
@@ -835,8 +835,8 @@ pub const Store = struct {
         };
     }
 
-    /// 刷新这个用户当前的群名片快照（`hikari:username:{user_id}`）。调用方
-    /// （`scan/runner.zig` 的 `authorCard`）只在这一轮真的问到
+    /// 刷新这个用户当前的 QQ 原始昵称快照（`hikari:username:{user_id}`）。调用方
+    /// （`scan/runner.zig` 的 `authorNickname`）只在这一轮真的问到
     /// `get_group_member_info` 的结果时才调用；问不到（网络失败、这个人已经
     /// 离群）就完全不碰这个键，保留上一次成功写入的值——这正是"作者离群"
     /// 这种情形下渲染时仍然拿得到"最后已知的名字"而不是被空白覆盖掉的原因。
@@ -1201,7 +1201,7 @@ pub const Store = struct {
     }
 
     /// 展开候选并按**当前渲染出的** from_who 精确匹配。fetchById 会先用
-    /// hikari:username:{user_id} 覆盖收录时冻结的名字，因此群名片变化会立即
+    /// hikari:username:{user_id} 覆盖收录时冻结的名字，因此 QQ 原始昵称变化会立即
     /// 影响昵称查询；不建昵称索引也避免旧名字残留和重名覆盖。
     /// 只在显式传 from_who 时调用，且调用方已经持有 self.mutex。
     fn fetchMatchingName(self: *Store, gpa: std.mem.Allocator, ids: []const resp.Value, name: []const u8) Error![]Quote {
