@@ -72,6 +72,8 @@ curl 'http://127.0.0.1:8080/'
 收到的 `mface` 转成带 `emoji_id`/`url` 的 `image`，Hikari 也兼容直接上报的原生 `mface`：普通图片优先把
 `file` 交还给同一个 NapCat、缺失时用 `url`；个人表情优先用真实 `url`（部分版本的 `file` 只是固定字符串
 `marketface`），缺 URL 时按 `emoji_id` 补出 NapCat 同源图地址。一张图里的 `texts[].text` 和多张图之间都按返回顺序用换行连接。
+这里的「个人表情」不是普通图片的同义词：它按 `emoji_id` 等字段单独识别，只是 NapCat 在**接收端**通常把
+`mface` 改写成了 `image` 段。QQ 内置小表情则是只有数字 ID、没有可 OCR 图源的 `face` 段，仍不会拿去 OCR。
 已有文字正文永远优先，不额外混入 OCR；OCR 是 best-effort，失败会告警，全部没有可用文本时仍按
 `empty` 跳过。管理员发 `✨` 并在同一条消息里附图也属于有效候选——光杆 `✨` 本身仍无效。
 

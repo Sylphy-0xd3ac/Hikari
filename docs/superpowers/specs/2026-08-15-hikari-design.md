@@ -52,6 +52,16 @@ Hikari 是一个常驻进程，做两件事：
 | `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
 | `send_group_forward_msg` | 发送运行日志 | 每群一条合并转发消息，七行各占一个 node；见 7 节 |
 
+所有 NapCat action 对**已经建立的 socket**共用 30 秒收发空闲超时。Zig 0.15.2
+的 `std.http.Client.FetchOptions` 没有 timeout 字段，因此客户端先取得要用的
+确切连接、给底层 socket 设置 `SO_RCVTIMEO` / `SO_SNDTIMEO`，再把该连接显式
+传给 `request()`。任一 send / 响应头 / 响应体 I/O 超时都按 `RequestFailed`
+交给各调用点原有的失败语义处理，并强制关闭这条 keep-alive 连接；下一次
+action 重新拨号。该超时约束的是连接建立后的无收发进展，不是覆盖 DNS、TCP
+connect 或 HTTPS TLS handshake 的整次 action 墙钟 deadline。尤其是
+`send_group_forward_msg`：Redis 已提交且 `lastrun` 已前移后，已建立连接上的
+群日志接口不响应不能再把 CLI 或 daemon 扫描线程永久挂住。
+
 ### 3.1 表情回应的读取代价
 
 `get_group_msg_history` 走的是 `parseMessage`，不会带出表情回应数据；只有 `get_msg` 会从 `msg.emojiLikesList` 手工填充 `emoji_likes_list`。因此**被观察者的每一条窗口内消息都需要额外一次 `get_msg`**。这是接口限制，无法规避。
@@ -336,7 +346,8 @@ D  （无 🔥）           → 连续段在这里结束
 - `at` 段：渲染为 `@` + `data.name`；`data.name` 缺失时退化为 `@` + `data.qq`
 - `image` 段：保留 `data.file` / `data.url`；带 `emoji_id` 或 `file="marketface"` 时标记为个人/商城表情，供空正文候选的 OCR 回退使用，本身不产生占位符
 - `mface` 段：归一成上述 image 结构；优先保留已有 URL，缺失时用 `emoji_id` 生成 NapCat 同源 `raw300.gif` URL
-- 其余所有段类型（face / record / video / file / json / forward 等）：直接丢弃，不产生占位符
+- `face` 段：QQ 内置表情，只有语义 ID、没有可交给 OCR 的图片定位信息；直接丢弃，不与个人/商城表情混同
+- 其余所有段类型（record / video / file / json / forward 等）：直接丢弃，不产生占位符
 
 按段顺序拼接，首尾 trim。结果为空字符串则跳过。
 

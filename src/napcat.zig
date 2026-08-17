@@ -165,6 +165,10 @@ pub const Client = struct {
     base_url: []const u8,
     token: []const u8,
     http: std.http.Client,
+    /// NapCat 接受连接后若一直不回响应，std.http.Client 默认会无限等待。
+    /// 生产扫描必须有上界，否则任意一个 get_msg / OCR / 结果日志请求都能把
+    /// 整条定时扫描线程永久卡住。测试会把它缩短到 1 秒。
+    request_timeout_s: u32 = 30,
 
     pub fn init(gpa: std.mem.Allocator, base_url: []const u8, token: []const u8) Client {
         return .{
@@ -179,6 +183,45 @@ pub const Client = struct {
         self.http.deinit();
     }
 
+    /// 取得一条 keep-alive 连接并给它的 socket 安装收发超时。
+    ///
+    /// Zig 0.15.2 的 std.http.Client.FetchOptions 没有 timeout 字段，但公开了
+    /// 连接与底层 net.Stream。call() 把这条确切的连接显式传给 request()，
+    /// 不经过一次 release → fetch → 再 acquire：后者会把“接下来一定还是这
+    /// 条连接”变成一个不必要的连接池时序假设。
+    fn acquireTimedConnection(self: *Client, uri: std.Uri) !*std.http.Client.Connection {
+        const protocol = std.http.Client.Protocol.fromUri(uri) orelse return error.RequestFailed;
+        var host_buf: [std.Uri.host_name_max]u8 = undefined;
+        const host = uri.getHost(&host_buf) catch return error.RequestFailed;
+        const port: u16 = uri.port orelse switch (protocol) {
+            .plain => 80,
+            .tls => 443,
+        };
+
+        const connection = self.http.connect(host, port, protocol) catch return error.RequestFailed;
+        const stream = connection.stream_reader.getStream();
+        const tv: std.posix.timeval = .{ .sec = @intCast(self.request_timeout_s), .usec = 0 };
+        inline for (.{ std.posix.SO.RCVTIMEO, std.posix.SO.SNDTIMEO }) |option| {
+            std.posix.setsockopt(
+                stream.handle,
+                std.posix.SOL.SOCKET,
+                option,
+                std.mem.asBytes(&tv),
+            ) catch |e| {
+                std.log.warn("napcat: could not set socket timeout: {s}", .{@errorName(e)});
+            };
+        }
+        return connection;
+    }
+
+    fn sendRequestBody(req: *std.http.Client.Request, payload: []const u8) !void {
+        req.transfer_encoding = .{ .content_length = payload.len };
+        var body = try req.sendBodyUnflushed(&.{});
+        try body.writer.writeAll(payload);
+        try body.end();
+        try req.connection.?.flush();
+    }
+
     /// POST {base_url}/{action}，body 为 params_json，返回响应体原文（arena 分配）。
     pub fn call(
         self: *Client,
@@ -188,18 +231,64 @@ pub const Client = struct {
     ) ![]u8 {
         const url = try std.fmt.allocPrint(arena, "{s}/{s}", .{ self.base_url, action });
         const auth = try std.fmt.allocPrint(arena, "Bearer {s}", .{self.token});
+        const uri = std.Uri.parse(url) catch return error.RequestFailed;
+        const connection = try self.acquireTimedConnection(uri);
 
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        const res = self.http.fetch(.{
-            .location = .{ .url = url },
-            .method = .POST,
-            .payload = params_json,
+        var req = self.http.request(.POST, uri, .{
+            .connection = connection,
+            .redirect_behavior = .unhandled,
             .headers = .{ .content_type = .{ .override = "application/json" } },
             .extra_headers = &.{.{ .name = "authorization", .value = auth }},
-            .response_writer = &aw.writer,
-        }) catch return error.RequestFailed;
+        }) catch {
+            // request() 没接管 connection，必须在这里自己把 acquire 撤销。
+            connection.closing = true;
+            self.http.connection_pool.release(connection);
+            return error.RequestFailed;
+        };
+        defer req.deinit();
 
-        if (res.status != .ok) return error.RequestFailed;
+        sendRequestBody(&req, params_json) catch {
+            // std.http 在响应头超时时 reader.state 仍可能是 .ready；只依赖
+            // Request.deinit 会把这条已失配的连接放回池。所有 I/O 错误都显式
+            // closing，确保下一次 action 重新连接，不会把迟到响应认成下一条。
+            connection.closing = true;
+            return error.RequestFailed;
+        };
+        var response = req.receiveHead(&.{}) catch {
+            connection.closing = true;
+            return error.RequestFailed;
+        };
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        const decompress_buffer_len: ?usize = switch (response.head.content_encoding) {
+            .identity => null,
+            .zstd => std.compress.zstd.default_window_len,
+            .deflate, .gzip => std.compress.flate.max_window_len,
+            .compress => {
+                connection.closing = true;
+                return error.RequestFailed;
+            },
+        };
+        // 跟 std.http.Client.fetch 一样，这块是**单次响应**的解压工作区，不
+        // 能塞进调用方的整群 arena：全员扫描约 4700 次 get_msg，若每次 gzip
+        // 都把 64 KiB 留到群结束才释放，会平白累计约 300 MiB。
+        const decompress_buffer: []u8 = if (decompress_buffer_len) |len|
+            self.gpa.alloc(u8, len) catch {
+                connection.closing = true;
+                return error.RequestFailed;
+            }
+        else
+            &.{};
+        defer if (decompress_buffer_len != null) self.gpa.free(decompress_buffer);
+        var transfer_buffer: [64]u8 = undefined;
+        var decompress: std.http.Decompress = undefined;
+        const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
+        _ = reader.streamRemaining(&aw.writer) catch {
+            connection.closing = true;
+            return error.RequestFailed;
+        };
+
+        if (response.head.status != .ok) return error.RequestFailed;
         return aw.toOwnedSlice();
     }
 
@@ -526,4 +615,220 @@ test "call 发出带 Bearer token 的 POST 请求" {
     try std.testing.expectEqual(std.http.Method.POST, fake.method);
     try std.testing.expect(fake.body != null);
     try std.testing.expectEqualStrings("{\"message_id\":1}", fake.body.?);
+}
+
+test "call：首请求超时后丢弃坏连接，下一请求重新 accept 并成功" {
+    const gpa = std.testing.allocator;
+
+    const Recover = struct {
+        listener: std.net.Server,
+        accepted_count: std.atomic.Value(u8) = .init(0),
+        first_closed: std.atomic.Value(bool) = .init(false),
+
+        fn acceptUntil(self: *@This()) ?std.net.Server.Connection {
+            for (0..300) |_| {
+                const conn = self.listener.accept() catch |e| switch (e) {
+                    error.WouldBlock => {
+                        std.Thread.sleep(10 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return null,
+                };
+                // Darwin 会让 accepted socket 继承 listener 的 O_NONBLOCK；
+                // 测试服务端后面的 std.http.Server/read 需要阻塞语义（另有
+                // SO_RCVTIMEO 兜底），所以显式清掉。
+                var flags = std.posix.fcntl(conn.stream.handle, std.posix.F.GETFL, 0) catch {
+                    conn.stream.close();
+                    return null;
+                };
+                flags &= ~@as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+                _ = std.posix.fcntl(conn.stream.handle, std.posix.F.SETFL, flags) catch {
+                    conn.stream.close();
+                    return null;
+                };
+                return conn;
+            }
+            return null;
+        }
+
+        fn setReadTimeout(stream: std.net.Stream) void {
+            const tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
+            std.posix.setsockopt(
+                stream.handle,
+                std.posix.SOL.SOCKET,
+                std.posix.SO.RCVTIMEO,
+                std.mem.asBytes(&tv),
+            ) catch {};
+        }
+
+        fn serve(self: *@This()) void {
+            // 第一条连接：读到完整请求后故意不响应，直到客户端超时并主动
+            // close。服务端看到 EOF，才能证明坏连接在 Client.deinit 之前就已
+            // 从池里销毁，而不是被整个 Client 的最终析构顺手关掉。
+            const first = self.acceptUntil() orelse return;
+            self.accepted_count.store(1, .release);
+            setReadTimeout(first.stream);
+            {
+                defer first.stream.close();
+                var buf: [4096]u8 = undefined;
+                while (true) {
+                    const n = first.stream.read(&buf) catch return;
+                    if (n == 0) break;
+                }
+            }
+            self.first_closed.store(true, .release);
+
+            // 第二次 call 必须新建 TCP 连接；如果错误地复用第一条，acceptUntil
+            // 会在 3 秒内退出而不是让测试线程永久卡在 accept。
+            const second = self.acceptUntil() orelse return;
+            self.accepted_count.store(2, .release);
+            setReadTimeout(second.stream);
+            defer second.stream.close();
+
+            var rbuf: [8192]u8 = undefined;
+            var wbuf: [8192]u8 = undefined;
+            var sr = second.stream.reader(&rbuf);
+            var sw = second.stream.writer(&wbuf);
+            var hs = std.http.Server.init(sr.interface(), &sw.interface);
+            var req = hs.receiveHead() catch return;
+            var body_buf: [4096]u8 = undefined;
+            _ = req.readerExpectNone(&body_buf).discardRemaining() catch return;
+            req.respond("{\"status\":\"ok\",\"retcode\":0,\"data\":{\"recovered\":true}}", .{
+                .status = .ok,
+                .extra_headers = &.{.{ .name = "content-type", .value = "application/json" }},
+            }) catch return;
+        }
+    };
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var recover: Recover = .{ .listener = try addr.listen(.{
+        .reuse_address = true,
+        .force_nonblocking = true,
+    }) };
+    defer recover.listener.deinit();
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{recover.listener.listen_address.getPort()});
+    defer gpa.free(base);
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    var timer = try std.time.Timer.start();
+
+    const th = try std.Thread.spawn(.{}, Recover.serve, .{&recover});
+    var c = Client.init(gpa, base, "test-token");
+    defer c.deinit();
+    c.request_timeout_s = 1;
+    const first_result = c.call(ar.allocator(), "get_msg", "{}");
+    const second_result = c.callData(ar.allocator(), "get_msg", "{}");
+    th.join();
+
+    try std.testing.expectError(error.RequestFailed, first_result);
+    const second_data = try second_result;
+    try std.testing.expect(second_data.object.get("recovered").?.bool);
+    try std.testing.expect(recover.first_closed.load(.acquire));
+    try std.testing.expectEqual(@as(u8, 2), recover.accepted_count.load(.acquire));
+    // 给高负载 CI 留足余量；关键是它必须在有限时间内返回，而非无限挂起。
+    try std.testing.expect(timer.read() < 5 * std.time.ns_per_s);
+}
+
+test "call：连续 gzip 响应的解压工作区按请求释放，不在整群 arena 累积" {
+    const gpa = std.testing.allocator;
+    const compressed =
+        "\x1f\x8b\x08\x00\x00\x00\x00\x00\x02\xff\xab\x56\x2a\x2e\x49\x2c" ++
+        "\x29\x2d\x56\xb2\x52\xca\xcf\x56\xd2\x51\x2a\x4a\x2d\x49\xce\x4f" ++
+        "\x49\x55\xb2\x32\xd0\x51\x4a\x49\x2c\x49\x54\xb2\xaa\x56\x4a\xaf" ++
+        "\xca\x2c\x50\xb2\x2a\x29\x2a\x4d\xad\xad\x05\x00\xc1\xdc\xff\xa8" ++
+        "\x30\x00\x00\x00";
+
+    const GzipFake = struct {
+        listener: std.net.Server,
+
+        fn acceptUntil(self: *@This()) ?std.net.Server.Connection {
+            for (0..300) |_| {
+                const conn = self.listener.accept() catch |e| switch (e) {
+                    error.WouldBlock => {
+                        std.Thread.sleep(10 * std.time.ns_per_ms);
+                        continue;
+                    },
+                    else => return null,
+                };
+                var flags = std.posix.fcntl(conn.stream.handle, std.posix.F.GETFL, 0) catch {
+                    conn.stream.close();
+                    return null;
+                };
+                flags &= ~@as(usize, 1 << @bitOffsetOf(std.posix.O, "NONBLOCK"));
+                _ = std.posix.fcntl(conn.stream.handle, std.posix.F.SETFL, flags) catch {
+                    conn.stream.close();
+                    return null;
+                };
+                return conn;
+            }
+            return null;
+        }
+
+        fn serve(self: *@This()) void {
+            for (0..4) |_| {
+                // 中途任一 call 失败时，下一次 accept 最多等 3 秒便退出；测试
+                // 不能因为它本来要捕获的 OOM/解压回归反而永久卡在 defer join。
+                const conn = self.acceptUntil() orelse return;
+                defer conn.stream.close();
+                const tv: std.posix.timeval = .{ .sec = 2, .usec = 0 };
+                std.posix.setsockopt(
+                    conn.stream.handle,
+                    std.posix.SOL.SOCKET,
+                    std.posix.SO.RCVTIMEO,
+                    std.mem.asBytes(&tv),
+                ) catch {};
+
+                var rbuf: [8192]u8 = undefined;
+                var wbuf: [8192]u8 = undefined;
+                var sr = conn.stream.reader(&rbuf);
+                var sw = conn.stream.writer(&wbuf);
+                var hs = std.http.Server.init(sr.interface(), &sw.interface);
+                var req = hs.receiveHead() catch return;
+                var body_buf: [4096]u8 = undefined;
+                _ = req.readerExpectNone(&body_buf).discardRemaining() catch return;
+                req.respond(compressed, .{
+                    .status = .ok,
+                    .keep_alive = false,
+                    .extra_headers = &.{
+                        .{ .name = "content-type", .value = "application/json" },
+                        .{ .name = "content-encoding", .value = "gzip" },
+                    },
+                }) catch return;
+            }
+        }
+    };
+
+    const addr = try std.net.Address.parseIp("127.0.0.1", 0);
+    var fake: GzipFake = .{ .listener = try addr.listen(.{
+        .reuse_address = true,
+        .force_nonblocking = true,
+    }) };
+    defer fake.listener.deinit();
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{fake.listener.listen_address.getPort()});
+    defer gpa.free(base);
+
+    // 一次 flate 工作区是 64 KiB。两份独立的 160 KiB 限额分别守住两种回归：
+    // Client backing 放不下三份并存，证明 self.gpa 上每轮 defer free；调用方
+    // arena backing 也放不下四份，证明工作区没有被重新塞回整群 arena 累积。
+    var client_storage: [160 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&client_storage);
+    var c = Client.init(fba.allocator(), base, "test-token");
+    defer c.deinit();
+    c.request_timeout_s = 3;
+
+    const th = try std.Thread.spawn(.{}, GzipFake.serve, .{&fake});
+    var joined = false;
+    defer if (!joined) th.join();
+
+    var call_storage: [160 * 1024]u8 = undefined;
+    var call_fba = std.heap.FixedBufferAllocator.init(&call_storage);
+    var ar = std.heap.ArenaAllocator.init(call_fba.allocator());
+    defer ar.deinit();
+    for (0..4) |_| {
+        const data = try c.callData(ar.allocator(), "get_msg", "{}");
+        try std.testing.expect(data.object.get("gzip").?.bool);
+    }
+    th.join();
+    joined = true;
 }
