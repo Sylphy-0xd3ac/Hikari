@@ -727,16 +727,35 @@ fn sleepReactionConfirmed(
 /// 每张图片的文本用换行连接。OCR 是 best-effort：
 /// 单张失败只告警并继续，其余图片仍有机会产出；全部失败时调用方按既有 empty
 /// 关卡跳过，不把一次 OCR 抖动升级成整群扫描失败。
-fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Message) ![]u8 {
+const OcrMessageResult = struct {
+    text: []u8,
+    images: usize,
+    attempted: usize,
+    succeeded: usize,
+    text_codepoints: usize,
+};
+
+fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Message) !OcrMessageResult {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
-    const engine = deps.ocr_engine orelse return out.toOwnedSlice(arena);
+    const engine = deps.ocr_engine orelse return .{
+        .text = try out.toOwnedSlice(arena),
+        .images = 0,
+        .attempted = 0,
+        .succeeded = 0,
+        .text_codepoints = 0,
+    };
+
+    var images: usize = 0;
+    var attempted: usize = 0;
+    var succeeded: usize = 0;
 
     for (m.segments) |segment| {
         const image = switch (segment) {
             .image => |img| img,
             else => continue,
         };
+        images += 1;
         // 本机不可能读取 NapCat 所在机器上的裸文件名/路径；只接受 NapCat
         // 上报的 URL（或 file 字段本身已经是 URL 的兼容形状）。这也修掉了
         // 把 `ABC.png` 当成本机路径后无法找到真实图片的生产问题。
@@ -745,6 +764,7 @@ fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Mes
         else
             continue;
 
+        attempted += 1;
         const recognized = engine.recognize(arena, source) catch |e| {
             std.log.warn(
                 "group {d}: local OCR failed for candidate message {d}: {s}; trying any remaining images",
@@ -760,10 +780,23 @@ fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Mes
             );
             continue;
         }
+        succeeded += 1;
         if (out.items.len > 0) try out.append(arena, '\n');
         try out.appendSlice(arena, text);
     }
-    return out.toOwnedSlice(arena);
+    const text = try out.toOwnedSlice(arena);
+    const text_codepoints = std.unicode.utf8CountCodepoints(text) catch text.len;
+    std.log.info(
+        "group {d}: local OCR candidate message {d}: images={d}, attempted={d}, succeeded={d}, text_codepoints={d}",
+        .{ group_id, m.message_id, images, attempted, succeeded, text_codepoints },
+    );
+    return .{
+        .text = text,
+        .images = images,
+        .attempted = attempted,
+        .succeeded = succeeded,
+        .text_codepoints = text_codepoints,
+    };
 }
 
 /// 单个群这一轮该不该写它自己的 `hikari:lastrun:{group_id}`：只在这个群
@@ -1297,7 +1330,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
             // 一张带文字说明的配图把说明改写成一大段 OCR 噪声。
             if (std.mem.trim(u8, base_text, " \t\r\n").len == 0) {
                 if (target) |tm| {
-                    if (tm.hasImage()) base_text = try ocrMessage(deps, a, gid, tm);
+                    if (tm.hasImage()) base_text = (try ocrMessage(deps, a, gid, tm)).text;
                 }
             }
             // 💨 是“补尾巴”而不是“给空候选提供正文”：先确认正常文本/OCR
@@ -2466,13 +2499,52 @@ test "ocrMessage：本机 OCR 统一使用 URL，跳过 NapCat 裸文件名，�
 
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
-    const text = try ocrMessage(deps, ar.allocator(), 99, message);
+    const result = try ocrMessage(deps, ar.allocator(), 99, message);
 
-    try std.testing.expectEqualStrings("图一\n图二甲\n图二乙\n表情字", text);
+    try std.testing.expectEqualStrings("图一\n图二甲\n图二乙\n表情字", result.text);
+    try std.testing.expectEqual(@as(usize, 4), result.images);
+    try std.testing.expectEqual(@as(usize, 3), result.attempted);
+    try std.testing.expectEqual(@as(usize, 3), result.succeeded);
+    try std.testing.expectEqual(@as(usize, 14), result.text_codepoints);
     try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
     try std.testing.expectEqualStrings("https://example.test/a.png", fake.seen.items[0]);
     try std.testing.expectEqualStrings("https://example.test/b.png", fake.seen.items[1]);
     try std.testing.expectEqualStrings("https://example.test/sticker.gif", fake.seen.items[2]);
+}
+
+test "ocrMessage：无 URL 与空识别仍返回可观察的逐消息统计" {
+    const gpa = std.testing.allocator;
+    var fake = FakeOcr{ .gpa = gpa, .replies = &.{"   \n"} };
+    defer fake.deinit();
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = undefined,
+        .st = undefined,
+        .observed_qqs = &.{},
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+        .ocr_engine = fake.engine(),
+    };
+    const message: onebot.Message = .{
+        .message_id = 8,
+        .user_id = 9,
+        .time = 0,
+        .segments = &.{
+            .{ .image = .{ .file = "napcat-only-file-name.png", .url = null } },
+            .{ .image = .{ .file = null, .url = "https://example.test/empty.png" } },
+        },
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const result = try ocrMessage(deps, ar.allocator(), 99, message);
+
+    try std.testing.expectEqualStrings("", result.text);
+    try std.testing.expectEqual(@as(usize, 2), result.images);
+    try std.testing.expectEqual(@as(usize, 1), result.attempted);
+    try std.testing.expectEqual(@as(usize, 0), result.succeeded);
+    try std.testing.expectEqual(@as(usize, 0), result.text_codepoints);
+    try std.testing.expectEqual(@as(usize, 1), fake.seen.items.len);
 }
 
 test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里最后一个，合并转发确实发出去了" {
