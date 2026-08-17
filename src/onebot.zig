@@ -65,6 +65,8 @@ pub const Message = struct {
     }
 
     /// text 段原样，at 段渲染为 @昵称（缺昵称或昵称为空时用 @QQ号），其余段丢弃，首尾 trim。
+    /// `name` 只能由 runner 的 `resolveAtNames` 写入 QQ 原始昵称；parseMessage
+    /// 会刻意丢弃 NapCat 的 `at.data.name`，因此这里绝不能把群名片带回输出。
     /// 返回新分配的内存，调用方负责 free。
     pub fn renderText(self: Message, gpa: std.mem.Allocator) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
