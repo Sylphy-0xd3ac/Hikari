@@ -2,10 +2,24 @@ const std = @import("std");
 
 pub const At = struct { qq: []const u8, name: ?[]const u8 };
 
+/// NapCat 图片段里 Hikari 实际会用到的两个定位字段。`file` 是 NapCat 自己
+/// 能重新解析的图片 id / 路径，`url` 是它随消息一并给出的下载地址；普通
+/// 图片 OCR 优先把 `file` 原样交还给同一个 NapCat，个人表情见 market_face。
+pub const Image = struct {
+    file: ?[]const u8,
+    url: ?[]const u8,
+    /// NapCat 内部的 marketFaceElement（QQ 商城/个人表情）。当前版本接收时
+    /// 通常把它转换成 image 段，但旧版本、转发内容或其它适配器也可能直接
+    /// 给 mface。OCR 时这类段优先用 URL：部分版本把 file 固定写成
+    /// "marketface"，它不是 `.ocr_image` 可重新定位的真实文件 id。
+    market_face: bool = false,
+};
+
 pub const Segment = union(enum) {
     text: []const u8,
     at: At,
     reply: i64,
+    image: Image,
     other,
 };
 
@@ -40,7 +54,17 @@ pub const Message = struct {
         return found;
     }
 
-    /// text 段原样，at 段渲染为 @昵称（缺昵称用 @QQ号），其余段丢弃，首尾 trim。
+    /// 是否至少有一个带可用 file/url 的图片段。图片仍不会被 `renderText`
+    /// 渲染成占位符；runner 只在正常文本为空时才把它交给 NapCat OCR。
+    pub fn hasImage(self: Message) bool {
+        for (self.segments) |s| switch (s) {
+            .image => |img| if (img.file != null or img.url != null) return true,
+            else => {},
+        };
+        return false;
+    }
+
+    /// text 段原样，at 段渲染为 @昵称（缺昵称或昵称为空时用 @QQ号），其余段丢弃，首尾 trim。
     /// 返回新分配的内存，调用方负责 free。
     pub fn renderText(self: Message, gpa: std.mem.Allocator) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
@@ -49,7 +73,8 @@ pub const Message = struct {
             .text => |t| try list.appendSlice(gpa, t),
             .at => |a| {
                 try list.append(gpa, '@');
-                try list.appendSlice(gpa, a.name orelse a.qq);
+                const display = if (a.name) |name| if (name.len > 0) name else a.qq else a.qq;
+                try list.appendSlice(gpa, display);
             },
             else => {},
         };
@@ -76,6 +101,34 @@ fn asStr(v: std.json.Value) ?[]const u8 {
 
 fn intField(obj: std.json.ObjectMap, key: []const u8) ?i64 {
     return asInt(obj.get(key) orelse return null);
+}
+
+/// 把 NapCat 的 image/mface 两种上报归一成同一个可 OCR 图片段。
+///
+/// NapCat 当前源码会把接收到的 marketFaceElement 转成 image，并附上
+/// emoji_id + 一个 raw300.gif URL；协议同时允许发送/转发路径保留 mface。
+/// 为兼容没有 url 的 mface，这里按 NapCat 自己的 URL 规则从 emoji_id 补出
+/// 同一张图。emoji_id 是 QQ/NapCat 生成的标识，不来自 Hikari 的 URL 输入。
+fn parseImage(arena: std.mem.Allocator, d: std.json.ObjectMap, market_hint: bool) !Image {
+    const file0 = if (d.get("file")) |fv| asStr(fv) else null;
+    const url0 = if (d.get("url")) |uv| asStr(uv) else null;
+    const emoji_id = if (d.get("emoji_id")) |ev| asStr(ev) else null;
+    const file = if (file0) |f| if (f.len > 0) f else null else null;
+    var url = if (url0) |u| if (u.len > 0) u else null else null;
+    const market_face = market_hint or emoji_id != null or (file != null and std.mem.eql(u8, file.?, "marketface"));
+    if (market_face and url == null) {
+        if (emoji_id) |id| {
+            if (id.len > 0) {
+                const dir_len: usize = @min(id.len, 2);
+                url = try std.fmt.allocPrint(
+                    arena,
+                    "https://gxh.vip.qq.com/club/item/parcel/item/{s}/{s}/raw300.gif",
+                    .{ id[0..dir_len], id },
+                );
+            }
+        }
+    }
+    return .{ .file = file, .url = url, .market_face = market_face };
 }
 
 pub fn parseMessage(arena: std.mem.Allocator, v: std.json.Value) !?Message {
@@ -123,6 +176,12 @@ pub fn parseMessage(arena: std.mem.Allocator, v: std.json.Value) !?Message {
                     } else {
                         try segs.append(arena, .other);
                     }
+                } else if (std.mem.eql(u8, ty, "image") or std.mem.eql(u8, ty, "mface")) {
+                    const d = data orelse {
+                        try segs.append(arena, .other);
+                        continue;
+                    };
+                    try segs.append(arena, .{ .image = try parseImage(arena, d, std.mem.eql(u8, ty, "mface")) });
                 } else {
                     try segs.append(arena, .other);
                 }
@@ -198,19 +257,51 @@ test "at 段带 name 渲染为 @昵称，缺 name 退化为 @QQ号" {
         \\ {"type":"at","data":{"qq":"999"}},{"type":"text","data":{"text":" hi"}}]}
     );
     try std.testing.expectEqualStrings("@999 hi", try m2.renderText(a));
+
+    const m3 = try parseOne(a,
+        \\{"message_id":1,"user_id":2,"time":0,"message":[
+        \\ {"type":"at","data":{"qq":"999","name":""}},{"type":"text","data":{"text":" hi"}}]}
+    );
+    try std.testing.expectEqualStrings("@999 hi", try m3.renderText(a));
 }
 
-test "image / face 等其他段被丢弃，不产生占位符" {
+test "image / face 等非文本段不产生占位符，但保留 OCR 所需的图片定位字段" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
     const m = try parseOne(a,
         \\{"message_id":1,"user_id":2,"time":0,"message":[
-        \\ {"type":"image","data":{"file":"x.png"}},
+        \\ {"type":"image","data":{"file":"x.png","url":"https://example.test/x.png"}},
         \\ {"type":"text","data":{"text":"abc"}},
         \\ {"type":"face","data":{"id":"1"}}]}
     );
     try std.testing.expectEqualStrings("abc", try m.renderText(a));
+    try std.testing.expect(m.hasImage());
+    try std.testing.expectEqualStrings("x.png", m.segments[0].image.file.?);
+    try std.testing.expectEqualStrings("https://example.test/x.png", m.segments[0].image.url.?);
+    try std.testing.expect(!m.segments[0].image.market_face);
+}
+
+test "个人表情兼容 image 和原生 mface，上报缺 URL 时按 NapCat 规则补图源" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const m = try parseOne(a,
+        \\{"message_id":1,"user_id":2,"time":0,"message":[
+        \\ {"type":"image","data":{"file":"marketface","emoji_id":"abcdef"}},
+        \\ {"type":"mface","data":{"emoji_id":"123456","emoji_package_id":"9","summary":"贴图"}}]}
+    );
+    try std.testing.expect(m.hasImage());
+    try std.testing.expect(m.segments[0].image.market_face);
+    try std.testing.expectEqualStrings(
+        "https://gxh.vip.qq.com/club/item/parcel/item/ab/abcdef/raw300.gif",
+        m.segments[0].image.url.?,
+    );
+    try std.testing.expect(m.segments[1].image.market_face);
+    try std.testing.expectEqualStrings(
+        "https://gxh.vip.qq.com/club/item/parcel/item/12/123456/raw300.gif",
+        m.segments[1].image.url.?,
+    );
 }
 
 test "纯图片消息渲染为空串" {
@@ -222,6 +313,18 @@ test "纯图片消息渲染为空串" {
         \\ "message":[{"type":"image","data":{"file":"x.png"}}]}
     );
     try std.testing.expectEqualStrings("", try m.renderText(a));
+    try std.testing.expect(m.hasImage());
+}
+
+test "没有 file/url 的 image 段不算可 OCR 图片" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const m = try parseOne(a,
+        \\{"message_id":1,"user_id":2,"time":0,
+        \\ "message":[{"type":"image","data":{"file":"","url":""}}]}
+    );
+    try std.testing.expect(!m.hasImage());
 }
 
 test "replyTarget 取 reply 段的 id" {
