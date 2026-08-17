@@ -2,16 +2,16 @@ const std = @import("std");
 
 pub const At = struct { qq: []const u8, name: ?[]const u8 };
 
-/// NapCat 图片段里 Hikari 实际会用到的两个定位字段。`file` 是 NapCat 自己
-/// 能重新解析的图片 id / 路径，`url` 是它随消息一并给出的下载地址；普通
-/// 图片 OCR 优先把 `file` 原样交还给同一个 NapCat，个人表情见 market_face。
+/// NapCat 图片段里 Hikari 实际会用到的两个定位字段。`file` 可能只是 NapCat
+/// 所在机器上的 id / 路径，`url` 是它随消息一并给出的下载地址；本机 OCR
+/// 只使用 http(s) URL，个人表情见 market_face。
 pub const Image = struct {
     file: ?[]const u8,
     url: ?[]const u8,
     /// NapCat 内部的 marketFaceElement（QQ 商城/个人表情）。当前版本接收时
     /// 通常把它转换成 image 段，但旧版本、转发内容或其它适配器也可能直接
-    /// 给 mface。OCR 时这类段优先用 URL：部分版本把 file 固定写成
-    /// "marketface"，它不是 `.ocr_image` 可重新定位的真实文件 id。
+    /// 给 mface。OCR 时这类段使用 URL：部分版本把 file 固定写成
+    /// "marketface"，它不是可下载的真实文件 id。
     market_face: bool = false,
 };
 
@@ -55,7 +55,7 @@ pub const Message = struct {
     }
 
     /// 是否至少有一个带可用 file/url 的图片段。图片仍不会被 `renderText`
-    /// 渲染成占位符；runner 只在正常文本为空时才把它交给 NapCat OCR。
+    /// 渲染成占位符；runner 只在正常文本为空时才把它交给本机 OCR。
     pub fn hasImage(self: Message) bool {
         for (self.segments) |s| switch (s) {
             .image => |img| if (img.file != null or img.url != null) return true,

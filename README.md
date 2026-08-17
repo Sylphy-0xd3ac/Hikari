@@ -1,13 +1,14 @@
 # Hikari
 
-Hikari 是一个用 Zig 写的常驻进程，零第三方依赖。每天定时扫描指定 QQ 群的历史消息，把群友用 ✨ 认可
+Hikari 是一个用 Zig 写的常驻进程，主程序不链接第三方库。每天定时扫描指定 QQ 群的历史消息，把群友用 ✨ 认可
 （或管理员手动补录）的话收进 Redis，再通过一个与 [Hitokoto 一言 API](https://developer.hitokoto.cn/sentence/)
 兼容的 HTTP 接口随机吐出来。扫描结果会以一条合并转发消息发回群里当运行日志。上游依赖
 [NapCatQQ](https://github.com/NapNeko/NapCatQQ) 的 HTTP 接口（OneBot 11 + NapCat 扩展）。
 
 ## 快速开始
 
-需要 Zig 0.15.2、一个可用的 Redis、一个已经登录好目标账号的 NapCat 实例。
+需要 Zig 0.15.2、一个可用的 Redis、一个已经登录好目标账号的 NapCat 实例。若要给纯图片/个人表情
+候选做 OCR，运行机器还需要 `curl`、`timeout`、`prlimit` 与 Tesseract 5（简中 + 英文模型）。
 
 ```bash
 # 构建（生产用 ReleaseSafe：见下方「构建」一节）
@@ -68,14 +69,17 @@ curl 'http://127.0.0.1:8080/'
 或其它段都不算这条语法。它是比自动 🔥 分组更明确的单条收录指令：目标不会再作为链内容被吞掉。
 
 **图片与个人表情 OCR**：候选通过 tombstone / existing / chain-member 关卡后，如果正常渲染正文为空但目标含
-图片或 QQ 个人/商城表情，Hikari 会把它们逐张交给 NapCat 原生增强 action **`.ocr_image`**。NapCat 当前通常把
-收到的 `mface` 转成带 `emoji_id`/`url` 的 `image`，Hikari 也兼容直接上报的原生 `mface`：普通图片优先把
-`file` 交还给同一个 NapCat、缺失时用 `url`；个人表情优先用真实 `url`（部分版本的 `file` 只是固定字符串
-`marketface`），缺 URL 时按 `emoji_id` 补出 NapCat 同源图地址。一张图里的 `texts[].text` 和多张图之间都按返回顺序用换行连接。
+图片或 QQ 个人/商城表情，Hikari 会下载真实的 HTTP(S) 图源并按需启动本机 Tesseract。NapCat 当前通常把
+收到的 `mface` 转成带 `emoji_id`/`url` 的 `image`，Hikari 也兼容直接上报的原生 `mface`：优先使用真实
+`url`，若 `file` 本身就是 HTTP(S) URL 也可使用；NapCat 所在机器上的裸文件名/路径不会被误当成本机文件。
+个人表情缺 URL 时按 `emoji_id` 补出 NapCat 同源图地址。每张图串行跑 PSM 6（整块文字）和 PSM 11
+（稀疏短字），按 TSV 字符加权置信度选较好结果；一张图里的各行及多张图之间按顺序用换行连接。
 这里的「个人表情」不是普通图片的同义词：它按 `emoji_id` 等字段单独识别，只是 NapCat 在**接收端**通常把
 `mface` 改写成了 `image` 段。QQ 内置小表情则是只有数字 ID、没有可 OCR 图源的 `face` 段，仍不会拿去 OCR。
 已有文字正文永远优先，不额外混入 OCR；OCR 是 best-effort，失败会告警，全部没有可用文本时仍按
-`empty` 跳过。管理员发 `✨` 并在同一条消息里附图也属于有效候选——光杆 `✨` 本身仍无效。
+`empty` 跳过。每张下载图最多 16 MiB；每个 Tesseract pass 最多 20 秒、2 个 OpenMP 线程和 2 GiB
+地址空间，而且两个布局串行执行，不常驻模型。管理员发 `✨` 并在同一条消息里附图也属于有效候选——
+光杆 `✨` 本身仍无效。
 
 **🔥 链的两种角色**：🔥 的含义是"这条消息和下一条属于同一句话"，🔥 必须构成一段**不间断**的连续
 标记——走到第一条没有 🔥 的消息，这一段就结束（没有"最多隔几条"这种间距上限，那是旧规则）。段里
@@ -155,6 +159,7 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 | `HTTP_HOST` | 是 | 一言服务监听地址 | `0.0.0.0` |
 | `HTTP_PORT` | 是 | 一言服务监听端口 | `8080` |
 | `REDIS_URL` | 是 | `redis://[:password@]host:port/db` | `redis://127.0.0.1:6379/0` |
+| `OCR_TESSDATA_DIR` | 否 | Tesseract 模型目录；生产建议指向装有 `tessdata_best` 简中/英文模型及系统 `configs` 的目录 | `/opt/hikari/tessdata` |
 
 ## CLI
 
@@ -292,6 +297,16 @@ zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 
 以非 root 用户运行，交给 systemd 管理：
 
+Fedora 生产机先安装运行时，并准备高精度模型目录。`tsv` 配置文件来自系统 tessdata，两个
+`traineddata` 则使用官方 `tessdata_best`；下载时应固定到部署审核过的提交与校验和：
+
+```bash
+sudo dnf install tesseract curl coreutils util-linux
+sudo install -d -m 0755 /opt/hikari/tessdata
+sudo cp -a /usr/share/tesseract/tessdata/. /opt/hikari/tessdata/
+# 再用官方 tessdata_best 的 chi_sim.traineddata / eng.traineddata 覆盖同名文件
+```
+
 ```ini
 [Unit]
 Description=Hikari
@@ -329,8 +344,8 @@ zig build test          # 完整测试套件
 跑一次真实扫描不需要等到定时触发，也不需要临时改 `SCAN_TIME` 再改回去：`hikari run` 用跟常驻路径
 完全同一套装配（同一个 config、同一种独立 Redis 连接）立刻跑一次并退出。
 
-部署目标是 `x86_64-linux-gnu`，本仓库零第三方依赖，`-Dtarget` 交叉编译到其他平台同样适用，只是
-目前只有这一个目标经过实际部署验证。
+部署目标是 `x86_64-linux-gnu`，Hikari 二进制本身不链接第三方库，`-Dtarget` 交叉编译到其他平台
+同样适用；图片 OCR 另需上述 Linux 命令行运行时。目前只有这一个目标经过实际部署验证。
 
 涉及所有权转移的代码（谁在错误路径上该释放哪块内存）容易在 OOM 分支上出岔子，本仓库的约定是这类
 代码都配一条 `std.testing.checkAllAllocationFailures` 测试，逐次让分配失败、确认每条路径都不泄漏

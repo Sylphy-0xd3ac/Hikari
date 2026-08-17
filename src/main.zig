@@ -1,6 +1,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const napcat = @import("napcat.zig");
+const ocr = @import("ocr.zig");
 const redis = @import("redis/client.zig");
 const store = @import("store.zig");
 const http_server = @import("http/server.zig");
@@ -120,6 +121,7 @@ pub fn main() !void {
 
     var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
     defer nap.deinit();
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_tessdata_dir);
 
     var srv = try http_server.Server.listen(gpa, &http_store, cfg.http_host, cfg.http_port);
     defer srv.deinit();
@@ -135,6 +137,7 @@ pub fn main() !void {
         .observed_qqs = cfg.observed_qqs,
         .admin_qqs = cfg.admin_qqs,
         .group_ids = cfg.group_ids,
+        .ocr_engine = local_ocr.engine(),
     };
 
     // 重启补跑：`hikari:lastrun:{group_id}` 是逐群独立的键，所以这里逐群判断
@@ -208,6 +211,7 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8, attribution_qq: u6
 
     var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
     defer nap.deinit();
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_tessdata_dir);
 
     const deps: runner.Deps = .{
         .gpa = gpa,
@@ -216,6 +220,7 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8, attribution_qq: u6
         .observed_qqs = cfg.observed_qqs,
         .admin_qqs = cfg.admin_qqs,
         .group_ids = cfg.group_ids,
+        .ocr_engine = local_ocr.engine(),
     };
 
     const summary = import.run(deps, path, attribution_qq, std.time.timestamp()) catch |e| {
@@ -266,6 +271,7 @@ fn runRunCommand(gpa: std.mem.Allocator, lookback_seconds: ?i64) !void {
 
     var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
     defer nap.deinit();
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_tessdata_dir);
 
     const deps: runner.Deps = .{
         .gpa = gpa,
@@ -274,6 +280,7 @@ fn runRunCommand(gpa: std.mem.Allocator, lookback_seconds: ?i64) !void {
         .observed_qqs = cfg.observed_qqs,
         .admin_qqs = cfg.admin_qqs,
         .group_ids = cfg.group_ids,
+        .ocr_engine = local_ocr.engine(),
     };
 
     runner.runOnceWithOptions(deps, std.time.timestamp(), .{ .lookback_seconds = lookback_seconds });
@@ -377,6 +384,7 @@ test "run CLI：--last 拒绝零、负数、小数、无单位、超 7 天及多
 test {
     _ = @import("config.zig");
     _ = @import("onebot.zig");
+    _ = @import("ocr.zig");
     _ = @import("scan/rules.zig");
     _ = @import("redis/resp.zig");
     _ = @import("redis/client.zig");

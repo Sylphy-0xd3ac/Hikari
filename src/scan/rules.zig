@@ -243,7 +243,7 @@ pub fn manualParse(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?Manua
     // 路径3语法，即使正文为空也必须作为空候选返回。否则它若又被贴了 ✨，会
     // 从路径3漏下去被路径1收成字面量 `✨ @某人`，同时 skipped 也少算一条。
     // 光杆 `✨` 仍不是候选；但同一条消息带图片时，✨ 已经明确是在要求收录
-    // 那张图，正文交给 runner 的 `.ocr_image` 回填。
+    // 那张图，正文交给 runner 的本机 OCR 回填。
     if (body.len == 0 and author_uid == null and !m.hasImage()) return null;
     return .{ .body = try gpa.dupe(u8, body), .author_uid = author_uid };
 }
