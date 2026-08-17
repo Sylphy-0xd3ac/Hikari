@@ -273,6 +273,7 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
         try gpa.dupe(u8, raw)
     else
         null;
+    errdefer if (ocr_tessdata_dir) |p| gpa.free(p);
 
     return .{
         .gpa = gpa,

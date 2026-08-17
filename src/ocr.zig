@@ -67,6 +67,8 @@ pub const Local = struct {
         defer std.fs.deleteFileAbsolute(image_path) catch {};
 
         try self.download(image_url, image_path);
+        // Zig 0.15.2 has no statFileAbsolute; Dir.statFile explicitly accepts an
+        // absolute sub_path and ignores the directory handle in that case.
         const stat = std.fs.cwd().statFile(image_path) catch return error.DownloadFailed;
         if (stat.size == 0) return error.EmptyImage;
         if (stat.size > max_image_bytes) return error.ImageTooLarge;
