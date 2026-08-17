@@ -172,10 +172,10 @@ pub const BuildArgs = struct {
     commit_from: []const u8 = "hikari",
     // creator/creator_uid：路径1、2、4（自动化路径）与 import 都不设置这两个
     // 字段，保持默认的 "Hikari"/0——这些语录不是任何一个具体的人"创建"的，
-    // "Hikari" 这个机器人身份对 Hitokoto 语义而言是准确的。只有路径3（管理员
-    // 手动 `✨ 内容`）在 scanGroup 里显式覆盖成那位管理员自己的显示名/QQ——
-    // 他本人确实是 Hitokoto 语义下的 creator，见 scanGroup 里 `cand.path ==
-    // .admin_manual` 分支的说明。
+    // "Hikari" 这个机器人身份对 Hitokoto 语义而言是准确的。路径3（管理员
+    // 手动 `✨ 内容` / `✨ @某人 内容`）与路径3b（reply + `✨ @某人`）在
+    // scanGroup 里显式覆盖成那位管理员自己的显示名/QQ——他本人确实是
+    // Hitokoto 语义下的 creator。
     creator: []const u8 = "Hikari",
     creator_uid: u64 = 0,
 };
@@ -239,6 +239,13 @@ pub fn oldestId(msgs: []const onebot.Message) ?i64 {
         }
     }
     return best.message_id;
+}
+
+/// 群消息的统一时间顺序：先按秒级时间戳，再按 message_id 打破同秒并列。
+/// QQ 群里连续短句经常落在同一秒；只比较 time 会把排序结果交给输入页顺序和
+/// 非稳定排序实现，🔥 链可能因此在不同分页形状下偶发换序或断开。
+fn messageBefore(_: void, x: onebot.Message, y: onebot.Message) bool {
+    return x.time < y.time or (x.time == y.time and x.message_id < y.message_id);
 }
 
 pub const Deps = struct {
@@ -523,6 +530,44 @@ pub fn authorCard(deps: Deps, arena: std.mem.Allocator, group_id: u64, user_id: 
     return name;
 }
 
+/// NapCat 的消息段经常只给 `at.data.qq`，不带 `at.data.name`。若直接走
+/// `Message.renderText`，正文就会永久写成 `@123456789`；后续 HTTP 渲染只会
+/// 刷新语录作者的 `from_who`，无法知道正文里这一串数字原本是哪一个 at 段，
+/// 因而也无法事后安全修复。这里在规则判定和正文拼接之前，按这条消息所在的
+/// 群用 `get_group_member_info` 主动补齐名字。
+///
+/// `messages` 的 Message 本身来自 arena，但 segments 字段是只读切片。只在
+/// 至少有一个 at 真正解析成功时复制一份 Segment 数组并替换 Message.segments；
+/// 原始解析结果仍由同一个 arena 托管，不需要逐条释放。数字以外的目标（例如
+/// `qq="all"`）不调用成员接口，继续使用 NapCat 自带的 name，缺失时保留原值。
+/// 查询失败也不是整群失败：保留 `@QQ` 并让扫描继续，下一次重扫仍有机会恢复。
+fn resolveAtNames(
+    deps: Deps,
+    arena: std.mem.Allocator,
+    group_id: u64,
+    messages: []onebot.Message,
+    cache: *AuthorCache,
+) !void {
+    for (messages) |*message| {
+        var replacement: ?[]onebot.Segment = null;
+        for (message.segments, 0..) |segment, i| {
+            const at = switch (segment) {
+                .at => |value| value,
+                else => continue,
+            };
+            if (at.name) |name| if (name.len > 0) continue;
+
+            const uid = std.fmt.parseInt(u64, std.mem.trim(u8, at.qq, " \t\r\n"), 10) catch continue;
+            const name = authorCard(deps, arena, group_id, uid, cache) orelse continue;
+            if (name.len == 0) continue;
+
+            if (replacement == null) replacement = try arena.dupe(onebot.Segment, message.segments);
+            replacement.?[i] = .{ .at = .{ .qq = at.qq, .name = name } };
+        }
+        if (replacement) |segments| message.segments = segments;
+    }
+}
+
 /// 一页历史的拉取结果。
 ///
 /// `stop` 非空表示这一页没能提供继续翻页的依据，同时**说明是哪种情况**。
@@ -673,6 +718,83 @@ fn sleepReactionConfirmed(
         return false;
     };
     return napcat.hasEmojiLikeFromUser(data, sender_uid);
+}
+
+/// NapCat `.ocr_image` 的 `data.texts[].text` 按返回顺序拼成多行纯文本。
+/// 坐标与 confidence 只用于识别排序/诊断，语录正文不保存这些结构化字段。
+fn ocrTextFromData(gpa: std.mem.Allocator, data: std.json.Value) ![]u8 {
+    const texts_value = switch (data) {
+        .object => |obj| obj.get("texts") orelse return gpa.dupe(u8, ""),
+        else => return gpa.dupe(u8, ""),
+    };
+    const items = switch (texts_value) {
+        .array => |arr| arr.items,
+        else => return gpa.dupe(u8, ""),
+    };
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (items) |item| {
+        const obj = switch (item) {
+            .object => |o| o,
+            else => continue,
+        };
+        const value = obj.get("text") orelse continue;
+        const raw = switch (value) {
+            .string => |s| s,
+            else => continue,
+        };
+        const line = std.mem.trim(u8, raw, " \t\r\n");
+        if (line.len == 0) continue;
+        if (out.items.len > 0) try out.append(gpa, '\n');
+        try out.appendSlice(gpa, line);
+    }
+    return out.toOwnedSlice(gpa);
+}
+
+/// 只在候选的正常文本为空时调用：把消息里的每个可定位图片交给 NapCat
+/// 增强 action `.ocr_image`，每张图片的文本用换行连接。OCR 是 best-effort：
+/// 单张失败只告警并继续，其余图片仍有机会产出；全部失败时调用方按既有 empty
+/// 关卡跳过，不把一次 OCR 抖动升级成整群扫描失败。
+fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Message) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(arena);
+
+    for (m.segments) |segment| {
+        const image = switch (segment) {
+            .image => |img| img,
+            else => continue,
+        };
+        // market face 在部分 NapCat 版本里会把 file 固定上报成
+        // "marketface"；它不是可供 `.ocr_image` 定位的文件 id。NapCat
+        // 同时给出的（或 onebot.parseMessage 由 emoji_id 补出的）URL 才是
+        // 实际表情图源。普通图片仍然保持 file 优先、URL 兜底。
+        const source = if (image.market_face)
+            (image.url orelse image.file orelse continue)
+        else
+            (image.file orelse image.url orelse continue);
+
+        var aw: std.Io.Writer.Allocating = .init(arena);
+        try std.json.Stringify.value(.{ .image = source }, .{}, &aw.writer);
+        const data = deps.nap.callData(arena, ".ocr_image", aw.written()) catch |e| {
+            std.log.warn(
+                "group {d}: NapCat .ocr_image failed for candidate message {d}: {s}; trying any remaining images",
+                .{ group_id, m.message_id, @errorName(e) },
+            );
+            continue;
+        };
+        const recognized = try ocrTextFromData(arena, data);
+        if (recognized.len == 0) {
+            std.log.warn(
+                "group {d}: NapCat .ocr_image returned no usable text for candidate message {d}",
+                .{ group_id, m.message_id },
+            );
+            continue;
+        }
+        if (out.items.len > 0) try out.append(arena, '\n');
+        try out.appendSlice(arena, recognized);
+    }
+    return out.toOwnedSlice(arena);
 }
 
 /// 单个群这一轮该不该写它自己的 `hikari:lastrun:{group_id}`：只在这个群
@@ -901,11 +1023,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     for (pool.items) |m| {
         if (inWindow(m.time, win_start, win_end)) try window.append(a, m);
     }
-    std.mem.sort(onebot.Message, window.items, {}, struct {
-        fn lt(_: void, x: onebot.Message, y: onebot.Message) bool {
-            return x.time < y.time;
-        }
-    }.lt);
+    std.mem.sort(onebot.Message, window.items, {}, messageBefore);
 
     const line = try willProcessLine(a, window.items.len);
     pushLine(a, lines, gid, line);
@@ -914,6 +1032,14 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     // getMsg 调用点。声明在这里、用到步骤 4 结束，理由跟 pages/stop_reason
     // 一样：一份局部状态，随 scanGroup 这次调用生生灭灭，不需要活得更久。
     var get_msg_stats: GetMsgStats = .{};
+    const rule_params: rules.Params = .{
+        .observed_qqs = deps.observed_qqs,
+        .admin_qqs = deps.admin_qqs,
+    };
+    // 同一份缓存同时服务正文里的 at 与候选作者/creator。一个 QQ 在一轮扫描
+    // 里不管被 at 多少次、又作为作者出现多少次，都只问一次群成员资料。
+    var author_cache: AuthorCache = .init(a);
+    defer author_cache.deinit();
 
     // ---- 3. 补拉不在池里的 reply 目标 ----
     for (window.items) |m| {
@@ -944,10 +1070,10 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         // 它再回群里 💦，天然是在一个后续窗口里操作），它自己不在 window.items
         // 里，这个循环不会为它单独走一遍。
         //
-        // 代价被刻意卡死在"只对形状对得上的目标多问一次"：条件是那条消息除
-        // reply 段外只有一个 trim 后等于 `✨` 的文本段——普通的"回复一条回复"
-        // 完全不满足，不会因为这条改动多花任何一次 get_msg。
-        const hop = rules.starTriggerTarget(target.?) orelse continue;
+        // 代价被刻意卡死在"只对形状对得上的目标多问一次"：普通路径2要求
+        // reply 外只有一个 `✨` 文本段；路径3b要求管理员的 `✨ @某人`。
+        // 普通的"回复一条回复"完全不满足，不会多花任何一次 get_msg。
+        const hop = rules.triggerTarget(target.?, rule_params) orelse continue;
         var have_hop = false;
         for (pool.items) |p| {
             if (p.message_id == hop) {
@@ -960,14 +1086,25 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         if (try onebot.parseMessage(a, hop_data)) |parsed| try pool.append(a, parsed);
     }
 
+    // pool 现在已经包含窗口消息及所有成功回补的 reply 目标。先在 pool 上补齐
+    // at 名字，再把同 id 的 segments 同步回 window 的 Message 拷贝：rules 会
+    // 在这里构建 🔥 joined 正文和路径3正文，必须在它之前完成，不能等到最终
+    // 普通候选的 renderText 调用点才补。
+    try resolveAtNames(deps, a, gid, pool.items, &author_cache);
+    for (window.items) |*message| {
+        for (pool.items) |pooled| {
+            if (pooled.message_id == message.message_id) {
+                message.segments = pooled.segments;
+                break;
+            }
+        }
+    }
+
     // ---- 4. 查表情回应（✨/🔥 共用 get_msg；管理员的单独 💤 也必须探测）----
     var star_ids: std.ArrayList(i64) = .empty;
     var fire_ids: std.ArrayList(i64) = .empty;
     var sleep_reaction_ids: std.ArrayList(i64) = .empty;
-    const probe_params: rules.Params = .{
-        .observed_qqs = deps.observed_qqs,
-        .admin_qqs = deps.admin_qqs,
-    };
+    const probe_params = rule_params;
     // 探针用量计时：跟 deps.clock（Successfully in Ns. 用的那个可注入时钟）
     // 故意脱钩，用真实墙钟毫秒数——这一行是运维诊断信息，不是七行产品日志
     // 的一部分，不需要参与测试对 deps.clock 调用次数的既有断言，用真实时钟
@@ -1104,9 +1241,6 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
 
     var added: usize = 0;
     var skipped: SkipReasons = .{};
-    var author_cache: AuthorCache = .init(a);
-    defer author_cache.deinit();
-
     if (outcome.skip_collection) {
         // 💤（design.md §4.5.2）：这个群这一轮一条都不收录。
         //
@@ -1182,17 +1316,33 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 }
             }
 
-            const text: []const u8 = if (cand.text_override) |t| t else blk: {
+            var base_text: []const u8 = if (cand.text_override) |t| t else blk: {
                 const tm = target orelse {
                     skipped.target_missing += 1;
                     continue;
                 };
                 break :blk try tm.renderText(a);
             };
-            if (text.len == 0) {
+            // 图片候选过去会在这里直接落入 empty。现在只在正常文本确实为空时
+            // 调 NapCat 原生增强 action `.ocr_image`：已有正文永远优先，避免
+            // 一张带文字说明的配图把说明改写成一大段 OCR 噪声。
+            if (std.mem.trim(u8, base_text, " \t\r\n").len == 0) {
+                if (target) |tm| {
+                    if (tm.hasImage()) base_text = try ocrMessage(deps, a, gid, tm);
+                }
+            }
+            // 💨 是“补尾巴”而不是“给空候选提供正文”：先确认正常文本/OCR
+            // 有结果，再无分隔符追加，防止纯表情等原本该跳过的消息被补丁救活。
+            if (std.mem.trim(u8, base_text, " \t\r\n").len == 0) {
                 skipped.empty += 1;
                 continue;
             }
+            const text: []const u8 = if (cand.text_suffix) |suffix| blk: {
+                const joined = try a.alloc(u8, base_text.len + suffix.len);
+                @memcpy(joined[0..base_text.len], base_text);
+                @memcpy(joined[base_text.len..], suffix);
+                break :blk joined;
+            } else base_text;
 
             // from_who 现在按**这条候选自己的作者**解析，不是群里固定的
             // 一个人：target 找到时用它的 user_id（这条消息真正的发送者，
@@ -1234,22 +1384,22 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 break :blk "";
             };
 
-            // creator/creator_uid：只有路径3（admin_manual，管理员手动
-            // `✨ 内容` / `✨ @某人 内容`）覆盖成这位管理员自己的信息——
+            // creator/creator_uid：两种显式管理员路径（admin_manual 的
+            // `✨ 内容` / `✨ @某人 内容`，以及 admin_quoted 的回复目标后
+            // `✨ @某人`）覆盖成敲命令的管理员信息——
             // 「添加者」在 Hitokoto 语义下永远是敲这条指令的人，跟这句话
-            // 是谁说的（作者）是两回事。`✨ 内容` 时两者是同一个人，
-            // author_uid == sender_uid，from_who 已经解析出来了，直接复用，
-            // 不多问一次 NapCat；`✨ @某人 内容` 时才需要为管理员自己再走
-            // 一次 authorCard（同一份每次扫描内的缓存，同一个管理员一天敲
-            // 多少条也只问一次）。其余三条路径不传 creator/creator_uid，
+            // 是谁说的（作者）是两回事。作者与 creator 是同一个人时直接复用
+            // from_who，不多问一次 NapCat；两者不同时才为管理员自己再走一次
+            // authorCard（同一份每次扫描内的缓存，同一个管理员一天敲多少条
+            // 也只问一次）。自动路径不传 creator/creator_uid，
             // buildQuote 落回默认的 "Hikari"/0。
-            const is_admin_manual = cand.path == .admin_manual;
-            const creator_name: []const u8 = if (!is_admin_manual)
+            const creator_uid = cand.creator_uid;
+            const creator_name: []const u8 = if (creator_uid == null)
                 "Hikari"
-            else if (author_uid == sender_uid)
+            else if (author_uid == creator_uid.?)
                 from_who
             else
-                authorCard(deps, a, gid, sender_uid, &author_cache) orelse "";
+                authorCard(deps, a, gid, creator_uid.?, &author_cache) orelse "";
 
             const id = try deps.st.nextId();
             const q = try buildQuote(deps.gpa, .{
@@ -1262,7 +1412,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 .group_id = gid,
                 .user_id = author_uid,
                 .creator = creator_name,
-                .creator_uid = if (is_admin_manual) sender_uid else 0,
+                .creator_uid = creator_uid orelse 0,
             });
             defer freeQuote(deps.gpa, q);
 
@@ -1786,6 +1936,18 @@ test "oldestId 时间并列时按 message_id 取最小者，与输入顺序无�
     try std.testing.expectEqual(@as(?i64, 2), oldestId(&b_first));
 }
 
+test "messageBefore：同秒消息按 message_id 确定排序，🔥 链不依赖历史页输入顺序" {
+    var msgs = [_]onebot.Message{
+        .{ .message_id = 30, .user_id = 1, .time = 100, .segments = &.{} },
+        .{ .message_id = 10, .user_id = 1, .time = 100, .segments = &.{} },
+        .{ .message_id = 20, .user_id = 1, .time = 99, .segments = &.{} },
+    };
+    std.mem.sort(onebot.Message, &msgs, {}, messageBefore);
+    try std.testing.expectEqual(@as(i64, 20), msgs[0].message_id);
+    try std.testing.expectEqual(@as(i64, 10), msgs[1].message_id);
+    try std.testing.expectEqual(@as(i64, 30), msgs[2].message_id);
+}
+
 // ---------------------------------------------------------------------------
 // noAdvanceOutcome：翻页锚点没能前进时，区分"翻到群历史最开头了"（合法收尾，
 // 不该打 NOT fully covered 警告）与"NapCat 真的又出岔子了"（异常，该打）。
@@ -2096,6 +2258,7 @@ const FakeNapcatServer = struct {
     thread: std.Thread,
     replies: []const []const u8,
     bodies: std.ArrayList([]u8),
+    targets: std.ArrayList([]u8),
     gpa: std.mem.Allocator,
     mutex: std.Thread.Mutex,
     active_stream: ?std.net.Stream,
@@ -2124,6 +2287,9 @@ const FakeNapcatServer = struct {
         var hs = std.http.Server.init(sr.interface(), &sw.interface);
         for (self.replies) |body| {
             var req = hs.receiveHead() catch return;
+            if (self.gpa.dupe(u8, req.head.target) catch null) |target| {
+                self.targets.append(self.gpa, target) catch self.gpa.free(target);
+            }
             var body_buf: [8192]u8 = undefined;
             const body_reader = req.readerExpectNone(&body_buf);
             if (body_reader.allocRemaining(self.gpa, .unlimited) catch null) |b| {
@@ -2144,6 +2310,7 @@ const FakeNapcatServer = struct {
             .thread = undefined,
             .replies = replies,
             .bodies = .empty,
+            .targets = .empty,
             .gpa = gpa,
             .mutex = .{},
             .active_stream = null,
@@ -2175,6 +2342,8 @@ const FakeNapcatServer = struct {
     fn destroy(self: *FakeNapcatServer) void {
         for (self.bodies.items) |b| self.gpa.free(b);
         self.bodies.deinit(self.gpa);
+        for (self.targets.items) |target| self.gpa.free(target);
+        self.targets.deinit(self.gpa);
         self.gpa.destroy(self);
     }
 };
@@ -2205,6 +2374,143 @@ test "FakeNapcatServer.stop：客户端少请求一次且仍存活时不会等�
 
     try std.testing.expectEqual(@as(usize, 1), nap_srv.bodies.items.len);
     try std.testing.expectEqualStrings("{\"message_id\":42}", nap_srv.bodies.items[0]);
+}
+
+test "resolveAtNames：at 缺 name 时按群和 QQ 查名片，同一 QQ 每轮只查一次" {
+    const gpa = std.testing.allocator;
+
+    // authorCard 在名字非空时会同步刷新 hikari:username:{uid}，因此 Redis
+    // fake 只需接住这一条 SET；第二条消息命中缓存，不会再问 NapCat 或写 Redis。
+    const redis_srv = try FakeServer.start(gpa, "+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    defer rc.deinit();
+    var st = store.Store.init(gpa, &rc);
+
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"群名片\",\"nickname\":\"昵称\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{},
+        .admin_qqs = &.{},
+        .group_ids = &.{99},
+    };
+    const first_segments = [_]onebot.Segment{
+        .{ .text = "你好 " },
+        .{ .at = .{ .qq = "50001", .name = null } },
+    };
+    const second_segments = [_]onebot.Segment{
+        .{ .at = .{ .qq = "50001", .name = "" } },
+        .{ .text = " 再见" },
+    };
+    var messages = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = 7, .time = 1, .segments = &first_segments },
+        .{ .message_id = 2, .user_id = 8, .time = 2, .segments = &second_segments },
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    var cache: AuthorCache = .init(ar.allocator());
+    defer cache.deinit();
+    try resolveAtNames(deps, ar.allocator(), 99, &messages, &cache);
+
+    try std.testing.expectEqualStrings("你好 @群名片", try messages[0].renderText(ar.allocator()));
+    try std.testing.expectEqualStrings("@群名片 再见", try messages[1].renderText(ar.allocator()));
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+    try std.testing.expectEqual(@as(usize, 1), nap_srv.targets.items.len);
+    try std.testing.expectEqualStrings("/get_group_member_info", nap_srv.targets.items[0]);
+    try std.testing.expectEqualStrings(
+        "{\"group_id\":99,\"user_id\":50001,\"no_cache\":true}",
+        nap_srv.bodies.items[0],
+    );
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:username:50001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "群名片") != null);
+}
+
+test "ocrTextFromData：按 NapCat texts 顺序拼行，忽略空项与坏形状" {
+    const gpa = std.testing.allocator;
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parsed = try std.json.parseFromSlice(
+        std.json.Value,
+        a,
+        "{\"texts\":[{\"text\":\" 第一行 \"},{\"text\":\"\"},{\"bad\":1},{\"text\":\"第二行\",\"confidence\":0.99}]}",
+        .{},
+    );
+    const text = try ocrTextFromData(a, parsed.value);
+    try std.testing.expectEqualStrings("第一行\n第二行", text);
+
+    const bad = try std.json.parseFromSlice(std.json.Value, a, "{\"texts\":{}}", .{});
+    try std.testing.expectEqualStrings("", try ocrTextFromData(a, bad.value));
+}
+
+test "ocrMessage：普通图片 file 优先，个人表情 URL 优先，多图 OCR 换行" {
+    const gpa = std.testing.allocator;
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"图一\"}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"图二甲\"},{\"text\":\"图二乙\"}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"表情字\"}]}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = undefined,
+        .observed_qqs = &.{},
+        .admin_qqs = &.{},
+        .group_ids = &.{},
+    };
+    const message: onebot.Message = .{
+        .message_id = 7,
+        .user_id = 8,
+        .time = 0,
+        .segments = &.{
+            .{ .image = .{ .file = "image-file-id", .url = "https://unused.test/a.png" } },
+            .{ .image = .{ .file = null, .url = "https://example.test/b.png" } },
+            .{ .image = .{ .file = "marketface", .url = "https://example.test/sticker.gif", .market_face = true } },
+        },
+    };
+
+    var ar = std.heap.ArenaAllocator.init(gpa);
+    defer ar.deinit();
+    const text = try ocrMessage(deps, ar.allocator(), 99, message);
+    nap_srv.stop();
+
+    try std.testing.expectEqualStrings("图一\n图二甲\n图二乙\n表情字", text);
+    try std.testing.expectEqual(@as(usize, 3), nap_srv.targets.items.len);
+    try std.testing.expectEqualStrings("/.ocr_image", nap_srv.targets.items[0]);
+    try std.testing.expectEqualStrings("/.ocr_image", nap_srv.targets.items[1]);
+    try std.testing.expectEqualStrings("{\"image\":\"image-file-id\"}", nap_srv.bodies.items[0]);
+    try std.testing.expectEqualStrings("{\"image\":\"https://example.test/b.png\"}", nap_srv.bodies.items[1]);
+    try std.testing.expectEqualStrings("{\"image\":\"https://example.test/sticker.gif\"}", nap_srv.bodies.items[2]);
 }
 
 test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里最后一个，合并转发确实发出去了" {
@@ -3457,6 +3763,78 @@ test "runOnce：✨ @某人 内容 → 作者是被 at 的人，creator 仍是�
         received,
         "*3\r\n$3\r\nSET\r\n$21\r\nhikari:username:20001\r\n$10\r\nAdminZhang\r\n",
     ) != null);
+}
+
+test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结果再无空格追加 💨 正文" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // 与上一个显式管理员归属测试相同：目标作者和命令 creator 各刷新一次，
+    // 其余是一条普通 add。目标原消息的发送者 30001 不参与署名查询。
+    const redis_srv = try FakeServer.start(
+        gpa,
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n:0\r\n+OK\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+    );
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":1,\"user_id\":30001,\"time\":1700050000,\"message\":[{\"type\":\"image\",\"data\":{\"file\":\"image-file-id\",\"url\":\"https://example.test/a.png\"}}]}," ++
+            "{\"message_id\":2,\"user_id\":20001,\"time\":1700050001,\"message\":[{\"type\":\"reply\",\"data\":{\"id\":\"1\"}},{\"type\":\"text\",\"data\":{\"text\":\"✨ \"}},{\"type\":\"at\",\"data\":{\"qq\":\"50001\",\"name\":\"小明\"}}]}," ++
+            "{\"message_id\":3,\"user_id\":30002,\"time\":1700050002,\"message\":[{\"type\":\"reply\",\"data\":{\"id\":\"1\"}},{\"type\":\"text\",\"data\":{\"text\":\"💨！\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"图中\"},{\"text\":\"文字\"}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"小明\",\"nickname\":\"xiaoming\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"AdminZhang\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        // 原消息作者 30001 不在 observed；显式管理员引用归属仍应生效。
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{20001},
+        .group_ids = &.{212},
+    };
+
+    runOnce(deps, run_at);
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    try std.testing.expectEqual(@as(usize, 8), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings("/.ocr_image", nap_srv.targets.items[4]);
+    try std.testing.expectEqualStrings("{\"image\":\"image-file-id\"}", nap_srv.bodies.items[4]);
+    try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[5], "\"user_id\":50001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[6], "\"user_id\":20001") != null);
+
+    const received = redis_srv.received.items;
+    // OCR 的两行先保留换行，再直接接上全角感叹号；中间没有系统补出的空格。
+    try std.testing.expect(std.mem.indexOf(u8, received, "$8\r\nhitokoto\r\n$16\r\n图中\n文字！\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "$7\r\nuser_id\r\n$5\r\n50001\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "$11\r\ncreator_uid\r\n$5\r\n20001\r\n") != null);
+
+    const forward = nap_srv.bodies.items[7];
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 }
 
 test "runOnce：✨ @某人 无正文 → 计 skipped 且即使带 ✨ 回应也不跌落路径1" {

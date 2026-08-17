@@ -10,6 +10,7 @@ pub const QueryError = error{
     InvalidEncode,
     InvalidCallback,
     InvalidUserId,
+    InvalidFromWho,
     OutOfMemory,
 };
 
@@ -20,9 +21,11 @@ pub const Query = struct {
     callback: ?[]u8 = null,
     select: []u8,
     user_id: ?u64 = null,
+    from_who: ?[]u8 = null,
 
     pub fn deinit(self: Query, gpa: std.mem.Allocator) void {
         if (self.callback) |c| gpa.free(c);
+        if (self.from_who) |name| gpa.free(name);
         gpa.free(self.select);
     }
 };
@@ -112,6 +115,12 @@ pub fn parseQuery(gpa: std.mem.Allocator, target: []const u8) QueryError!Query {
             // 400，不是"这个人没有语录"——后者是一个合法的空结果（404/[]]），
             // 前者是一个格式错误的请求，两者不能混为一谈。
             q.user_id = std.fmt.parseInt(u64, v_raw, 10) catch return error.InvalidUserId;
+        } else if (std.mem.eql(u8, k, "from_who")) {
+            const decoded = try percentDecodeAlloc(gpa, v_raw);
+            errdefer gpa.free(decoded);
+            if (decoded.len == 0 or !std.unicode.utf8ValidateSlice(decoded)) return error.InvalidFromWho;
+            if (q.from_who) |old| gpa.free(old);
+            q.from_who = decoded;
         } else if (std.mem.eql(u8, k, "callback")) {
             // 先解码出新值、校验 + 成功了再释放旧值：如果 percentDecodeAlloc
             // 失败，或者解码出来的值没通过 isValidCallback 校验，q.callback
@@ -160,6 +169,7 @@ pub const ExtraQueryError = error{
     UnsupportedEncode,
     InvalidCallback,
     InvalidUserId,
+    InvalidFromWho,
     OutOfMemory,
 };
 
@@ -168,10 +178,12 @@ pub const ExtraQuery = struct {
     min_length: ?usize = null,
     max_length: ?usize = null,
     user_id: ?u64 = null,
+    from_who: ?[]u8 = null,
     callback: ?[]u8 = null,
 
     pub fn deinit(self: ExtraQuery, gpa: std.mem.Allocator) void {
         if (self.callback) |c| gpa.free(c);
+        if (self.from_who) |name| gpa.free(name);
     }
 };
 
@@ -215,6 +227,12 @@ pub fn parseExtraQuery(gpa: std.mem.Allocator, target: []const u8) ExtraQueryErr
             q.max_length = std.fmt.parseInt(usize, v_raw, 10) catch return error.InvalidNumber;
         } else if (std.mem.eql(u8, k, "user_id")) {
             q.user_id = std.fmt.parseInt(u64, v_raw, 10) catch return error.InvalidUserId;
+        } else if (std.mem.eql(u8, k, "from_who")) {
+            const decoded = try percentDecodeAlloc(gpa, v_raw);
+            errdefer gpa.free(decoded);
+            if (decoded.len == 0 or !std.unicode.utf8ValidateSlice(decoded)) return error.InvalidFromWho;
+            if (q.from_who) |old| gpa.free(old);
+            q.from_who = decoded;
         } else if (std.mem.eql(u8, k, "callback")) {
             const decoded = try percentDecodeAlloc(gpa, v_raw);
             errdefer gpa.free(decoded);
@@ -503,6 +521,16 @@ test "parseQuery 解析 user_id" {
     try std.testing.expectEqual(@as(?u64, 10001), q.user_id);
 }
 
+test "parseQuery 解析百分号编码的 from_who，且 user_id 仍只接受数字" {
+    const gpa = std.testing.allocator;
+    const q = try parseQuery(gpa, "/?from_who=%E5%B0%8F%E6%98%8E");
+    defer q.deinit(gpa);
+    try std.testing.expectEqualStrings("小明", q.from_who.?);
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=%E5%B0%8F%E6%98%8E"));
+    try std.testing.expectError(error.InvalidFromWho, parseQuery(gpa, "/?from_who="));
+    try std.testing.expectError(error.InvalidFromWho, parseQuery(gpa, "/?from_who=%FF"));
+}
+
 test "parseQuery 不带 user_id 时是 null" {
     const gpa = std.testing.allocator;
     const q = try parseQuery(gpa, "/");
@@ -672,7 +700,7 @@ test "parseQuery 在分配失败时不泄漏、不重复释放（checkAllAllocat
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         checkParseQueryAlloc,
-        .{"/?select=%23a&callback=moe&select=%23b&callback=nya"},
+        .{"/?select=%23a&callback=moe&from_who=%E5%B0%8F%E6%98%8E&select=%23b&callback=nya&from_who=%E5%B0%8F%E7%BA%A2"},
     );
 }
 
@@ -827,6 +855,19 @@ test "parseExtraQuery 解析 user_id / 长度 / encode=text / callback" {
     try std.testing.expectEqualStrings("moe", q.callback.?);
 }
 
+test "parseExtraQuery 在 all/batch 共用路径解析 from_who" {
+    const gpa = std.testing.allocator;
+    const all = try parseExtraQuery(gpa, "/extra/all?from_who=%E5%B0%8F%E6%98%8E");
+    defer all.deinit(gpa);
+    try std.testing.expectEqualStrings("小明", all.from_who.?);
+
+    const batch = try parseExtraQuery(gpa, "/extra/batch/2?from_who=%E5%B0%8F%E7%BA%A2");
+    defer batch.deinit(gpa);
+    try std.testing.expectEqualStrings("小红", batch.from_who.?);
+    try std.testing.expectError(error.InvalidFromWho, parseExtraQuery(gpa, "/extra/all?from_who="));
+    try std.testing.expectError(error.InvalidFromWho, parseExtraQuery(gpa, "/extra/all?from_who=%FF"));
+}
+
 test "parseExtraQuery：encode=js 是 error.UnsupportedEncode，不是静默降级成 json" {
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedEncode, parseExtraQuery(gpa, "/extra/all?encode=js"));
@@ -882,7 +923,7 @@ test "parseExtraQuery 在分配失败时不泄漏（checkAllAllocationFailures�
     try std.testing.checkAllAllocationFailures(
         std.testing.allocator,
         checkParseExtraQueryAlloc,
-        .{"/extra/all?callback=moe&callback=nya"},
+        .{"/extra/all?callback=moe&from_who=%E5%B0%8F%E6%98%8E&callback=nya&from_who=%E5%B0%8F%E7%BA%A2"},
     );
 }
 

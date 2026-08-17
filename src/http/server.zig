@@ -153,6 +153,7 @@ pub const Server = struct {
                 error.InvalidEncode => "encode must be one of json, text, js",
                 error.InvalidCallback => "callback must be non-empty and match [A-Za-z0-9_$.]",
                 error.InvalidUserId => "user_id must be a non-negative integer",
+                error.InvalidFromWho => "from_who must be a non-empty UTF-8 name",
                 error.OutOfMemory => return e,
             };
             const b = try hitokoto.errorBody(gpa, msg);
@@ -167,6 +168,7 @@ pub const Server = struct {
         // 非 null 时才会走 hikari:byuser 这条新路径。
         const maybe = self.st.randomFiltered(gpa, .{
             .user_id = query.user_id,
+            .from_who = query.from_who,
             .min_length = query.min_length,
             .max_length = query.max_length,
         });
@@ -224,6 +226,7 @@ pub const Server = struct {
             error.UnsupportedEncode => "encode=js is not supported on array endpoints (js targets a single DOM element, not an array); use json or text",
             error.InvalidCallback => "callback must be non-empty and match [A-Za-z0-9_$.]",
             error.InvalidUserId => "user_id must be a non-negative integer",
+            error.InvalidFromWho => "from_who must be a non-empty UTF-8 name",
             error.OutOfMemory => unreachable, // 调用方在这之前已经把 OutOfMemory 单独 return 出去
         };
     }
@@ -256,6 +259,7 @@ pub const Server = struct {
 
         const quotes = self.st.allFiltered(gpa, .{
             .user_id = query.user_id,
+            .from_who = query.from_who,
             .min_length = query.min_length,
             .max_length = query.max_length,
         }) catch |e| {
@@ -323,6 +327,7 @@ pub const Server = struct {
 
         const quotes = self.st.randomManyFiltered(gpa, .{
             .user_id = query.user_id,
+            .from_who = query.from_who,
             .min_length = query.min_length,
             .max_length = query.max_length,
         }, count) catch |e| {
@@ -1086,6 +1091,71 @@ test "GET /?user_id= 对应候选为空时返回 404 —— 覆盖真的没有�
 test "GET /?user_id= 非法值（非数字/负数）返回 400，不碰 Redis" {
     const gpa = std.testing.allocator;
     for ([_][]const u8{ "/?user_id=abc", "/?user_id=-1", "/?user_id=" }) |path| {
+        const h = try startHarness(gpa, &[_][]const u8{});
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(std.http.Status.bad_request, try get(gpa, h.srv.port(), path, &body));
+    }
+}
+
+test "from_who 在 root、extra/all、extra/batch 都按昵称过滤" {
+    const gpa = std.testing.allocator;
+    const range = "*1\r\n$5\r\n12345\r\n";
+
+    {
+        const replies = [_][]const u8{ range, hgetallReply(), mget_nil_reply };
+        const h = try startHarness(gpa, &replies);
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(
+            std.http.Status.ok,
+            try get(gpa, h.srv.port(), "/?from_who=%E5%B0%8F%E6%98%8E", &body),
+        );
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqualStrings("小明", parsed.value.object.get("from_who").?.string);
+    }
+
+    {
+        const replies = [_][]const u8{ range, hgetallReply(), mget_nil_reply };
+        const h = try startHarness(gpa, &replies);
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(
+            std.http.Status.ok,
+            try get(gpa, h.srv.port(), "/extra/all?from_who=%E5%B0%8F%E6%98%8E", &body),
+        );
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 1), parsed.value.array.items.len);
+    }
+
+    {
+        const replies = [_][]const u8{ range, hgetallReply(), mget_nil_reply };
+        const h = try startHarness(gpa, &replies);
+        defer stopHarness(h);
+        var body: std.Io.Writer.Allocating = .init(gpa);
+        defer body.deinit();
+        try std.testing.expectEqual(
+            std.http.Status.ok,
+            try get(gpa, h.srv.port(), "/extra/batch/2?from_who=%E5%B0%8F%E6%98%8E", &body),
+        );
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    }
+}
+
+test "from_who 为空或不是 UTF-8 时三个端点都返回 400 且不碰 Redis" {
+    const gpa = std.testing.allocator;
+    for ([_][]const u8{
+        "/?from_who=",
+        "/extra/all?from_who=%FF",
+        "/extra/batch/2?from_who=",
+    }) |path| {
         const h = try startHarness(gpa, &[_][]const u8{});
         defer stopHarness(h);
         var body: std.Io.Writer.Allocating = .init(gpa);

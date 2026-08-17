@@ -161,11 +161,14 @@ pub fn byUserKey(buf: *[64]u8, user_id: u64) []const u8 {
 /// 路径，不存在"组合起来没人测过"的分支。
 pub const Filter = struct {
     user_id: ?u64 = null,
+    /// 当前渲染出的作者名（群名片优先、昵称其次）精确匹配。这里保留字符串，
+    /// 不把昵称塞进 `user_id`：昵称允许重复且会变化，QQ 号则是稳定数字标识。
+    from_who: ?[]const u8 = null,
     min_length: ?usize = null,
     max_length: ?usize = null,
 
     pub fn isUnfiltered(self: Filter) bool {
-        return self.user_id == null and self.min_length == null and self.max_length == null;
+        return self.user_id == null and self.from_who == null and self.min_length == null and self.max_length == null;
     }
 
     fn minScore(self: Filter) usize {
@@ -1092,16 +1095,16 @@ pub const Store = struct {
         return if (filter.user_id) |uid| byUserKey(buf, uid) else key_bylen;
     }
 
-    /// `GET /` 的统一入口，供 server.zig 在 `user_id` 存在时使用。
+    /// `GET /` 的统一入口，供 server.zig 在有读取过滤条件时使用。
     ///
-    /// `filter.user_id == null` 时**逐字节委托**给改动前就有的
+    /// `filter.user_id == null && filter.from_who == null` 时**逐字节委托**给改动前就有的
     /// `randomAny`/`randomByLength`——不是重新实现同样的逻辑，是直接调用
     /// 它们：这样不带 `user_id` 的请求命令序列跟这次改动之前完全相同，
     /// 那两个函数已有的测试不需要跟着改，也不需要为"没有 user_id 时行为
     /// 不变"这件事另外证明什么。只有 `user_id` 非 null 时才会走下面全新的
     /// `hikari:byuser` 路径。
     pub fn randomFiltered(self: *Store, gpa: std.mem.Allocator, filter: Filter) Error!?Quote {
-        if (filter.user_id == null) {
+        if (filter.user_id == null and filter.from_who == null) {
             if (filter.min_length != null or filter.max_length != null) {
                 return self.randomByLength(gpa, filter.minScore(), filter.maxScore());
             }
@@ -1119,6 +1122,22 @@ pub const Store = struct {
             else => return null,
         };
         if (items.len == 0) return null;
+
+        if (filter.from_who) |name| {
+            const matches = try self.fetchMatchingName(gpa, items, name);
+            if (matches.len == 0) {
+                gpa.free(matches);
+                return null;
+            }
+            const selected = std.crypto.random.uintLessThan(usize, matches.len);
+            const result = matches[selected];
+            for (matches, 0..) |q, i| {
+                if (i != selected) q.deinit(gpa);
+            }
+            gpa.free(matches);
+            return result;
+        }
+
         const pick = items[std.crypto.random.uintLessThan(usize, items.len)];
         const id_str = switch (pick) {
             .bulk => |b| b orelse return null,
@@ -1145,6 +1164,7 @@ pub const Store = struct {
             .array => |a| if (a) |arr| arr else &[_]resp.Value{},
             else => &[_]resp.Value{},
         };
+        if (filter.from_who) |name| return self.fetchMatchingName(gpa, items, name);
         return self.fetchMany(gpa, items);
     }
 
@@ -1169,7 +1189,85 @@ pub const Store = struct {
             .array => |a| if (a) |arr| arr else &[_]resp.Value{},
             else => &[_]resp.Value{},
         };
+        if (filter.from_who) |name| {
+            const matches = try self.fetchMatchingName(gpa, items, name);
+            defer {
+                for (matches) |q| q.deinit(gpa);
+                gpa.free(matches);
+            }
+            return cloneSampled(gpa, matches, count);
+        }
         return self.fetchSampled(gpa, items, count);
+    }
+
+    /// 展开候选并按**当前渲染出的** from_who 精确匹配。fetchById 会先用
+    /// hikari:username:{user_id} 覆盖收录时冻结的名字，因此群名片变化会立即
+    /// 影响昵称查询；不建昵称索引也避免旧名字残留和重名覆盖。
+    /// 只在显式传 from_who 时调用，且调用方已经持有 self.mutex。
+    fn fetchMatchingName(self: *Store, gpa: std.mem.Allocator, ids: []const resp.Value, name: []const u8) Error![]Quote {
+        var out: std.ArrayList(Quote) = .empty;
+        errdefer {
+            for (out.items) |q| q.deinit(gpa);
+            out.deinit(gpa);
+        }
+        for (ids) |item| {
+            const id_str = switch (item) {
+                .bulk => |b| b orelse continue,
+                else => continue,
+            };
+            if (try self.fetchById(gpa, id_str)) |q| {
+                if (!std.mem.eql(u8, q.from_who, name)) {
+                    q.deinit(gpa);
+                    continue;
+                }
+                out.append(gpa, q) catch |e| {
+                    q.deinit(gpa);
+                    return e;
+                };
+            }
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// 深拷贝一条由 Store 分配的 Quote；用于 from_who 过滤后的有放回抽样，
+    /// 保证同一候选被抽中多次时每个返回元素都有独立所有权。
+    fn cloneQuote(gpa: std.mem.Allocator, source: Quote) error{OutOfMemory}!Quote {
+        var out = source;
+        out.hitokoto = try gpa.dupe(u8, source.hitokoto);
+        errdefer gpa.free(out.hitokoto);
+        out.kind = try gpa.dupe(u8, source.kind);
+        errdefer gpa.free(out.kind);
+        out.from = try gpa.dupe(u8, source.from);
+        errdefer gpa.free(out.from);
+        out.from_who = try gpa.dupe(u8, source.from_who);
+        errdefer gpa.free(out.from_who);
+        out.creator = try gpa.dupe(u8, source.creator);
+        errdefer gpa.free(out.creator);
+        out.commit_from = try gpa.dupe(u8, source.commit_from);
+        errdefer gpa.free(out.commit_from);
+        out.created_at = try gpa.dupe(u8, source.created_at);
+        return out;
+    }
+
+    /// 对已经按昵称过滤好的 Quote 数组做有放回抽样。
+    fn cloneSampled(gpa: std.mem.Allocator, matches: []const Quote, count: usize) error{OutOfMemory}![]Quote {
+        var out: std.ArrayList(Quote) = .empty;
+        errdefer {
+            for (out.items) |q| q.deinit(gpa);
+            out.deinit(gpa);
+        }
+        if (matches.len > 0) {
+            var n: usize = 0;
+            while (n < count) : (n += 1) {
+                const pick = matches[std.crypto.random.uintLessThan(usize, matches.len)];
+                const q = try cloneQuote(gpa, pick);
+                out.append(gpa, q) catch |e| {
+                    q.deinit(gpa);
+                    return e;
+                };
+            }
+        }
+        return out.toOwnedSlice(gpa);
     }
 
     /// 从候选 id 集合（`ZRANGEBYSCORE` 回复里的 bulk string 数组）里**有
@@ -2722,6 +2820,72 @@ test "allFiltered：user_id 过滤后候选为空返回长度 0 的切片（对�
     const quotes = try store.allFiltered(gpa, .{ .user_id = 99999 });
     defer gpa.free(quotes);
     try std.testing.expectEqual(@as(usize, 0), quotes.len);
+}
+
+test "from_who 用当前显示名精确过滤，并同时覆盖 root/all/batch 三种 Store 读法" {
+    const gpa = std.testing.allocator;
+    var q2 = sampleQuote();
+    q2.message_id = 999;
+    q2.hitokoto = "第二条语录";
+    q2.from_who = "小红";
+    q2.user_id = 10002;
+
+    const args1 = try hashFields(gpa, sampleQuote());
+    defer freeHashFields(gpa, args1);
+    const args2 = try hashFields(gpa, q2);
+    defer freeHashFields(gpa, args2);
+    const h1 = try encodeArrayReply(gpa, args1[2..]);
+    defer gpa.free(h1);
+    const h2 = try encodeArrayReply(gpa, args2[2..]);
+    defer gpa.free(h2);
+
+    // 第一条 hash 冻结的是“小明”，但当前 hikari:username 覆盖为“新小明”；
+    // 第二条仍是“小红”。三种 API 各读取一轮同样的候选，应该都只留下第一条。
+    const candidates = "*2\r\n$5\r\n12345\r\n$3\r\n999\r\n";
+    const current_name = "*2\r\n$9\r\n新小明\r\n$-1\r\n";
+    const cycle = try std.mem.concat(gpa, u8, &.{ candidates, h1, current_name, h2, mget_nil_reply });
+    defer gpa.free(cycle);
+    const script = try std.mem.concat(gpa, u8, &.{ cycle, cycle, cycle });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var one = (try store.randomFiltered(gpa, .{ .from_who = "新小明" })).?;
+    defer one.deinit(gpa);
+    try std.testing.expectEqual(@as(i64, 12345), one.message_id);
+    try std.testing.expectEqualStrings("新小明", one.from_who);
+
+    const all = try store.allFiltered(gpa, .{ .from_who = "新小明" });
+    defer {
+        for (all) |q| q.deinit(gpa);
+        gpa.free(all);
+    }
+    try std.testing.expectEqual(@as(usize, 1), all.len);
+    try std.testing.expectEqual(@as(i64, 12345), all[0].message_id);
+
+    const batch = try store.randomManyFiltered(gpa, .{ .from_who = "新小明" }, 2);
+    defer {
+        for (batch) |q| q.deinit(gpa);
+        gpa.free(batch);
+    }
+    try std.testing.expectEqual(@as(usize, 2), batch.len);
+    try std.testing.expectEqual(@as(i64, 12345), batch[0].message_id);
+    try std.testing.expectEqual(@as(i64, 12345), batch[1].message_id);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, srv.received.items, "ZRANGEBYSCORE"));
+    // 昵称没有进入 user_id 键空间；纯昵称查询始终从长度索引拿候选。
+    try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, srv.received.items, "hikari:bylen"));
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:byuser") == null);
 }
 
 test "randomManyFiltered 带 user_id 时有放回抽样——同一个 id 被抽中 3 次，各自单独 HGETALL（允许重复）" {

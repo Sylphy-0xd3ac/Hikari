@@ -3,6 +3,9 @@ const onebot = @import("../onebot.zig");
 
 pub const star = "✨";
 pub const drop = "💦";
+/// 💨 = 给本轮尚未入库的候选追加一段正文。回复目标必须最终成为候选；控制
+/// 回复可含 text/at，at 会移到补丁最前，整个补丁直接拼接且不自动插入空格。
+pub const append = "💨";
 /// 💤 = U+1F4A4。管理员在窗口内发一条**只有** 💤 的消息，再由同一个管理员
 /// 给这条消息点一个 💤 表情回应，才等于「这个群这一轮别收录任何东西」。
 /// 单独的 💤 只是普通聊天，没有任何控制效果。
@@ -10,7 +13,7 @@ pub const sleep = "💤";
 
 const ws = " \t\r\n";
 
-pub const Path = enum { emoji_reaction, quoted_star, admin_manual, fire_chain };
+pub const Path = enum { emoji_reaction, quoted_star, admin_manual, admin_quoted, fire_chain };
 
 pub const Candidate = struct {
     message_id: i64,
@@ -20,6 +23,10 @@ pub const Candidate = struct {
     /// 见 finalizeChain）后用空格拼接的结果。路径1、2 为 null，表示按
     /// renderText 从目标消息提取。
     text_override: ?[]u8,
+    /// 窗口内引用这条候选的 `💨 内容` 控制回复，按时间顺序拼好后的尾巴。
+    /// runner 先取得正常正文（必要时 OCR），确认它不是空文本后，再把这里的
+    /// 字节无分隔符追加上去；因此它不会把原本应当按 empty 跳过的消息救活。
+    text_suffix: ?[]u8 = null,
     /// 路径4专用：这条链的全部**内容**成员 message_id（时间升序，
     /// `chain_members[0] == message_id`，即主键）。路径1/2/3 为 null。
     ///
@@ -55,6 +62,12 @@ pub const Candidate = struct {
     /// 是他说的"，要求目标必须被观察会让这条语法在配置了子集时彻底没法用
     /// （生产上观察集合是空的，任何人都算被观察，这条限制本来也不起作用）。
     author_uid: ?u64,
+
+    /// 显式管理员收录命令的发送者。路径3（`✨ 内容` / `✨ @某人 内容`）和
+    /// 新的引用归属命令（回复目标并只发 `✨ @某人`）填写；自动路径为 null。
+    /// 不能从 `message_id` 对应目标的发送者反推：引用归属命令的目标与敲命令
+    /// 的管理员本来就是两条不同消息。
+    creator_uid: ?u64 = null,
 };
 
 pub const Params = struct {
@@ -66,7 +79,7 @@ pub const Params = struct {
     /// 其它调用点无需关心 NapCat 数据来源。
     sleep_reaction_ids: []const i64 = &.{},
 
-    /// "这个 QQ 算不算被观察者" 的**唯一**判定点。四条收录路径、Pass A 的
+    /// "这个 QQ 算不算被观察者" 的**唯一**判定点。自动收录路径、Pass A 的
     /// 撤稿目标判定、🔥 链的成员资格全部走这一个函数，不允许任何一处再写
     /// 一份自己的 `for (observed_qqs) |o| ...`——"空集合 = 全部" 这条规则
     /// 抄四遍就是四次抄错的机会，而抄错的后果分别是：漏收（判成 false）、
@@ -100,6 +113,7 @@ pub const Outcome = struct {
     pub fn deinit(self: *Outcome, gpa: std.mem.Allocator) void {
         for (self.candidates) |c| {
             if (c.text_override) |t| gpa.free(t);
+            if (c.text_suffix) |t| gpa.free(t);
             if (c.chain_members) |cm| gpa.free(cm);
         }
         gpa.free(self.candidates);
@@ -228,7 +242,9 @@ pub fn manualParse(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?Manua
     // 光杆 `✨` 维持旧行为（不是候选）；但 `✨ @某人` 已经明确命中了新增的
     // 路径3语法，即使正文为空也必须作为空候选返回。否则它若又被贴了 ✨，会
     // 从路径3漏下去被路径1收成字面量 `✨ @某人`，同时 skipped 也少算一条。
-    if (body.len == 0 and author_uid == null) return null;
+    // 光杆 `✨` 仍不是候选；但同一条消息带图片时，✨ 已经明确是在要求收录
+    // 那张图，正文交给 runner 的 `.ocr_image` 回填。
+    if (body.len == 0 and author_uid == null and !m.hasImage()) return null;
     return .{ .body = try gpa.dupe(u8, body), .author_uid = author_uid };
 }
 
@@ -243,6 +259,83 @@ pub fn manualBody(gpa: std.mem.Allocator, m: onebot.Message, p: Params) !?[]u8 {
         return null;
     }
     return parsed.body;
+}
+
+pub const QuotedAuthor = struct {
+    target_id: i64,
+    author_uid: u64,
+};
+
+fn replyCount(m: onebot.Message) usize {
+    var n: usize = 0;
+    for (m.segments) |s| switch (s) {
+        .reply => n += 1,
+        else => {},
+    };
+    return n;
+}
+
+/// 管理员显式给一条引用消息指定作者：除了唯一 reply 段外，只有 `✨`、一个
+/// 数字 QQ 的 at 段和任意空白 text 段。目标可以是管理员自己或任何群成员，
+/// 被 at 的人也不要求属于 OBSERVED_QQS。
+pub fn quotedAuthorCommand(m: onebot.Message, p: Params) ?QuotedAuthor {
+    if (!isAdmin(p, m.user_id) or replyCount(m) != 1) return null;
+    const target_id = m.replyTarget() orelse return null;
+
+    var saw_star = false;
+    var author_uid: ?u64 = null;
+    for (m.segments) |s| switch (s) {
+        .reply => {},
+        .text => |t| {
+            const trimmed = std.mem.trim(u8, t, ws);
+            if (trimmed.len == 0) continue;
+            if (saw_star or author_uid != null or !std.mem.eql(u8, trimmed, star)) return null;
+            saw_star = true;
+        },
+        .at => |a| {
+            if (!saw_star or author_uid != null) return null;
+            author_uid = std.fmt.parseInt(u64, std.mem.trim(u8, a.qq, ws), 10) catch return null;
+        },
+        else => return null,
+    };
+    return .{ .target_id = target_id, .author_uid = author_uid orelse return null };
+}
+
+/// `reply + 💨 + text/at` 的正文补丁。所有 at 段按原顺序移动到补丁最前面，
+/// 再接控制符后的文本；at 之间、at 与文本之间规范化为一个空格。返回值由
+/// gpa 分配，调用方负责释放。系统把它追加到原语录时不会再补任何空格。
+pub fn tailAppendBody(gpa: std.mem.Allocator, m: onebot.Message) !?[]u8 {
+    if (replyCount(m) != 1) return null;
+
+    var texts: std.ArrayList(u8) = .empty;
+    defer texts.deinit(gpa);
+    var ats: std.ArrayList(onebot.At) = .empty;
+    defer ats.deinit(gpa);
+    for (m.segments) |segment| switch (segment) {
+        .reply => {},
+        .text => |text| try texts.appendSlice(gpa, text),
+        .at => |at| try ats.append(gpa, at),
+        else => return null,
+    };
+
+    const trimmed = std.mem.trim(u8, texts.items, ws);
+    if (!std.mem.startsWith(u8, trimmed, append)) return null;
+    const text_body = std.mem.trim(u8, trimmed[append.len..], ws);
+    if (text_body.len == 0 and ats.items.len == 0) return null;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(gpa);
+    for (ats.items, 0..) |at, i| {
+        if (i > 0) try out.append(gpa, ' ');
+        try out.append(gpa, '@');
+        const display = if (at.name) |name| if (name.len > 0) name else at.qq else at.qq;
+        try out.appendSlice(gpa, display);
+    }
+    if (text_body.len > 0) {
+        if (out.items.len > 0) try out.append(gpa, ' ');
+        try out.appendSlice(gpa, text_body);
+    }
+    return try out.toOwnedSlice(gpa);
 }
 
 /// 这条消息是不是一条"路径2的 ✨ 触发消息"——除 reply 段外只有一个文本段、
@@ -265,6 +358,13 @@ pub fn starTriggerTarget(m: onebot.Message) ?i64 {
     const txt = m.soleTextBesidesReply() orelse return null;
     if (!std.mem.eql(u8, std.mem.trim(u8, txt, ws), star)) return null;
     return rid;
+}
+
+/// runner 为窗口外的控制目标补拉第二跳时使用。普通路径2的 `reply + ✨` 与
+/// 管理员的 `reply + ✨ @某人` 都会把被引用原消息变成候选，二者都必须预取。
+pub fn triggerTarget(m: onebot.Message, p: Params) ?i64 {
+    if (quotedAuthorCommand(m, p)) |q| return q.target_id;
+    return starTriggerTarget(m);
 }
 
 /// 这条消息是不是 💤 控制命令的**文本锚点**。锚点本身不产生控制效果；
@@ -342,7 +442,13 @@ fn carriesFire(m: onebot.Message, fire_ids: []const i64) bool {
 
 /// **内容**消息：同时带 ✨ 与 🔥，且作者是被观察者。它的正文会进这条语录。
 /// 调用方保证已经确认过 carriesFire。
-fn isChainContent(m: onebot.Message, star_ids: []const i64, p: Params) bool {
+fn isChainContent(gpa: std.mem.Allocator, m: onebot.Message, star_ids: []const i64, p: Params) !bool {
+    // 控制回复即使碰巧也被点了 ✨/🔥，其字面量也不应进入语录正文。
+    if (try tailAppendBody(gpa, m)) |body| {
+        gpa.free(body);
+        return false;
+    }
+    if (quotedAuthorCommand(m, p) != null) return false;
     return p.isObserved(m.user_id) and contains(star_ids, m.message_id);
 }
 
@@ -430,6 +536,7 @@ fn buildChains(
     window: []const onebot.Message,
     star_ids: []const i64,
     fire_ids: []const i64,
+    excluded_content_ids: []const i64,
     p: Params,
 ) ![]Chain {
     const distinct = try distinctWindow(gpa, window);
@@ -452,7 +559,7 @@ fn buildChains(
             run.clearRetainingCapacity();
             continue;
         }
-        if (!isChainContent(m, star_ids, p)) continue; // 桥：不进正文，也不断链
+        if (contains(excluded_content_ids, m.message_id) or !(try isChainContent(gpa, m, star_ids, p))) continue; // 桥：不进正文，也不断链
         if (run.items.len > 0 and run.items[0].user_id != m.user_id) {
             // 另一个被观察者的内容消息：当前 run 到此为止，它自己另起一条。
             if (run.items.len >= 2) try finalizeChain(gpa, &chains, run.items, p);
@@ -481,12 +588,24 @@ pub fn classify(
     fire_ids: []const i64,
     p: Params,
 ) !Outcome {
+    // `✨ @某人` 引用归属是管理员对“只收这条引用目标”的显式指令，优先于
+    // 自动 🔥 分组。先收集这些目标，让它们在建链时只充当桥、不成为链正文；
+    // 否则目标若是非主键链成员，后面的 Store 链成员关卡会把管理员的显式命令
+    // 静默跳掉。
+    var quoted_targets: std.ArrayList(i64) = .empty;
+    defer quoted_targets.deinit(gpa);
+    for (window) |m| {
+        if (quotedAuthorCommand(m, p)) |q| {
+            if (!contains(quoted_targets.items, q.target_id)) try quoted_targets.append(gpa, q.target_id);
+        }
+    }
+
     // 链必须在 Pass A 之前就构建好：💦 可能引用链上任意一个成员（不一定是
     // 主键那条），Pass A 要能把这次撤稿展开成"整条链的全部成员都要 tombstone"，
     // 就必须已经知道成员→链的映射。构建放在函数最前面，而不是让 Pass A 现算，
     // 是因为 Pass B 插入 fire_chain 候选、排除路径1里的链成员，同样需要这份
     // 映射——算一次，Pass A/Pass B 共用，也避免两处判定逻辑各写一份、悄悄分叉。
-    const chains = try buildChains(gpa, window, star_ids, fire_ids, p);
+    const chains = try buildChains(gpa, window, star_ids, fire_ids, quoted_targets.items, p);
     defer {
         for (chains) |*c| c.deinit(gpa);
         gpa.free(chains);
@@ -500,6 +619,7 @@ pub fn classify(
     errdefer {
         for (cands.items) |c| {
             if (c.text_override) |t| gpa.free(t);
+            if (c.text_suffix) |t| gpa.free(t);
             if (c.chain_members) |cm| gpa.free(cm);
         }
         cands.deinit(gpa);
@@ -535,6 +655,19 @@ pub fn classify(
             if (!contains(unresolved.items, rid)) try unresolved.append(gpa, rid);
             continue;
         };
+        var explicit_admin_trigger = false;
+        // 管理员 `✨ @某人` 引用归属命令也是一条可见的收录触发消息。之后
+        // 💦 引用这条命令，应与路径2的一跳一样撤掉真正入库的引用目标；它
+        // 不要求原作者在 observed 集合内，也允许管理员引用自己的原消息。
+        if (quotedAuthorCommand(target, p)) |quoted| {
+            const hop_target = lookup(pool, quoted.target_id) orelse {
+                if (!contains(unresolved.items, quoted.target_id)) try unresolved.append(gpa, quoted.target_id);
+                continue;
+            };
+            rid = quoted.target_id;
+            target = hop_target;
+            explicit_admin_trigger = true;
+        }
         // 一跳（4.3 节）：💦 的目标本身就是一条路径2的 `✨` 触发消息时，真正
         // 要撤的是**那条 ✨ 引用的消息**——那才是被收录进库的语录。管理员在群里
         // 看得见的是那条 ✨，让他去 💦 它是最自然的动作；改动之前这个动作什么
@@ -544,21 +677,23 @@ pub fn classify(
         // 是不是路径3格式 / 🔥 链展开）原样再跑一遍，没有任何新语义。跳到的
         // 东西要是解析不出来（窗口外 + get_msg 也回补不到），跟改动之前一样
         // 什么都不发生，只是多记一条 unresolved 警告。
-        if (starTriggerTarget(target)) |hop| {
-            const trigger = target;
-            const hop_target = lookup(pool, hop) orelse {
-                if (!contains(unresolved.items, hop)) try unresolved.append(gpa, hop);
-                continue;
-            };
-            // 只有完整满足路径2资格才 hop：原消息必须被观察，且触发者必须是
-            // 别人。否则这只是“一条长得像 ✨ 触发的普通引用消息”，保持旧的
-            // 直接撤稿语义，继续对 rid0 / trigger 本身做下方资格判定。
-            if (p.isObserved(hop_target.user_id) and trigger.user_id != hop_target.user_id) {
-                rid = hop;
-                target = hop_target;
+        if (!explicit_admin_trigger) {
+            if (starTriggerTarget(target)) |hop| {
+                const trigger = target;
+                const hop_target = lookup(pool, hop) orelse {
+                    if (!contains(unresolved.items, hop)) try unresolved.append(gpa, hop);
+                    continue;
+                };
+                // 只有完整满足路径2资格才 hop：原消息必须被观察，且触发者必须是
+                // 别人。否则这只是“一条长得像 ✨ 触发的普通引用消息”，保持旧的
+                // 直接撤稿语义，继续对 rid0 / trigger 本身做下方资格判定。
+                if (p.isObserved(hop_target.user_id) and trigger.user_id != hop_target.user_id) {
+                    rid = hop;
+                    target = hop_target;
+                }
             }
         }
-        var ok = p.isObserved(target.user_id);
+        var ok = explicit_admin_trigger or p.isObserved(target.user_id);
         if (!ok) {
             if (try manualBody(gpa, target, p)) |body| {
                 gpa.free(body);
@@ -622,6 +757,13 @@ pub fn classify(
 
     // Pass B：收集候选
     for (window) |m| {
+        // 💨 回复是候选的正文补丁，不是它自己的语录；即使这条控制消息碰巧
+        // 被贴了 ✨，也不能把 `💨 内容` 字面量再收一份。
+        if (try tailAppendBody(gpa, m)) |body| {
+            gpa.free(body);
+            continue;
+        }
+
         // 链成员的个体收录资格对全部路径一律让路给路径4：链是更具体的信号
         // （群里明确把这几条标记成一句话），路径1/2/3 只是"这条消息本身也值得
         // 收录"的独立信号，两者同时生效会让语录库里同时存在碎句和整句
@@ -635,6 +777,25 @@ pub fn classify(
         // 更具体的"分组"信号，而分组这件事没有别的路径能表达。
         const is_chain_member = chainOf(chains, m.message_id) != null;
 
+        // 管理员引用归属：回复目标并只发 `✨ @某人`。目标在建链前已被显式
+        // 排除出链正文，所以这里不会被路径4吞掉；目标可以不是 observed，
+        // 也可以是管理员自己的原消息。
+        if (quotedAuthorCommand(m, p)) |quoted| {
+            if (lookup(pool, quoted.target_id) == null) {
+                if (!contains(unresolved.items, quoted.target_id)) try unresolved.append(gpa, quoted.target_id);
+                continue;
+            }
+            try appendCandidate(gpa, &cands, .{
+                .message_id = quoted.target_id,
+                .path = .admin_quoted,
+                .text_override = null,
+                .chain_members = null,
+                .author_uid = quoted.author_uid,
+                .creator_uid = m.user_id,
+            });
+            continue;
+        }
+
         // 路径3 优先于路径1（但链成员整体让路给路径4，见上）
         if (!is_chain_member) {
             if (try manualParse(gpa, m, p)) |manual| {
@@ -647,6 +808,7 @@ pub fn classify(
                     // `✨ @某人 内容` 时是被 at 的那个人；`✨ 内容` 时是 null，
                     // runner.zig 落回"发这条消息的人"（也就是这位管理员）。
                     .author_uid = manual.author_uid,
+                    .creator_uid = m.user_id,
                 });
                 continue;
             }
@@ -709,6 +871,7 @@ pub fn classify(
         // 回归测试正是靠这条路径抓到的。
         for (kept.items) |c| {
             if (c.text_override) |t| gpa.free(t);
+            if (c.text_suffix) |t| gpa.free(t);
             if (c.chain_members) |cm| gpa.free(cm);
         }
         kept.deinit(gpa);
@@ -716,13 +879,16 @@ pub fn classify(
     for (cands.items) |*c| {
         if (contains(revoked.items, c.message_id)) {
             if (c.text_override) |t| gpa.free(t);
+            if (c.text_suffix) |t| gpa.free(t);
             if (c.chain_members) |cm| gpa.free(cm);
             c.text_override = null; // 防止上方 errdefer 在后续 OOM 时对同一指针重复 free
+            c.text_suffix = null;
             c.chain_members = null; // 同理
             continue;
         }
         try kept.append(gpa, c.*);
         c.text_override = null; // 所有权转移给 kept 了；同理防止 cands 的 errdefer 在后续 OOM 时重复 free
+        c.text_suffix = null;
         c.chain_members = null; // 同理
     }
     // 用 clearAndFree 而非 deinit：deinit 会把 cands 设为 undefined，
@@ -730,6 +896,41 @@ pub fn classify(
     // 读到 undefined 内存并段错误。clearAndFree 让 cands 保持合法的空列表，
     // errdefer 此时只是安全的空操作。
     cands.clearAndFree(gpa);
+
+    // 💨 只修改已经通过分类、去重和同窗口撤稿的候选。分页边界可能让同一条
+    // 回复在 window 里出现两次，所以先按 message_id 去重；随后按
+    // time/message_id 排序，使多条补充的拼接顺序不依赖 NapCat 返回数组顺序。
+    const tail_msgs = try distinctWindow(gpa, window);
+    defer gpa.free(tail_msgs);
+    std.mem.sort(onebot.Message, tail_msgs, {}, struct {
+        fn lt(_: void, x: onebot.Message, y: onebot.Message) bool {
+            return x.time < y.time or (x.time == y.time and x.message_id < y.message_id);
+        }
+    }.lt);
+    for (tail_msgs) |m| {
+        if (contains(revoked.items, m.message_id)) continue;
+        const body = (try tailAppendBody(gpa, m)) orelse continue;
+        defer gpa.free(body);
+        const rid = m.replyTarget().?;
+        for (kept.items) |*candidate| {
+            var matches = candidate.message_id == rid;
+            if (!matches) {
+                if (candidate.chain_members) |members| matches = contains(members, rid);
+            }
+            if (!matches) continue;
+
+            if (candidate.text_suffix) |old| {
+                const joined = try gpa.alloc(u8, old.len + body.len);
+                @memcpy(joined[0..old.len], old);
+                @memcpy(joined[old.len..], body);
+                gpa.free(old);
+                candidate.text_suffix = joined;
+            } else {
+                candidate.text_suffix = try gpa.dupe(u8, body);
+            }
+            break;
+        }
+    }
 
     // 分三步而不是直接塞进返回结构体字面量：若三次 toOwnedSlice 中某一次
     // 先成功、后一次才因 OOM 失败，成功那次拿到的切片必须有名字才能被
@@ -743,6 +944,7 @@ pub fn classify(
     errdefer {
         for (candidates_owned) |c| {
             if (c.text_override) |t| gpa.free(t);
+            if (c.text_suffix) |t| gpa.free(t);
             if (c.chain_members) |cm| gpa.free(cm);
         }
         gpa.free(candidates_owned);
@@ -758,7 +960,8 @@ pub fn classify(
     };
 }
 
-/// 按 message_id 去重。已存在时：只有新来的是 admin_manual 而旧的不是，才替换。
+/// 按 message_id 去重。显式管理员路径优先于自动路径；其中 admin_quoted 又比
+/// admin_manual 更具体（管理员明确指定了“引用哪条、署名给谁”）。
 ///
 /// 两个分支里的 free 都不能删——但注意它们的写法本身不依赖"哪个路径今天
 /// 带不带 text_override/chain_members"这类判断：`if (optional) |x| gpa.free(x)`
@@ -791,12 +994,24 @@ pub fn classify(
 fn appendCandidate(gpa: std.mem.Allocator, list: *std.ArrayList(Candidate), c: Candidate) !void {
     for (list.items) |*existing| {
         if (existing.message_id != c.message_id) continue;
-        if (c.path == .admin_manual and existing.path != .admin_manual) {
+        const new_priority: u8 = switch (c.path) {
+            .admin_quoted => 2,
+            .admin_manual => 1,
+            else => 0,
+        };
+        const old_priority: u8 = switch (existing.path) {
+            .admin_quoted => 2,
+            .admin_manual => 1,
+            else => 0,
+        };
+        if (new_priority > old_priority) {
             if (existing.text_override) |t| gpa.free(t);
+            if (existing.text_suffix) |t| gpa.free(t);
             if (existing.chain_members) |cm| gpa.free(cm);
             existing.* = c;
         } else {
             if (c.text_override) |t| gpa.free(t);
+            if (c.text_suffix) |t| gpa.free(t);
             if (c.chain_members) |cm| gpa.free(cm);
         }
         return;
@@ -1718,6 +1933,107 @@ fn atMsg(
     };
 }
 
+fn replyAtMsg(
+    comptime id: i64,
+    comptime uid: u64,
+    comptime target: i64,
+    comptime qq: []const u8,
+    comptime name: ?[]const u8,
+) onebot.Message {
+    return .{
+        .message_id = id,
+        .user_id = uid,
+        .time = 0,
+        .segments = &.{
+            .{ .reply = target },
+            .{ .text = "✨ " },
+            .{ .at = .{ .qq = qq, .name = name } },
+        },
+    };
+}
+
+test "管理员引用归属：reply + ✨ @某人 收录引用目标，目标可为管理员自己的消息" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, ADMIN, "管理员自己的原话"),
+        replyAtMsg(2, ADMIN, 1, "50001", "小明"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    const candidate = out.candidates[0];
+    try std.testing.expectEqual(Path.admin_quoted, candidate.path);
+    try std.testing.expectEqual(@as(i64, 1), candidate.message_id);
+    try std.testing.expectEqual(@as(?u64, NAMED), candidate.author_uid);
+    try std.testing.expectEqual(@as(?u64, ADMIN), candidate.creator_uid);
+    try std.testing.expectEqual(@as(?[]u8, null), candidate.text_override);
+}
+
+test "管理员引用归属：目标与被 at 作者都不要求属于 observed 集合" {
+    const gpa = std.testing.allocator;
+    const observed_subset: Params = .{ .observed_qqs = &.{OBSERVED}, .admin_qqs = &.{ADMIN} };
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "集合外原话"),
+        replyAtMsg(2, ADMIN, 1, "50001", "小明"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, observed_subset);
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.admin_quoted, out.candidates[0].path);
+    try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+}
+
+test "管理员引用归属：非管理员、夹带正文或图片都不是控制命令" {
+    const ordinary = replyAtMsg(2, OUTSIDER, 1, "50001", "小明");
+    try std.testing.expectEqual(@as(?QuotedAuthor, null), quotedAuthorCommand(ordinary, params()));
+
+    const with_body: onebot.Message = .{
+        .message_id = 3,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .reply = 1 },
+            .{ .text = "✨ " },
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+            .{ .text = " 多余正文" },
+        },
+    };
+    try std.testing.expectEqual(@as(?QuotedAuthor, null), quotedAuthorCommand(with_body, params()));
+
+    const with_image: onebot.Message = .{
+        .message_id = 4,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .reply = 1 },
+            .{ .text = "✨ " },
+            .{ .at = .{ .qq = "50001", .name = "小明" } },
+            .{ .image = .{ .file = "x.png", .url = null } },
+        },
+    };
+    try std.testing.expectEqual(@as(?QuotedAuthor, null), quotedAuthorCommand(with_image, params()));
+}
+
+test "管理员手动收录：光杆 ✨ 仍无效，但同条带图片时形成空候选等待 OCR" {
+    const gpa = std.testing.allocator;
+    const image_command: onebot.Message = .{
+        .message_id = 1,
+        .user_id = ADMIN,
+        .time = 0,
+        .segments = &.{
+            .{ .text = "✨" },
+            .{ .image = .{ .file = "image-id", .url = null } },
+        },
+    };
+    const msgs = [_]onebot.Message{image_command};
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.admin_manual, out.candidates[0].path);
+    try std.testing.expectEqual(@as(usize, 0), out.candidates[0].text_override.?.len);
+}
+
 test "路径3 · at 语法：✨ @某人 内容 → 作者是被 at 的人，正文不含 ✨ 也不含那个 at" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{atMsg(1, ADMIN, "✨ ", "50001", "小明", " 这句是他说的")};
@@ -1927,6 +2243,107 @@ test "OOM 回归：✨ @某人 内容 的多次分配（renderSegments + dupe + 
 }
 
 // ---------------------------------------------------------------------------
+// 💨：引用一个最终成立的候选，把控制符后的正文无空格追加到语录末尾。
+
+test "💨：多条回复按时间顺序无空格追加，控制回复自身即使带 ✨ 也不成为候选" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = OBSERVED, .time = 1, .segments = &.{.{ .text = "前半句" }} },
+        .{ .message_id = 3, .user_id = OUTSIDER, .time = 3, .segments = &.{ .{ .reply = 1 }, .{ .text = "💨 丙" } } },
+        .{ .message_id = 2, .user_id = OUTSIDER, .time = 2, .segments = &.{ .{ .reply = 1 }, .{ .text = "  💨 乙  " } } },
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2, 3 }, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(i64, 1), out.candidates[0].message_id);
+    try std.testing.expectEqualStrings("乙丙", out.candidates[0].text_suffix.?);
+}
+
+test "💨：回复链上任意内容成员都追加到整条 fire_chain 候选" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = OBSERVED, .time = 1, .segments = &.{.{ .text = "上" }} },
+        .{ .message_id = 2, .user_id = OBSERVED, .time = 2, .segments = &.{.{ .text = "下" }} },
+        .{ .message_id = 3, .user_id = OUTSIDER, .time = 3, .segments = &.{ .{ .reply = 2 }, .{ .text = "💨！" } } },
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{ 1, 2 }, &.{ 1, 2 }, params());
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(Path.fire_chain, out.candidates[0].path);
+    try std.testing.expectEqualStrings("！", out.candidates[0].text_suffix.?);
+}
+
+test "💨：补充回复在同窗口被管理员撤掉后不再追加" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = OBSERVED, .time = 1, .segments = &.{.{ .text = "原文" }} },
+        .{ .message_id = 2, .user_id = OBSERVED, .time = 2, .segments = &.{ .{ .reply = 1 }, .{ .text = "💨补充" } } },
+        .{ .message_id = 3, .user_id = ADMIN, .time = 3, .segments = &.{ .{ .reply = 2 }, .{ .text = "💦" } } },
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    try std.testing.expectEqual(@as(?[]u8, null), out.candidates[0].text_suffix);
+    try std.testing.expect(contains(out.revoked, 2));
+}
+
+test "💨：at 段移动到补丁最前面，多个 at 保持顺序" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "原文"),
+        .{
+            .message_id = 2,
+            .user_id = OUTSIDER,
+            .time = 2,
+            .segments = &.{
+                .{ .reply = 1 },
+                .{ .text = "💨 内容" },
+                .{ .at = .{ .qq = "9", .name = "甲" } },
+                .{ .at = .{ .qq = "10", .name = "乙" } },
+            },
+        },
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
+    // 追加到原文时仍不额外插空格，最终正文是“原文@甲 @乙 内容”。
+    try std.testing.expectEqualStrings("@甲 @乙 内容", out.candidates[0].text_suffix.?);
+}
+
+test "💨：没有正文、夹带 image、或目标不是候选时完全无效" {
+    const gpa = std.testing.allocator;
+    const no_body = replyMsg(2, OUTSIDER, 1, "💨  ");
+    try std.testing.expectEqual(@as(?[]u8, null), try tailAppendBody(gpa, no_body));
+    const dirty: onebot.Message = .{
+        .message_id = 3,
+        .user_id = OUTSIDER,
+        .time = 0,
+        .segments = &.{ .{ .reply = 1 }, .{ .text = "💨内容" }, .{ .image = .{ .file = "x", .url = null } } },
+    };
+    try std.testing.expectEqual(@as(?[]u8, null), try tailAppendBody(gpa, dirty));
+
+    const msgs = [_]onebot.Message{ textMsg(1, OBSERVED, "未触发"), replyMsg(2, OUTSIDER, 1, "💨补充") };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+fn tailAppendUnderFailingAllocator(gpa: std.mem.Allocator) !void {
+    const msgs = [_]onebot.Message{
+        textMsg(1, OBSERVED, "原文"),
+        replyMsg(2, OUTSIDER, 1, "💨甲"),
+        replyMsg(3, OUTSIDER, 1, "💨乙"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
+    out.deinit(gpa);
+}
+
+test "OOM 回归：多条 💨 反复扩容与候选所有权转移任意失败点都不泄漏" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, tailAppendUnderFailingAllocator, .{});
+}
+
+// ---------------------------------------------------------------------------
 // 💦 的一跳（design.md §4.3）：💦 引用的是那条路径2的 `✨` 触发消息时，撤稿
 // 目标解析成**那条 ✨ 引用的消息**，然后所有既有规则原样再跑一遍。
 
@@ -1943,6 +2360,20 @@ test "💦 一跳：引用路径2的 ✨ 触发消息 → 作废那条 ✨ 引�
     try std.testing.expectEqual(@as(usize, 1), out.revoked.len);
     try std.testing.expectEqual(@as(i64, 1), out.revoked[0]);
     // 同一个窗口里的路径2候选也因此被剔除（作废优先于收录）。
+    try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
+}
+
+test "💦 一跳：引用管理员的 ✨ @某人 引用归属命令 → 作废真正入库的原消息" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]onebot.Message{
+        textMsg(1, OUTSIDER, "不在 observed 的原话"),
+        replyAtMsg(2, ADMIN, 1, "50001", "小明"),
+        replyMsg(3, ADMIN, 2, "💦"),
+    };
+    var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
+    defer out.deinit(gpa);
+
+    try std.testing.expectEqualSlices(i64, &.{1}, out.revoked);
     try std.testing.expectEqual(@as(usize, 0), out.candidates.len);
 }
 
