@@ -36,6 +36,7 @@ Hikari 是一个常驻进程，做两件事：
 | `HTTP_HOST` | 是 | 一言服务监听地址 | `0.0.0.0` |
 | `HTTP_PORT` | 是 | 一言服务监听端口 | `8080` |
 | `REDIS_URL` | 是 | `redis://[:password@]host:port/db` | `redis://127.0.0.1:6379/0` |
+| `OCR_TESSDATA_DIR` | 否 | 本机 Tesseract 模型目录；生产指向带系统 `configs` 与 `tessdata_best` 简中/英文模型的目录 | `/opt/hikari/tessdata` |
 
 任一必填项缺失或格式非法，进程启动即退出并打印具体是哪一项。
 
@@ -50,7 +51,6 @@ Hikari 是一个常驻进程，做两件事：
 | `get_emoji_likes` | 取某条消息某一种表情回应的点击者 | 入参至少给 `message_id`, `emoji_id`, `count`（`count=0` 取全部；Unicode 💤 的 `emoji_id="128164"`，`emoji_type="2"` 可省略或显式给出），返回 `emoji_like_list: [{user_id, nick_name}]`。只在一条管理员 💤 锚点的 `get_msg` 已显示存在 💤 回应时调用，用返回的 `user_id` 验证是不是锚点发送者本人确认 |
 | `get_group_info` | 取群名 | 刷新 `hikari:groupname:{group_id}`，渲染时覆盖 hitokoto 的 `from`（见 4.7 节、5 节） |
 | `get_group_member_info` | 取**某个作者**的群名片 | 逐候选作者调用（每次扫描内按 `user_id` 缓存，同一个作者只问一次），刷新 `hikari:username:{user_id}`，渲染时覆盖 hitokoto 的 `from_who`（见 4.7 节、5 节）。2026-08-16 起不再是"每群一次、查被观察者"——`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群不再有唯一的"那个被观察者"可查，改成按窗口内每条候选**自己的作者**查 |
-| `.ocr_image` | 空正文候选的图片/个人表情 OCR | 入参 `{image}`，返回 `data.texts[].text`。NapCat 当前把收到的 market face 通常转换成带 `emoji_id`/`url` 的 image；Hikari 同时兼容原生 mface，缺 URL 时按 NapCat 主干 `marketFaceElement` 的规则从 `emoji_id` 补 `raw300.gif` 图源，见 4.6 节 |
 | `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
 | `send_group_forward_msg` | 发送运行日志 | 每群一条合并转发消息，七行各占一个 node；见 7 节 |
 
@@ -217,7 +217,7 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 - `m` **不含** `reply` 段（含 `reply` 段的一律走路径 2 判定，避免两套语法打架）
 - `m` 的渲染文本（按 4.6 节规则处理后）trim 后以 `✨` 开头
 - 去掉开头的 `✨` 及紧随其后的空白（可有可无）
-- → 候选是 `m` 自身，**正文为剩余部分**（不含 `✨` 前缀）；普通 `✨ 内容` 的正文必须非空，光杆 `✨` 保持旧行为、不形成候选。例外是同一条消息还带可用图片：此时空正文候选交给 4.6 节 `.ocr_image` 回填。下面已经识别到作者标记的 `✨ @某人` 也允许空正文，并交给 4.6 节的文本空关卡诚实计入 `skipped`
+- → 候选是 `m` 自身，**正文为剩余部分**（不含 `✨` 前缀）；普通 `✨ 内容` 的正文必须非空，光杆 `✨` 保持旧行为、不形成候选。例外是同一条消息还带可用图片：此时空正文候选交给 4.6 节的本机 OCR 回填。下面已经识别到作者标记的 `✨ @某人` 也允许空正文，并交给 4.6 节的文本空关卡诚实计入 `skipped`
 
 **`✨ @某人 内容`：显式指定作者（2026-08-16 新增，可选、向后兼容）**
 
@@ -353,7 +353,11 @@ D  （无 🔥）           → 连续段在这里结束
 
 按段顺序拼接，首尾 trim。结果为空字符串则跳过。
 
-**OCR 回退**：候选先通过 tombstone / existing / chain-member 关卡；正常正文为空且目标消息至少有一个带 `file` 或 `url` 的归一化 image/mface 段时，runner 调 NapCat 原生增强 action `.ocr_image`。请求只带 `{image}`：普通图片优先用同一个 NapCat 可解析的 `file`，缺失时退回 `url`；个人/商城表情优先 URL，因为部分版本的 `file` 只是固定字符串 `marketface`。原生 mface 缺 URL 时，`onebot.parseMessage` 按 NapCat 当前源码的 `https://gxh.vip.qq.com/club/item/parcel/item/{emoji_id前两位}/{emoji_id}/raw300.gif` 规则补出图源。每次响应读取 `data.texts[].text`，同图多行与多图之间都按返回顺序用 `\n` 连接。已有正文不再 OCR；单图失败只告警并继续其它图，全部失败/空响应最终仍计 `empty`，不把 best-effort OCR 升级成整群 Trouble。
+**OCR 回退**：候选先通过 tombstone / existing / chain-member 关卡；正常正文为空且目标消息至少有一个带可下载 URL 的归一化 image/mface 段时，runner 调按需启动的本机 Tesseract。普通图片使用 `data.url`（或本身就是 HTTP(S) URL 的 `file`）；NapCat 所在机器上的裸文件名/路径不能跨机读取，直接跳过。原生 mface 缺 URL 时，`onebot.parseMessage` 按 NapCat 当前源码的 `https://gxh.vip.qq.com/club/item/parcel/item/{emoji_id前两位}/{emoji_id}/raw300.gif` 规则补出图源。
+
+下载只允许 HTTP(S)、最多 3 次重定向、连接 5 秒/总计 15 秒，图片最多 16 MiB，并放进 mode 0600 的随机临时文件。每张图串行跑 Tesseract LSTM 的 `chi_sim+eng` 两次：PSM 6 保留默认 Otsu，适合整块截图；PSM 11 加 Sauvola，适合花背景上的稀疏短字。输出使用 TSV，按有效字符数加权平均 confidence 选较好的一次，再按 page/block/paragraph/line 重建换行；中文 token 不凭空插空格，连续 ASCII 单词之间保留一个空格。每个 pass 由 `timeout` / `prlimit` 限制在 20 秒、2 个 OpenMP 线程和 2 GiB 地址空间，两个 pass 不并发、模型不常驻。生产通过可选 `OCR_TESSDATA_DIR` 指向带系统 `configs` 及官方 `tessdata_best` 简中/英文模型的目录。
+
+同图各行与多图之间按返回顺序用 `\n` 连接。已有正文不再 OCR；单图下载、解码或识别失败只告警并继续其它图，全部失败/空响应最终仍计 `empty`，不把 best-effort OCR 升级成整群 Trouble。
 
 OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、不注入分隔符。
 
@@ -367,7 +371,7 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 |---|---|
 | `id` | `INCR hikari:seq` |
 | `uuid` | 本地生成的 UUIDv4 |
-| `hitokoto` | 4.6 提取出的文本（必要时来自 `.ocr_image`），再无分隔符追加 4.5.3 的 💨 补丁 |
+| `hitokoto` | 4.6 提取出的文本（必要时来自本机 OCR），再无分隔符追加 4.5.3 的 💨 补丁 |
 | `type` | 固定 `"g"`（其他） |
 | `from` | 群名。渲染时（`GET /`、`/extra/*`）优先取 `hikari:groupname:{group_id}` 的实时值；这个键缺失才落回收录当时冻结进 hash 的快照 |
 | `from_who` | 语录**作者**（不是固定的被观察者）的群名片。路径3用了 `✨ @某人 内容`、或路径3b用了 `reply + ✨ @某人` 时，作者是**被 at 的那个人**，不是敲指令的管理员。渲染时优先取 `hikari:username:{user_id}` 的实时值；这个键缺失（导入的语录、这个人从未被某次扫描当过候选作者、或者已经离群且从未刷新成功过）才落回 hash 里冻结的快照 |
@@ -663,9 +667,10 @@ src/
   redis/client.zig    TCP 连接、命令发送、重连
   store.zig           语录存储层 add/addChain/has/revoke/randomAny/randomByLength/allQuotes/randomMany/nextId/reindexByUser
   napcat.zig          NapCat HTTP 客户端 callAction(action, params)
+  ocr.zig             按需下载图源、受限启动本机 Tesseract、解析 TSV 并择优
   onebot.zig          OB11 消息模型：段解析、图片 file/url、replyTarget、renderText   [纯函数]
   scan/rules.zig      判定逻辑 classify(msgs, cfg) → {revoked, candidates, unresolved, skip_collection}  [纯函数]
-  scan/runner.zig     编排：翻页、补 get_msg、空正文调用 .ocr_image、写库、发日志
+  scan/runner.zig     编排：翻页、补 get_msg、空正文调用本机 OCR、写库、发日志
   scheduler.zig       HH:MM 循环 + 窗口计算
   http/server.zig     std.http.Server + 路由
   http/hitokoto.zig   查询参数解析 + json/text/js 编码
@@ -696,7 +701,7 @@ src/
 - 💦 引用一条路径 3 收录的管理员指令消息 → 应当作废
 - 💦 引用一条管理员发的普通消息（非 `✨` 格式）→ 不作废
 - 同一条消息被多条路径同时命中 → 只入库一次
-- 纯图片或个人/商城表情候选 → 调 `.ocr_image`；image 与原生 mface 都能取得图源，`file="marketface"` 时 URL 优先；有可用 `texts[].text` 则收录，多图/多行按顺序换行，否则仍按 empty skip。无图源的内置 face 仍直接 skip
+- 纯图片或个人/商城表情候选 → 使用 URL 调本机 OCR；image 与原生 mface 都能取得图源，NapCat 裸文件名跳过；有可用识别文本则收录，多图/多行按顺序换行，否则仍按 empty skip。无图源的内置 face 仍直接 skip
 - `at` 段有 / 无 `name` 字段
 - 中文长度按码点计算
 - `hikari run --last`：`1m`/`1h`/`24h`/`7d` 正确换算；坏单位、零/负数/小数、超 7 天和多余参数拒绝；强制窗口不发 `GET hikari:lastrun:*`，成功后仍发 `SET hikari:lastrun:*`
@@ -718,7 +723,7 @@ src/
 - 路径 2 引用链上某个成员 → 该候选被抑制，只留 fire_chain 一条
 - 链的主键 / 非主键成员自身满足路径3格式 → 路径3候选被抑制，链仍然赢，且 joined 正文剥掉该成员自己的 `✨` 前缀
 - 路径 3：`✨ @某人 内容` → 作者是被 at 的人、`creator`/`creator_uid` 仍是管理员、正文既不含 `✨` 也不含那个 at
-- 路径 3：光杆 `✨` 仍无效；同条带图片时形成空正文候选，由 `.ocr_image` 回填
+- 路径 3：光杆 `✨` 仍无效；同条带图片时形成空正文候选，由本机 OCR 回填
 - 路径 3：`✨ 内容`（没有 at）→ 逐字保持改动前的行为，作者仍是管理员
 - 路径 3：`✨ 你好 @某人` / 作者标记之后再出现的 at → 都是普通正文，照常渲染成 `@昵称`
 - 路径 3：`✨ @某人` 后面没有正文 → 形成正文为空的路径3候选，在文本空关卡计入 `skipped`，且路径3优先阻止跌回路径1

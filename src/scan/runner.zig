@@ -1,5 +1,6 @@
 const std = @import("std");
 const napcat = @import("../napcat.zig");
+const ocr = @import("../ocr.zig");
 const onebot = @import("../onebot.zig");
 const rules = @import("rules.zig");
 const store = @import("../store.zig");
@@ -255,6 +256,8 @@ pub const Deps = struct {
     observed_qqs: []const u64,
     admin_qqs: []const u64,
     group_ids: []const u64,
+    /// null 时图片候选保持既有 empty 行为；生产注入按需启动的本机 OCR。
+    ocr_engine: ?ocr.Engine = null,
     /// getMsg 单次重试前的等待时长。生产上 24/2300 探针在负载压力下失败，紧接着
     /// 立刻重试大概率撞上同一波拥堵（这轮扫描本身就在跟 get_group_info/
     /// get_group_member_info/回复补拉/合并转发挤同一条 NapCat 连接），留几百毫秒
@@ -720,79 +723,45 @@ fn sleepReactionConfirmed(
     return napcat.hasEmojiLikeFromUser(data, sender_uid);
 }
 
-/// NapCat `.ocr_image` 的 `data.texts[].text` 按返回顺序拼成多行纯文本。
-/// 坐标与 confidence 只用于识别排序/诊断，语录正文不保存这些结构化字段。
-fn ocrTextFromData(gpa: std.mem.Allocator, data: std.json.Value) ![]u8 {
-    const texts_value = switch (data) {
-        .object => |obj| obj.get("texts") orelse return gpa.dupe(u8, ""),
-        else => return gpa.dupe(u8, ""),
-    };
-    const items = switch (texts_value) {
-        .array => |arr| arr.items,
-        else => return gpa.dupe(u8, ""),
-    };
-
-    var out: std.ArrayList(u8) = .empty;
-    errdefer out.deinit(gpa);
-    for (items) |item| {
-        const obj = switch (item) {
-            .object => |o| o,
-            else => continue,
-        };
-        const value = obj.get("text") orelse continue;
-        const raw = switch (value) {
-            .string => |s| s,
-            else => continue,
-        };
-        const line = std.mem.trim(u8, raw, " \t\r\n");
-        if (line.len == 0) continue;
-        if (out.items.len > 0) try out.append(gpa, '\n');
-        try out.appendSlice(gpa, line);
-    }
-    return out.toOwnedSlice(gpa);
-}
-
-/// 只在候选的正常文本为空时调用：把消息里的每个可定位图片交给 NapCat
-/// 增强 action `.ocr_image`，每张图片的文本用换行连接。OCR 是 best-effort：
+/// 只在候选的正常文本为空时调用：把消息里的每个可下载图片交给本机 OCR，
+/// 每张图片的文本用换行连接。OCR 是 best-effort：
 /// 单张失败只告警并继续，其余图片仍有机会产出；全部失败时调用方按既有 empty
 /// 关卡跳过，不把一次 OCR 抖动升级成整群扫描失败。
 fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Message) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(arena);
+    const engine = deps.ocr_engine orelse return out.toOwnedSlice(arena);
 
     for (m.segments) |segment| {
         const image = switch (segment) {
             .image => |img| img,
             else => continue,
         };
-        // market face 在部分 NapCat 版本里会把 file 固定上报成
-        // "marketface"；它不是可供 `.ocr_image` 定位的文件 id。NapCat
-        // 同时给出的（或 onebot.parseMessage 由 emoji_id 补出的）URL 才是
-        // 实际表情图源。普通图片仍然保持 file 优先、URL 兜底。
-        const source = if (image.market_face)
-            (image.url orelse image.file orelse continue)
+        // 本机不可能读取 NapCat 所在机器上的裸文件名/路径；只接受 NapCat
+        // 上报的 URL（或 file 字段本身已经是 URL 的兼容形状）。这也修掉了
+        // 把 `ABC.png` 当成本机路径后无法找到真实图片的生产问题。
+        const source = image.url orelse if (image.file) |file|
+            if (std.mem.startsWith(u8, file, "https://") or std.mem.startsWith(u8, file, "http://")) file else continue
         else
-            (image.file orelse image.url orelse continue);
+            continue;
 
-        var aw: std.Io.Writer.Allocating = .init(arena);
-        try std.json.Stringify.value(.{ .image = source }, .{}, &aw.writer);
-        const data = deps.nap.callData(arena, ".ocr_image", aw.written()) catch |e| {
+        const recognized = engine.recognize(arena, source) catch |e| {
             std.log.warn(
-                "group {d}: NapCat .ocr_image failed for candidate message {d}: {s}; trying any remaining images",
+                "group {d}: local OCR failed for candidate message {d}: {s}; trying any remaining images",
                 .{ group_id, m.message_id, @errorName(e) },
             );
             continue;
         };
-        const recognized = try ocrTextFromData(arena, data);
-        if (recognized.len == 0) {
+        const text = std.mem.trim(u8, recognized, " \t\r\n");
+        if (text.len == 0) {
             std.log.warn(
-                "group {d}: NapCat .ocr_image returned no usable text for candidate message {d}",
+                "group {d}: local OCR returned no usable text for candidate message {d}",
                 .{ group_id, m.message_id },
             );
             continue;
         }
         if (out.items.len > 0) try out.append(arena, '\n');
-        try out.appendSlice(arena, recognized);
+        try out.appendSlice(arena, text);
     }
     return out.toOwnedSlice(arena);
 }
@@ -1324,7 +1293,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
                 break :blk try tm.renderText(a);
             };
             // 图片候选过去会在这里直接落入 empty。现在只在正常文本确实为空时
-            // 调 NapCat 原生增强 action `.ocr_image`：已有正文永远优先，避免
+            // 调按需启动的本机 OCR：已有正文永远优先，避免
             // 一张带文字说明的配图把说明改写成一大段 OCR 噪声。
             if (std.mem.trim(u8, base_text, " \t\r\n").len == 0) {
                 if (target) |tm| {
@@ -2446,71 +2415,64 @@ test "resolveAtNames：at 缺 name 时按群和 QQ 查名片，同一 QQ 每轮�
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "群名片") != null);
 }
 
-test "ocrTextFromData：按 NapCat texts 顺序拼行，忽略空项与坏形状" {
-    const gpa = std.testing.allocator;
-    var ar = std.heap.ArenaAllocator.init(gpa);
-    defer ar.deinit();
-    const a = ar.allocator();
-    const parsed = try std.json.parseFromSlice(
-        std.json.Value,
-        a,
-        "{\"texts\":[{\"text\":\" 第一行 \"},{\"text\":\"\"},{\"bad\":1},{\"text\":\"第二行\",\"confidence\":0.99}]}",
-        .{},
-    );
-    const text = try ocrTextFromData(a, parsed.value);
-    try std.testing.expectEqualStrings("第一行\n第二行", text);
+const FakeOcr = struct {
+    gpa: std.mem.Allocator,
+    replies: []const []const u8,
+    next: usize = 0,
+    seen: std.ArrayList([]const u8) = .empty,
 
-    const bad = try std.json.parseFromSlice(std.json.Value, a, "{\"texts\":{}}", .{});
-    try std.testing.expectEqualStrings("", try ocrTextFromData(a, bad.value));
-}
-
-test "ocrMessage：普通图片 file 优先，个人表情 URL 优先，多图 OCR 换行" {
-    const gpa = std.testing.allocator;
-    const nap_srv = try FakeNapcatServer.start(gpa, &.{
-        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"图一\"}]}}",
-        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"图二甲\"},{\"text\":\"图二乙\"}]}}",
-        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"表情字\"}]}}",
-    });
-    defer {
-        nap_srv.stop();
-        nap_srv.destroy();
+    fn deinit(self: *FakeOcr) void {
+        self.seen.deinit(self.gpa);
     }
 
-    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
-    defer gpa.free(base);
-    var nap = napcat.Client.init(gpa, base, "test-token");
-    defer nap.deinit();
+    fn engine(self: *FakeOcr) ocr.Engine {
+        return .{ .context = self, .recognize_fn = recognize };
+    }
+
+    fn recognize(context: *anyopaque, arena: std.mem.Allocator, image_url: []const u8) ![]u8 {
+        const self: *FakeOcr = @ptrCast(@alignCast(context));
+        if (self.next >= self.replies.len) return error.NoScriptedOcrReply;
+        try self.seen.append(self.gpa, image_url);
+        const reply = self.replies[self.next];
+        self.next += 1;
+        return arena.dupe(u8, reply);
+    }
+};
+
+test "ocrMessage：本机 OCR 统一使用 URL，跳过 NapCat 裸文件名，多图换行" {
+    const gpa = std.testing.allocator;
+    var fake = FakeOcr{ .gpa = gpa, .replies = &.{ "图一", "图二甲\n图二乙", "表情字" } };
+    defer fake.deinit();
     const deps: Deps = .{
         .gpa = gpa,
-        .nap = &nap,
+        .nap = undefined,
         .st = undefined,
         .observed_qqs = &.{},
         .admin_qqs = &.{},
         .group_ids = &.{},
+        .ocr_engine = fake.engine(),
     };
     const message: onebot.Message = .{
         .message_id = 7,
         .user_id = 8,
         .time = 0,
         .segments = &.{
-            .{ .image = .{ .file = "image-file-id", .url = "https://unused.test/a.png" } },
+            .{ .image = .{ .file = "image-file-id", .url = "https://example.test/a.png" } },
             .{ .image = .{ .file = null, .url = "https://example.test/b.png" } },
             .{ .image = .{ .file = "marketface", .url = "https://example.test/sticker.gif", .market_face = true } },
+            .{ .image = .{ .file = "napcat-only-file-name.png", .url = null } },
         },
     };
 
     var ar = std.heap.ArenaAllocator.init(gpa);
     defer ar.deinit();
     const text = try ocrMessage(deps, ar.allocator(), 99, message);
-    nap_srv.stop();
 
     try std.testing.expectEqualStrings("图一\n图二甲\n图二乙\n表情字", text);
-    try std.testing.expectEqual(@as(usize, 3), nap_srv.targets.items.len);
-    try std.testing.expectEqualStrings("/.ocr_image", nap_srv.targets.items[0]);
-    try std.testing.expectEqualStrings("/.ocr_image", nap_srv.targets.items[1]);
-    try std.testing.expectEqualStrings("{\"image\":\"image-file-id\"}", nap_srv.bodies.items[0]);
-    try std.testing.expectEqualStrings("{\"image\":\"https://example.test/b.png\"}", nap_srv.bodies.items[1]);
-    try std.testing.expectEqualStrings("{\"image\":\"https://example.test/sticker.gif\"}", nap_srv.bodies.items[2]);
+    try std.testing.expectEqual(@as(usize, 3), fake.seen.items.len);
+    try std.testing.expectEqualStrings("https://example.test/a.png", fake.seen.items[0]);
+    try std.testing.expectEqualStrings("https://example.test/b.png", fake.seen.items[1]);
+    try std.testing.expectEqualStrings("https://example.test/sticker.gif", fake.seen.items[2]);
 }
 
 test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里最后一个，合并转发确实发出去了" {
@@ -3765,7 +3727,7 @@ test "runOnce：✨ @某人 内容 → 作者是被 at 的人，creator 仍是�
     ) != null);
 }
 
-test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结果再无空格追加 💨 正文" {
+test "runOnce：管理员 reply + ✨ @某人 收录纯图片，本机 OCR 结果再无空格追加 💨 正文" {
     const gpa = std.testing.allocator;
     const run_at: i64 = 1_700_100_000;
 
@@ -3790,7 +3752,6 @@ test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结�
             "]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
-        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"texts\":[{\"text\":\"图中\"},{\"text\":\"文字\"}]}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"小明\",\"nickname\":\"xiaoming\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"AdminZhang\"}}",
         "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
@@ -3806,6 +3767,8 @@ test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结�
     defer gpa.free(base);
     var nap = napcat.Client.init(gpa, base, "test-token");
     defer nap.deinit();
+    var fake = FakeOcr{ .gpa = gpa, .replies = &.{"图中\n文字"} };
+    defer fake.deinit();
     const deps: Deps = .{
         .gpa = gpa,
         .nap = &nap,
@@ -3814,6 +3777,7 @@ test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结�
         .observed_qqs = &.{10001},
         .admin_qqs = &.{20001},
         .group_ids = &.{212},
+        .ocr_engine = fake.engine(),
     };
 
     runOnce(deps, run_at);
@@ -3821,11 +3785,11 @@ test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结�
     redis_srv.stop();
     nap_srv.stop();
 
-    try std.testing.expectEqual(@as(usize, 8), nap_srv.bodies.items.len);
-    try std.testing.expectEqualStrings("/.ocr_image", nap_srv.targets.items[4]);
-    try std.testing.expectEqualStrings("{\"image\":\"image-file-id\"}", nap_srv.bodies.items[4]);
-    try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[5], "\"user_id\":50001") != null);
-    try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[6], "\"user_id\":20001") != null);
+    try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
+    try std.testing.expectEqual(@as(usize, 1), fake.seen.items.len);
+    try std.testing.expectEqualStrings("https://example.test/a.png", fake.seen.items[0]);
+    try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[4], "\"user_id\":50001") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[5], "\"user_id\":20001") != null);
 
     const received = redis_srv.received.items;
     // OCR 的两行先保留换行，再直接接上全角感叹号；中间没有系统补出的空格。
@@ -3833,7 +3797,7 @@ test "runOnce：管理员 reply + ✨ @某人 收录纯图片，.ocr_image 结�
     try std.testing.expect(std.mem.indexOf(u8, received, "$7\r\nuser_id\r\n$5\r\n50001\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, received, "$11\r\ncreator_uid\r\n$5\r\n20001\r\n") != null);
 
-    const forward = nap_srv.bodies.items[7];
+    const forward = nap_srv.bodies.items[6];
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 }
 
