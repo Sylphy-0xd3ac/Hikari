@@ -163,8 +163,11 @@ pub fn parseMessage(arena: std.mem.Allocator, v: std.json.Value) !?Message {
                         continue;
                     };
                     const qq = asStr(d.get("qq") orelse std.json.Value{ .null = {} }) orelse "";
-                    const name = if (d.get("name")) |nv| asStr(nv) else null;
-                    try segs.append(arena, .{ .at = .{ .qq = qq, .name = name } });
+                    // `at.data.name` 是该群里的展示名，通常就是群名片。昵称的
+                    // 唯一可信来源是 runner 统一查询 get_group_member_info 后的
+                    // `nickname` 字段；先丢弃这里的值，避免任一未经过补全的路径
+                    // 意外把群名片写入正文或 Redis。
+                    try segs.append(arena, .{ .at = .{ .qq = qq, .name = null } });
                 } else if (std.mem.eql(u8, ty, "reply")) {
                     const d = data orelse {
                         try segs.append(arena, .other);
@@ -240,7 +243,7 @@ test "user_id 与 message_id 可以是字符串" {
     try std.testing.expectEqual(@as(i64, 100), m.time);
 }
 
-test "at 段带 name 渲染为 @昵称，缺 name 退化为 @QQ号" {
+test "at 段忽略 NapCat 附带的群展示名，补全前一律渲染为 @QQ号" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
@@ -250,7 +253,7 @@ test "at 段带 name 渲染为 @昵称，缺 name 退化为 @QQ号" {
         \\ {"type":"at","data":{"qq":"999","name":"小明"}},
         \\ {"type":"text","data":{"text":" 你好"}}]}
     );
-    try std.testing.expectEqualStrings("@小明 你好", try m1.renderText(a));
+    try std.testing.expectEqualStrings("@999 你好", try m1.renderText(a));
 
     const m2 = try parseOne(a,
         \\{"message_id":1,"user_id":2,"time":0,"message":[

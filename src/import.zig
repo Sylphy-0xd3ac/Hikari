@@ -189,7 +189,7 @@ fn importLine(
 /// `group_ids` 至少有一个元素（parseUintList 对空列表返回 error），所以这里
 /// 直接下标取而不再判空。
 ///
-/// 归属（群名 / 被观察者名片）解析不出来就直接 error.AttributionUnavailable，
+/// 归属（群名 / 被观察者 QQ 原始昵称）解析不出来就直接 error.AttributionUnavailable，
 /// 一条都不写：跟 scanGroup 同样的理由，但这里更严格——scanGroup 至少还有
 /// "这个群这一轮失败，下次/补跑再试"的退路，import 是一次性手工操作，没有
 /// 重跑窗口的概念，写出去的残缺归属字段就是永久的（design.md：入库后只能
@@ -210,7 +210,7 @@ pub fn run(deps: runner.Deps, path: []const u8, attribution_qq: u64, now: i64) !
     const group_id = deps.group_ids[0];
 
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
-    const from_who = runner.memberCard(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
+    const from_who = runner.memberNickname(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
 
     for (parsed.lines) |line| {
         try importLine(deps, line, from, from_who, group_id, attribution_qq, now, &summary);
@@ -401,7 +401,7 @@ const FakeRedisServer = struct {
 /// 接受一条连接，在这条连接上依次收 `replies.len` 个 HTTP 请求、按顺序各
 /// 回一个预先写好的 JSON body——跟 napcat.zig「call 发出带 Bearer token
 /// 的 POST 请求」测试用的是同一套 std.http.Server 搭法，只是把单次请求-响应
-/// 循环了 replies.len 次，好覆盖 groupName + memberCard 两次调用。
+/// 循环了 replies.len 次，好覆盖 groupName + memberNickname 两次调用。
 const FakeNapcatServer = struct {
     listener: std.net.Server,
     thread: std.Thread,
