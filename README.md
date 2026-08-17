@@ -8,7 +8,8 @@ Hikari 是一个用 Zig 写的常驻进程，主程序不链接第三方库。�
 ## 快速开始
 
 需要 Zig 0.15.2、一个可用的 Redis、一个已经登录好目标账号的 NapCat 实例。若要给纯图片/个人表情
-候选做 OCR，运行机器还需要 `curl`、`timeout`、`prlimit` 与 Tesseract 5（简中 + 英文模型）。
+候选做 OCR，运行机器还需要 `curl`、`timeout`、`prlimit`、Python 3.12，以及用
+`scripts/install-rapidocr.sh` 安装的固定版本 RapidOCR/ONNX Runtime 虚拟环境。
 
 ```bash
 # 构建（生产用 ReleaseSafe：见下方「构建」一节）
@@ -69,16 +70,17 @@ curl 'http://127.0.0.1:8080/'
 或其它段都不算这条语法。它是比自动 🔥 分组更明确的单条收录指令：目标不会再作为链内容被吞掉。
 
 **图片与个人表情 OCR**：候选通过 tombstone / existing / chain-member 关卡后，如果正常渲染正文为空但目标含
-图片或 QQ 个人/商城表情，Hikari 会下载真实的 HTTP(S) 图源并按需启动本机 Tesseract。NapCat 当前通常把
+图片或 QQ 个人/商城表情，Hikari 会下载真实的 HTTP(S) 图源并按需启动本机 RapidOCR。NapCat 当前通常把
 收到的 `mface` 转成带 `emoji_id`/`url` 的 `image`，Hikari 也兼容直接上报的原生 `mface`：优先使用真实
 `url`，若 `file` 本身就是 HTTP(S) URL 也可使用；NapCat 所在机器上的裸文件名/路径不会被误当成本机文件。
-个人表情缺 URL 时按 `emoji_id` 补出 NapCat 同源图地址。每张图串行跑 PSM 6（整块文字）和 PSM 11
-（稀疏短字），按 TSV 字符加权置信度选较好结果；一张图里的各行及多张图之间按顺序用换行连接。
+个人表情缺 URL 时按 `emoji_id` 补出 NapCat 同源图地址。识别使用 PP-OCRv6 small 的文字检测与中英文
+识别模型；外层解码后的最长边硬限制为 960、候选框最多 200、batch 为 1。结构化字符框会用于恢复原图里明显的中文
+词间空格，并过滤与正文重叠的单独装饰框；一张图里的各行及多张图之间按顺序用换行连接。
 这里的「个人表情」不是普通图片的同义词：它按 `emoji_id` 等字段单独识别，只是 NapCat 在**接收端**通常把
 `mface` 改写成了 `image` 段。QQ 内置小表情则是只有数字 ID、没有可 OCR 图源的 `face` 段，仍不会拿去 OCR。
 已有文字正文永远优先，不额外混入 OCR；OCR 是 best-effort，失败会告警，全部没有可用文本时仍按
-`empty` 跳过。每张下载图最多 16 MiB；每个 Tesseract pass 最多 20 秒、2 个 OpenMP 线程和 2 GiB
-地址空间，而且两个布局串行执行，不常驻模型。管理员发 `✨` 并在同一条消息里附图也属于有效候选——
+`empty` 跳过。每张下载图最多 16 MiB；每个 RapidOCR 子进程最多 20 秒、ORT 2/1 线程和 2 GiB
+地址空间，识别进程不常驻。管理员发 `✨` 并在同一条消息里附图也属于有效候选——
 光杆 `✨` 本身仍无效。每条真正进入 OCR 回退的候选都会打一行不含正文的摘要日志：`images` 是图片段
 总数，`attempted` 是有 HTTP(S) 图源、实际启动识别的数量，`succeeded` 是得到非空文本的数量，
 `text_codepoints` 是最终拼接结果的 UTF-8 码点数。确认 💤 后整群不收录时不会启动 OCR，也不会有这行。
@@ -161,7 +163,7 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 | `HTTP_HOST` | 是 | 一言服务监听地址 | `0.0.0.0` |
 | `HTTP_PORT` | 是 | 一言服务监听端口 | `8080` |
 | `REDIS_URL` | 是 | `redis://[:password@]host:port/db` | `redis://127.0.0.1:6379/0` |
-| `OCR_TESSDATA_DIR` | 否 | Tesseract 模型目录；生产建议指向装有 `tessdata_best` 的 `chi_sim` / `chi_sim_vert` / `eng` 及系统 `configs` 的目录 | `/opt/hikari/tessdata` |
+| `OCR_PYTHON_PATH` | 否 | 固定 RapidOCR 虚拟环境的 Python；不使用系统全局 Python 包 | `/opt/hikari/ocr-venv/bin/python` |
 
 ## CLI
 
@@ -193,6 +195,10 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 ## HTTP 接口
 
 **`GET /`** —— 返回随机一条语录，参数遵循 Hitokoto 规范：
+
+默认 JSON（以及 JSONP）完整对象包含数值字段 `user_id`，即这条语录作者的 QQ；它与 `from_who`
+和 `?user_id=` 的作者归属完全一致。`message_id` / `group_id` 仍只作为 Redis 内部归属元数据，不通过
+HTTP 暴露。`/extra/all` 与 `/extra/batch/:count` 的 JSON 数组元素使用同一个对象结构。
 
 | 参数 | 支持情况 |
 |---|---|
@@ -299,16 +305,12 @@ zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 
 以非 root 用户运行，交给 systemd 管理：
 
-Fedora 生产机先安装运行时，并准备高精度模型目录。`tsv` 配置文件来自系统 tessdata，三个
-`traineddata` 则使用官方 `tessdata_best`；下载时应固定到部署审核过的提交与校验和。`chi_sim`
-会自动加载 `chi_sim_vert`，所以后者不是可省略的“只给竖排图片用”的附加模型：
+Fedora 生产机先安装运行时，再用仓库脚本创建固定版本的 OCR 虚拟环境。脚本会安装 RapidOCR
+3.9.2、CPU 版 ONNX Runtime 1.28.0，并把依赖解析带入的 GUI OpenCV wheel 换成 headless wheel：
 
 ```bash
-sudo dnf install tesseract curl coreutils util-linux
-sudo install -d -m 0755 /opt/hikari/tessdata
-sudo cp -a /usr/share/tesseract/tessdata/. /opt/hikari/tessdata/
-# 再用官方 tessdata_best 的 chi_sim.traineddata、chi_sim_vert.traineddata、
-# eng.traineddata 覆盖同名文件
+sudo dnf install python3.12 curl coreutils util-linux
+sudo ./scripts/install-rapidocr.sh python3.12 /opt/hikari/ocr-venv
 ```
 
 ```ini
@@ -349,7 +351,7 @@ zig build test          # 完整测试套件
 完全同一套装配（同一个 config、同一种独立 Redis 连接）立刻跑一次并退出。
 
 部署目标是 `x86_64-linux-gnu`，Hikari 二进制本身不链接第三方库，`-Dtarget` 交叉编译到其他平台
-同样适用；图片 OCR 另需上述 Linux 命令行运行时。目前只有这一个目标经过实际部署验证。
+同样适用；图片 OCR 另需上述 Linux 命令行运行时与 Python 虚拟环境。目前只有这一个目标经过实际部署验证。
 
 涉及所有权转移的代码（谁在错误路径上该释放哪块内存）容易在 OOM 分支上出岔子，本仓库的约定是这类
 代码都配一条 `std.testing.checkAllAllocationFailures` 测试，逐次让分配失败、确认每条路径都不泄漏

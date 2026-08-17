@@ -806,6 +806,8 @@ test "GET /extra/all 返回全部语录的 JSON 数组" {
     try std.testing.expectEqual(@as(usize, 2), arr.len);
     try std.testing.expectEqualStrings("今天也是好天气", arr[0].object.get("hitokoto").?.string);
     try std.testing.expectEqualStrings("第二条语录", arr[1].object.get("hitokoto").?.string);
+    try std.testing.expectEqual(@as(i64, 10001), arr[0].object.get("user_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 10002), arr[1].object.get("user_id").?.integer);
 }
 
 test "GET /extra/all 库空时返回 [] 而不是 404 —— 数组端点的\"没有\"是一个成功答案" {
@@ -1033,6 +1035,7 @@ test "GET /?user_id= 命中时用 hikari:byuser（不是 hikari:index），命�
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqualStrings("今天也是好天气", parsed.value.object.get("hitokoto").?.string);
+    try std.testing.expectEqual(@as(i64, 10001), parsed.value.object.get("user_id").?.integer);
 
     client.deinit();
     fake.stop();
@@ -1088,9 +1091,18 @@ test "GET /?user_id= 对应候选为空时返回 404 —— 覆盖真的没有�
     );
 }
 
-test "GET /?user_id= 非法值（非数字/负数）返回 400，不碰 Redis" {
+test "GET /?user_id= 非纯数字值返回 400，不碰 Redis" {
     const gpa = std.testing.allocator;
-    for ([_][]const u8{ "/?user_id=abc", "/?user_id=-1", "/?user_id=" }) |path| {
+    for ([_][]const u8{
+        "/?user_id=abc",
+        "/?user_id=-1",
+        "/?user_id=",
+        "/?user_id=+10001",
+        "/?user_id=10_001",
+        "/?user_id=-0",
+        "/extra/all?user_id=+10001",
+        "/extra/batch/2?user_id=10_001",
+    }) |path| {
         const h = try startHarness(gpa, &[_][]const u8{});
         defer stopHarness(h);
         var body: std.Io.Writer.Allocating = .init(gpa);
@@ -1194,6 +1206,8 @@ test "GET /extra/all?user_id= 走 hikari:byuser，返回过滤后的数组" {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body.written(), .{});
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try std.testing.expectEqual(@as(i64, 10001), parsed.value.array.items[0].object.get("user_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 10002), parsed.value.array.items[1].object.get("user_id").?.integer);
 
     client.deinit();
     fake.stop();

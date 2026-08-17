@@ -5,9 +5,9 @@ pub const Error = error{ MissingEnv, InvalidValue, OutOfMemory };
 pub const Env = std.StringHashMap([]const u8);
 
 const env_keys = [_][]const u8{
-    "NAPCAT_HTTP_URL", "NAPCAT_TOKEN",     "OBSERVED_QQS", "QQ_GROUP_IDS",
-    "ADMIN_QQS",       "SCAN_TIME",        "HTTP_HOST",    "HTTP_PORT",
-    "REDIS_URL",       "OCR_TESSDATA_DIR",
+    "NAPCAT_HTTP_URL", "NAPCAT_TOKEN",    "OBSERVED_QQS", "QQ_GROUP_IDS",
+    "ADMIN_QQS",       "SCAN_TIME",       "HTTP_HOST",    "HTTP_PORT",
+    "REDIS_URL",       "OCR_PYTHON_PATH",
     // 已废弃，仍然读取：只为了在它单独在场时报出明确的改名错误。
     "OBSERVED_QQ",
 };
@@ -45,8 +45,8 @@ pub const Config = struct {
     redis_port: u16,
     redis_password: ?[]u8,
     redis_db: u32,
-    /// null 时让 Tesseract 使用系统自带模型；生产指向 tessdata_best 目录。
-    ocr_tessdata_dir: ?[]u8,
+    /// 固定 RapidOCR 虚拟环境的解释器，避免使用宿主机不受控的 Python 包。
+    ocr_python_path: []u8,
 
     pub fn deinit(self: *Config) void {
         self.gpa.free(self.napcat_url);
@@ -57,7 +57,7 @@ pub const Config = struct {
         self.gpa.free(self.http_host);
         self.gpa.free(self.redis_host);
         if (self.redis_password) |p| self.gpa.free(p);
-        if (self.ocr_tessdata_dir) |p| self.gpa.free(p);
+        self.gpa.free(self.ocr_python_path);
     }
 };
 
@@ -269,11 +269,11 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
     errdefer gpa.free(napcat_token);
     const http_host = try gpa.dupe(u8, host_raw);
     errdefer gpa.free(http_host);
-    const ocr_tessdata_dir = if (optional(env, "OCR_TESSDATA_DIR")) |raw|
-        try gpa.dupe(u8, raw)
-    else
-        null;
-    errdefer if (ocr_tessdata_dir) |p| gpa.free(p);
+    const ocr_python_path = try gpa.dupe(
+        u8,
+        optional(env, "OCR_PYTHON_PATH") orelse "/opt/hikari/ocr-venv/bin/python",
+    );
+    errdefer gpa.free(ocr_python_path);
 
     return .{
         .gpa = gpa,
@@ -290,7 +290,7 @@ pub fn loadFrom(gpa: std.mem.Allocator, env: Env, bad: *?[]const u8) Error!Confi
         .redis_port = redis.port,
         .redis_password = redis.password,
         .redis_db = redis.db,
-        .ocr_tessdata_dir = ocr_tessdata_dir,
+        .ocr_python_path = ocr_python_path,
     };
 }
 
@@ -465,18 +465,18 @@ test "loadFrom 读全所有字段" {
     try std.testing.expectEqual(@as(u8, 3), cfg.scan_hour);
     try std.testing.expectEqual(@as(u16, 8080), cfg.http_port);
     try std.testing.expectEqual(@as(u16, 6379), cfg.redis_port);
-    try std.testing.expectEqual(@as(?[]u8, null), cfg.ocr_tessdata_dir);
+    try std.testing.expectEqualStrings("/opt/hikari/ocr-venv/bin/python", cfg.ocr_python_path);
 }
 
-test "loadFrom：OCR_TESSDATA_DIR 可选，填写时保留路径" {
+test "loadFrom：OCR_PYTHON_PATH 可覆盖默认虚拟环境解释器" {
     const gpa = std.testing.allocator;
     var env = try testEnv(gpa);
     defer env.deinit();
-    try env.put("OCR_TESSDATA_DIR", "/opt/hikari/tessdata");
+    try env.put("OCR_PYTHON_PATH", "/srv/hikari-ocr/bin/python");
     var bad: ?[]const u8 = null;
     var cfg = try loadFrom(gpa, env, &bad);
     defer cfg.deinit();
-    try std.testing.expectEqualStrings("/opt/hikari/tessdata", cfg.ocr_tessdata_dir.?);
+    try std.testing.expectEqualStrings("/srv/hikari-ocr/bin/python", cfg.ocr_python_path);
 }
 
 test "loadFrom 缺字段时报出是哪一个" {
