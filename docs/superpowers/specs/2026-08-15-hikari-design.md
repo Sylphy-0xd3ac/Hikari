@@ -36,7 +36,7 @@ Hikari 是一个常驻进程，做两件事：
 | `HTTP_HOST` | 是 | 一言服务监听地址 | `0.0.0.0` |
 | `HTTP_PORT` | 是 | 一言服务监听端口 | `8080` |
 | `REDIS_URL` | 是 | `redis://[:password@]host:port/db` | `redis://127.0.0.1:6379/0` |
-| `OCR_TESSDATA_DIR` | 否 | 本机 Tesseract 模型目录；生产指向带系统 `configs` 与 `tessdata_best` 简中/英文模型的目录 | `/opt/hikari/tessdata` |
+| `OCR_TESSDATA_DIR` | 否 | 本机 Tesseract 模型目录；生产指向带系统 `configs` 与 `tessdata_best` 的 `chi_sim` / `chi_sim_vert` / `eng` 的目录 | `/opt/hikari/tessdata` |
 
 任一必填项缺失或格式非法，进程启动即退出并打印具体是哪一项。
 
@@ -355,7 +355,7 @@ D  （无 🔥）           → 连续段在这里结束
 
 **OCR 回退**：候选先通过 tombstone / existing / chain-member 关卡；正常正文为空且目标消息至少有一个带可下载 URL 的归一化 image/mface 段时，runner 调按需启动的本机 Tesseract。普通图片使用 `data.url`（或本身就是 HTTP(S) URL 的 `file`）；NapCat 所在机器上的裸文件名/路径不能跨机读取，直接跳过。原生 mface 缺 URL 时，`onebot.parseMessage` 按 NapCat 当前源码的 `https://gxh.vip.qq.com/club/item/parcel/item/{emoji_id前两位}/{emoji_id}/raw300.gif` 规则补出图源。
 
-下载只允许 HTTP(S)、最多 3 次重定向、连接 5 秒/总计 15 秒，图片最多 16 MiB，并放进 mode 0600 的随机临时文件。每张图串行跑 Tesseract LSTM 的 `chi_sim+eng` 两次：PSM 6 保留默认 Otsu，适合整块截图；PSM 11 加 Sauvola，适合花背景上的稀疏短字。输出使用 TSV，按有效字符数加权平均 confidence 选较好的一次，再按 page/block/paragraph/line 重建换行；中文 token 不凭空插空格，连续 ASCII 单词之间保留一个空格。每个 pass 由 `timeout` / `prlimit` 限制在 20 秒、2 个 OpenMP 线程和 2 GiB 地址空间，两个 pass 不并发、模型不常驻。生产通过可选 `OCR_TESSDATA_DIR` 指向带系统 `configs` 及官方 `tessdata_best` 简中/英文模型的目录。
+下载只允许 HTTP(S)、最多 3 次重定向、连接 5 秒/总计 15 秒，图片最多 16 MiB，并放进 mode 0600 的随机临时文件。每张图串行跑 Tesseract LSTM 的 `chi_sim+eng` 两次：PSM 6 保留默认 Otsu，适合整块截图；PSM 11 加 Sauvola，适合花背景上的稀疏短字。输出使用 TSV，按有效字符数加权平均 confidence 选较好的一次，再按 page/block/paragraph/line 重建换行；中文 token 不凭空插空格，连续 ASCII 单词之间保留一个空格。每个 pass 由 `timeout` / `prlimit` 限制在 20 秒、2 个 OpenMP 线程和 2 GiB 地址空间，两个 pass 不并发、模型不常驻。生产通过可选 `OCR_TESSDATA_DIR` 指向带系统 `configs` 及官方 `tessdata_best` 的 `chi_sim` / `chi_sim_vert` / `eng` 三个模型；`chi_sim` 会自动加载 `chi_sim_vert`，后者缺失时即使横排识别仍返回结果，也会报模型加载错误并失去竖排能力。
 
 同图各行与多图之间按返回顺序用 `\n` 连接。已有正文不再 OCR；单图下载、解码或识别失败只告警并继续其它图，全部失败/空响应最终仍计 `empty`，不把 best-effort OCR 升级成整群 Trouble。
 

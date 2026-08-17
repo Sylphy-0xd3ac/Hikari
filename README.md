@@ -159,7 +159,7 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 | `HTTP_HOST` | 是 | 一言服务监听地址 | `0.0.0.0` |
 | `HTTP_PORT` | 是 | 一言服务监听端口 | `8080` |
 | `REDIS_URL` | 是 | `redis://[:password@]host:port/db` | `redis://127.0.0.1:6379/0` |
-| `OCR_TESSDATA_DIR` | 否 | Tesseract 模型目录；生产建议指向装有 `tessdata_best` 简中/英文模型及系统 `configs` 的目录 | `/opt/hikari/tessdata` |
+| `OCR_TESSDATA_DIR` | 否 | Tesseract 模型目录；生产建议指向装有 `tessdata_best` 的 `chi_sim` / `chi_sim_vert` / `eng` 及系统 `configs` 的目录 | `/opt/hikari/tessdata` |
 
 ## CLI
 
@@ -297,14 +297,16 @@ zig build -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe
 
 以非 root 用户运行，交给 systemd 管理：
 
-Fedora 生产机先安装运行时，并准备高精度模型目录。`tsv` 配置文件来自系统 tessdata，两个
-`traineddata` 则使用官方 `tessdata_best`；下载时应固定到部署审核过的提交与校验和：
+Fedora 生产机先安装运行时，并准备高精度模型目录。`tsv` 配置文件来自系统 tessdata，三个
+`traineddata` 则使用官方 `tessdata_best`；下载时应固定到部署审核过的提交与校验和。`chi_sim`
+会自动加载 `chi_sim_vert`，所以后者不是可省略的“只给竖排图片用”的附加模型：
 
 ```bash
 sudo dnf install tesseract curl coreutils util-linux
 sudo install -d -m 0755 /opt/hikari/tessdata
 sudo cp -a /usr/share/tesseract/tessdata/. /opt/hikari/tessdata/
-# 再用官方 tessdata_best 的 chi_sim.traineddata / eng.traineddata 覆盖同名文件
+# 再用官方 tessdata_best 的 chi_sim.traineddata、chi_sim_vert.traineddata、
+# eng.traineddata 覆盖同名文件
 ```
 
 ```ini
