@@ -121,7 +121,7 @@ pub fn main() !void {
 
     var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
     defer nap.deinit();
-    var local_ocr = ocr.Local.init(gpa, cfg.ocr_tessdata_dir);
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_python_path);
 
     var srv = try http_server.Server.listen(gpa, &http_store, cfg.http_host, cfg.http_port);
     defer srv.deinit();
@@ -211,7 +211,7 @@ fn runImportCommand(gpa: std.mem.Allocator, path: []const u8, attribution_qq: u6
 
     var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
     defer nap.deinit();
-    var local_ocr = ocr.Local.init(gpa, cfg.ocr_tessdata_dir);
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_python_path);
 
     const deps: runner.Deps = .{
         .gpa = gpa,
@@ -271,7 +271,7 @@ fn runRunCommand(gpa: std.mem.Allocator, lookback_seconds: ?i64) !void {
 
     var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
     defer nap.deinit();
-    var local_ocr = ocr.Local.init(gpa, cfg.ocr_tessdata_dir);
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_python_path);
 
     const deps: runner.Deps = .{
         .gpa = gpa,

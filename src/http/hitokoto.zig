@@ -80,6 +80,14 @@ fn isValidCallback(s: []const u8) bool {
     return true;
 }
 
+fn parseUserId(raw: []const u8) QueryError!u64 {
+    if (raw.len == 0) return error.InvalidUserId;
+    for (raw) |c| {
+        if (!std.ascii.isDigit(c)) return error.InvalidUserId;
+    }
+    return std.fmt.parseInt(u64, raw, 10) catch return error.InvalidUserId;
+}
+
 /// target 形如 "/" 或 "/?a=b&c=d"。
 pub fn parseQuery(gpa: std.mem.Allocator, target: []const u8) QueryError!Query {
     var q: Query = .{ .select = try gpa.dupe(u8, ".hitokoto") };
@@ -114,7 +122,7 @@ pub fn parseQuery(gpa: std.mem.Allocator, target: []const u8) QueryError!Query {
             // QQ 号是非负整数；语法上不合法（负号、非数字、溢出 u64）一律
             // 400，不是"这个人没有语录"——后者是一个合法的空结果（404/[]]），
             // 前者是一个格式错误的请求，两者不能混为一谈。
-            q.user_id = std.fmt.parseInt(u64, v_raw, 10) catch return error.InvalidUserId;
+            q.user_id = try parseUserId(v_raw);
         } else if (std.mem.eql(u8, k, "from_who")) {
             const decoded = try percentDecodeAlloc(gpa, v_raw);
             errdefer gpa.free(decoded);
@@ -226,7 +234,7 @@ pub fn parseExtraQuery(gpa: std.mem.Allocator, target: []const u8) ExtraQueryErr
         } else if (std.mem.eql(u8, k, "max_length")) {
             q.max_length = std.fmt.parseInt(usize, v_raw, 10) catch return error.InvalidNumber;
         } else if (std.mem.eql(u8, k, "user_id")) {
-            q.user_id = std.fmt.parseInt(u64, v_raw, 10) catch return error.InvalidUserId;
+            q.user_id = try parseUserId(v_raw);
         } else if (std.mem.eql(u8, k, "from_who")) {
             const decoded = try percentDecodeAlloc(gpa, v_raw);
             errdefer gpa.free(decoded);
@@ -258,6 +266,7 @@ const Payload = struct {
     type: []const u8,
     from: []const u8,
     from_who: []const u8,
+    user_id: u64,
     creator: []const u8,
     creator_uid: u64,
     reviewer: u64,
@@ -287,6 +296,7 @@ fn jsonBody(gpa: std.mem.Allocator, q: store.Quote) ![]u8 {
         .type = q.kind,
         .from = q.from,
         .from_who = q.from_who,
+        .user_id = q.user_id,
         .creator = q.creator,
         .creator_uid = q.creator_uid,
         .reviewer = q.reviewer,
@@ -346,6 +356,7 @@ pub fn jsonArrayBody(gpa: std.mem.Allocator, quotes: []const store.Quote) ![]u8 
             .type = q.kind,
             .from = q.from,
             .from_who = q.from_who,
+            .user_id = q.user_id,
             .creator = q.creator,
             .creator_uid = q.creator_uid,
             .reviewer = q.reviewer,
@@ -543,6 +554,9 @@ test "parseQuery 拒绝非法 user_id（负数、非数字、溢出 u64）——
     try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=-1"));
     try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=abc"));
     try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id="));
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=+10001"));
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=10_001"));
+    try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=-0"));
     // u64 最大值是 18446744073709551615，多一位数字就溢出。
     try std.testing.expectError(error.InvalidUserId, parseQuery(gpa, "/?user_id=184467440737095516150"));
 }
@@ -585,6 +599,7 @@ test "render json 输出 hitokoto 规范字段" {
     try std.testing.expectEqualStrings("g", o.get("type").?.string);
     try std.testing.expectEqualStrings("测试群", o.get("from").?.string);
     try std.testing.expectEqualStrings("小明", o.get("from_who").?.string);
+    try std.testing.expectEqual(@as(i64, 10001), o.get("user_id").?.integer);
     try std.testing.expectEqualStrings("Hikari", o.get("creator").?.string);
     try std.testing.expectEqualStrings("hikari", o.get("commit_from").?.string);
     try std.testing.expectEqualStrings("1700000000", o.get("created_at").?.string);
@@ -776,6 +791,8 @@ test "jsonArrayBody 产出与元素个数一致的 JSON 数组，字段跟 encod
     try std.testing.expectEqualStrings("第二条语录", arr[1].object.get("hitokoto").?.string);
     try std.testing.expectEqualStrings("660e8400-e29b-41d4-a716-446655440001", arr[1].object.get("uuid").?.string);
     try std.testing.expectEqual(@as(i64, 43), arr[1].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 10001), arr[0].object.get("user_id").?.integer);
+    try std.testing.expectEqual(@as(i64, 10002), arr[1].object.get("user_id").?.integer);
 }
 
 test "jsonArrayBody 空切片产出 []" {
@@ -890,6 +907,9 @@ test "parseExtraQuery 拒绝非法 user_id / 非法 encode / 非数字长度 / m
     const gpa = std.testing.allocator;
     try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/all?user_id=abc"));
     try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/all?user_id=-1"));
+    try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/all?user_id=+10001"));
+    try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/batch/2?user_id=10_001"));
+    try std.testing.expectError(error.InvalidUserId, parseExtraQuery(gpa, "/extra/all?user_id=-0"));
     try std.testing.expectError(error.InvalidEncode, parseExtraQuery(gpa, "/extra/all?encode=xml"));
     try std.testing.expectError(error.InvalidNumber, parseExtraQuery(gpa, "/extra/all?min_length=abc"));
     try std.testing.expectError(error.BadLengthRange, parseExtraQuery(gpa, "/extra/all?min_length=10&max_length=3"));
