@@ -189,7 +189,8 @@ fn importLine(
 /// `group_ids` 至少有一个元素（parseUintList 对空列表返回 error），所以这里
 /// 直接下标取而不再判空。
 ///
-/// 归属（群名 / 被观察者 QQ 原始昵称）解析不出来就直接 error.AttributionUnavailable，
+/// 归属（群名 / 被观察者 QQ 原始昵称）解析不出来、或昵称为空，就直接
+/// error.AttributionUnavailable，
 /// 一条都不写：跟 scanGroup 同样的理由，但这里更严格——scanGroup 至少还有
 /// "这个群这一轮失败，下次/补跑再试"的退路，import 是一次性手工操作，没有
 /// 重跑窗口的概念，写出去的残缺归属字段就是永久的（design.md：入库后只能
@@ -211,6 +212,7 @@ pub fn run(deps: runner.Deps, path: []const u8, attribution_qq: u64, now: i64) !
 
     const from = runner.groupName(deps, a, group_id) orelse return error.AttributionUnavailable;
     const from_who = runner.memberNickname(deps, a, group_id, attribution_qq) orelse return error.AttributionUnavailable;
+    if (from_who.len == 0) return error.AttributionUnavailable;
 
     for (parsed.lines) |line| {
         try importLine(deps, line, from, from_who, group_id, attribution_qq, now, &summary);
@@ -606,6 +608,40 @@ test "run 端到端：群归属解析不出来就整体中止，一条候选都�
 
     try std.testing.expectError(error.AttributionUnavailable, run(deps, path, 123456, 1_700_000_000));
 
+    c.deinit();
+    redis_srv.stop();
+    try std.testing.expectEqual(@as(usize, 0), redis_srv.received.items.len);
+}
+
+test "run 端到端：原始昵称为空也中止，不写空 from_who" {
+    const gpa = std.testing.allocator;
+    const redis_srv = try FakeRedisServer.start(gpa, "");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"群名片\",\"nickname\":\"\"}}",
+    });
+    defer nap_srv.stop();
+
+    var c = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+    const deps: runner.Deps = .{ .gpa = gpa, .nap = &nap, .st = &st, .observed_qqs = &.{}, .admin_qqs = &.{}, .group_ids = &.{10001} };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTempInput(gpa, &tmp, "这一行不能写入\n");
+    defer gpa.free(path);
+
+    try std.testing.expectError(error.AttributionUnavailable, run(deps, path, 123456, 1_700_000_000));
     c.deinit();
     redis_srv.stop();
     try std.testing.expectEqual(@as(usize, 0), redis_srv.received.items.len);
