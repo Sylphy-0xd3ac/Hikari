@@ -137,7 +137,8 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 
 复制 `.env.example` 为 `.env` 并填入真实值。Hikari 会自动读取**当前工作目录**下的 `.env`，无需先
 `source`；文件不存在也不报错，只要真正的进程环境已经给齐配置。优先级固定为
-**进程环境变量 > `.env`**，因此 systemd `EnvironmentFile`、容器注入或命令行临时覆盖都能压过文件值。
+**进程环境变量 > `.env`**，因此容器注入或命令行临时覆盖仍能压过文件值。生产环境统一把持久配置放在
+`/opt/hikari/.env`；systemd unit 不再写 `Environment=` / `EnvironmentFile=`，避免同时维护两份配置。
 
 `.env` 支持空行、`#` 注释、可选的 `export` 前缀，以及单双引号包住的值。值里含空白、`#` 或 shell
 元字符时应加引号；外层引号会被剥掉，反斜杠保持字面量。它不是 shell，**不会展开** `$VAR` 或
@@ -309,8 +310,9 @@ RestartSec=5
 WantedBy=multi-user.target
 ```
 
-上例由 Hikari 自己读取 `/opt/hikari/.env`，所以 `WorkingDirectory` 不能省。如果仍想用 systemd 管理
-配置，也可以加 `EnvironmentFile=/opt/hikari/hikari.env`；这些进程环境变量会按上述优先级覆盖 `.env`。
+上例由 Hikari 自己读取 `/opt/hikari/.env`，所以 `WorkingDirectory` 不能省。`/opt/hikari/.env` 是生产
+环境唯一的持久配置来源；不要再给 unit 添加 `Environment=` 或 `EnvironmentFile=`，也不要保留一份会
+与它漂移的 `hikari.env`。配置文件应只允许服务用户读取（例如 mode `0600`）。
 
 日志走 journal：
 
