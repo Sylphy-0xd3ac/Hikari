@@ -21,8 +21,32 @@ pub fn willProcessLine(gpa: std.mem.Allocator, n: usize) ![]u8 {
     return std.fmt.allocPrint(gpa, "Will process {d} messages.", .{n});
 }
 
-pub fn resultLine(gpa: std.mem.Allocator, added: usize, skipped: usize) ![]u8 {
-    return std.fmt.allocPrint(gpa, "Added {d} messages, skipped {d} messages.", .{ added, skipped });
+pub const SkipReasons = struct {
+    existing: usize = 0,
+    tombstoned: usize = 0,
+    chain_member: usize = 0,
+    target_missing: usize = 0,
+    empty: usize = 0,
+
+    pub fn total(self: SkipReasons) usize {
+        return self.existing + self.tombstoned + self.chain_member + self.target_missing + self.empty;
+    }
+};
+
+pub fn resultLine(gpa: std.mem.Allocator, added: usize, skipped: SkipReasons) ![]u8 {
+    return std.fmt.allocPrint(
+        gpa,
+        "Added {d} messages, skipped {d} messages (existing {d}, tombstoned {d}, chain member {d}, target missing {d}, empty {d}).",
+        .{
+            added,
+            skipped.total(),
+            skipped.existing,
+            skipped.tombstoned,
+            skipped.chain_member,
+            skipped.target_missing,
+            skipped.empty,
+        },
+    );
 }
 
 /// 💤 双重确认命中时仍保持七行合并转发，只把第六行写清楚“为什么全跳过”。
@@ -1079,7 +1103,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     const attributed = from != null;
 
     var added: usize = 0;
-    var skipped: usize = 0;
+    var skipped: SkipReasons = .{};
     var author_cache: AuthorCache = .init(a);
     defer author_cache.deinit();
 
@@ -1097,19 +1121,18 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         //     前移。不前移的话下一次触发会原样重扫同一个窗口、看到同一条
         //     💤、再跳过一次——一个自我持续的永久停摆，跟两轮之前修掉的
         //     "作者已离群"那个 bug 是同一个形状。
-        skipped = outcome.candidates.len;
         std.log.info(
             "group {d}: an admin's standalone 💤 message was confirmed by the same admin's 💤 reaction — collecting nothing for this group this run; {d} candidate(s) counted as skipped. Revocations were still applied and lastrun still advances.",
-            .{ gid, skipped },
+            .{ gid, outcome.candidates.len },
         );
     } else if (attributed) {
         for (outcome.candidates) |cand| {
             if (try deps.st.isTombstoned(cand.message_id)) {
-                skipped += 1;
+                skipped.tombstoned += 1;
                 continue;
             }
             if (try deps.st.exists(cand.message_id)) {
-                skipped += 1;
+                skipped.existing += 1;
                 continue;
             }
             // 第三道关卡：这个 id 是不是某条早先已经入库的 🔥 链的成员——不管
@@ -1142,12 +1165,12 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
             if (cand.chain_members != null) {
                 if (try deps.st.chainPrimaryOf(cand.message_id)) |primary| {
                     if (primary != cand.message_id) {
-                        skipped += 1;
+                        skipped.chain_member += 1;
                         continue;
                     }
                 }
             } else if (try deps.st.isChainMember(cand.message_id)) {
-                skipped += 1;
+                skipped.chain_member += 1;
                 continue;
             }
 
@@ -1161,13 +1184,13 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
 
             const text: []const u8 = if (cand.text_override) |t| t else blk: {
                 const tm = target orelse {
-                    skipped += 1;
+                    skipped.target_missing += 1;
                     continue;
                 };
                 break :blk try tm.renderText(a);
             };
             if (text.len == 0) {
-                skipped += 1;
+                skipped.empty += 1;
                 continue;
             }
 
@@ -1275,7 +1298,7 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
     }
 
     const result = if (outcome.skip_collection)
-        try sleepResultLine(a, skipped)
+        try sleepResultLine(a, outcome.candidates.len)
     else
         try resultLine(a, added, skipped);
     pushLine(a, lines, gid, result);
@@ -1322,16 +1345,28 @@ test "willProcessLine 格式" {
 
 test "resultLine 格式" {
     const gpa = std.testing.allocator;
-    const a = try resultLine(gpa, 12, 34);
+    const a = try resultLine(gpa, 12, .{
+        .existing = 12,
+        .tombstoned = 3,
+        .chain_member = 4,
+        .target_missing = 5,
+        .empty = 10,
+    });
     defer gpa.free(a);
-    try std.testing.expectEqualStrings("Added 12 messages, skipped 34 messages.", a);
+    try std.testing.expectEqualStrings(
+        "Added 12 messages, skipped 34 messages (existing 12, tombstoned 3, chain member 4, target missing 5, empty 10).",
+        a,
+    );
 }
 
 test "resultLine 处理 0/0" {
     const gpa = std.testing.allocator;
-    const a = try resultLine(gpa, 0, 0);
+    const a = try resultLine(gpa, 0, .{});
     defer gpa.free(a);
-    try std.testing.expectEqualStrings("Added 0 messages, skipped 0 messages.", a);
+    try std.testing.expectEqualStrings(
+        "Added 0 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).",
+        a,
+    );
 }
 
 test "sleepResultLine 保留稳定结果句并追加暂停原因" {
@@ -1996,7 +2031,7 @@ test "buildForwardBody：七行按顺序原样打进 node 数组，Failed 行替
     for (banner) |line| try lines.append(a, line);
     try lines.append(a, processing_line);
     try lines.append(a, try willProcessLine(a, 1234));
-    try lines.append(a, try resultLine(a, 12, 34));
+    try lines.append(a, try resultLine(a, 12, .{ .existing = 34 }));
     try lines.append(a, try failedLine(a, "NapCatError"));
 
     const body = try buildForwardBody(a, 1039716984, "2131597992", lines.items);
@@ -2008,7 +2043,7 @@ test "buildForwardBody：七行按顺序原样打进 node 数组，Failed 行替
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Will process 1234 messages.\"}}]}}," ++
-            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 12 messages, skipped 34 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 12 messages, skipped 34 messages (existing 34, tombstoned 0, chain member 0, target missing 0, empty 0).\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Failed: NapCatError\"}}]}}" ++
             "]}",
         body,
@@ -2025,7 +2060,7 @@ test "buildForwardBody：正常收尾时最后一个 node 是 Successfully，不
     for (banner) |line| try lines.append(a, line);
     try lines.append(a, processing_line);
     try lines.append(a, try willProcessLine(a, 0));
-    try lines.append(a, try resultLine(a, 0, 0));
+    try lines.append(a, try resultLine(a, 0, .{}));
     try lines.append(a, try successLine(a, 7));
 
     const body = try buildForwardBody(a, 1, "1", lines.items);
@@ -2245,7 +2280,7 @@ test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Will process 1 messages.\"}}]}}," ++
-            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 0 messages, skipped 0 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 0 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Failed: 1 quote(s) not written: attribution unavailable\"}}]}}" ++
             "]}",
         nap_srv.bodies.items[5],
@@ -2415,7 +2450,7 @@ test "runOnce：正常收尾（没有 Trouble）时第七个 node 是 Successful
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Thanks to collaborators: 恩恩hhh, apanzinc, Lonely, 小晴同学, Sylphy\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Processing...\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Will process 0 messages.\"}}]}}," ++
-            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 0 messages, skipped 0 messages.\"}}]}}," ++
+            "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Added 0 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).\"}}]}}," ++
             "{\"type\":\"node\",\"data\":{\"user_id\":\"2131597992\",\"nickname\":\"Hikari\",\"content\":[{\"type\":\"text\",\"data\":{\"text\":\"Successfully in 3s.\"}}]}}" ++
             "]}",
         nap_srv.bodies.items[3],
@@ -2518,7 +2553,7 @@ test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成
     const forward = nap_srv.bodies.items[7];
     // joined 正文（"你们有钱 你们潇洒"）作为一条候选被收录，不是两条碎句。
     try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 2 messages.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
 }
 
@@ -2595,7 +2630,7 @@ test "runOnce：isChainMember 拦下一个已属于其它链的候选——即�
 
     try std.testing.expectEqual(@as(usize, 6), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[5];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages (existing 0, tombstoned 0, chain member 1, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
 }
 
@@ -2687,7 +2722,7 @@ test "runOnce：空观察集合下多个不同作者各自被正确收录，同�
 
     const forward = nap_srv.bodies.items[9];
     try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 3 messages.") != null);
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 3 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 3 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
 
     // hikari:username:111 只被刷新一次（缓存命中的第二条候选没有再发一次
@@ -2764,7 +2799,7 @@ test "runOnce：路径3（admin_manual）候选的 creator/creator_uid 是那位
 
     try std.testing.expectEqual(@as(usize, 6), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[5];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 
     // HSET 里 creator/creator_uid 字段被覆盖成管理员的信息，不是默认值：
     // 逐帧检查字段名后面紧跟的值，防止只查子串被"creator_uid 恰好包含
@@ -2851,7 +2886,7 @@ test "runOnce：链候选自己映射到自己（上一次 addChain 部分失败
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:79") != null);
     try std.testing.expectEqual(@as(usize, 8), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[7];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
 }
 
@@ -2916,7 +2951,7 @@ test "runOnce：链候选映射到别的主键（真的已经被另一条链吸�
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:80") != null);
     try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[6];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages (existing 0, tombstoned 0, chain member 1, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
 }
 
@@ -2993,7 +3028,7 @@ test "runOnce：作者名片解析失败（已经离群）不再让整个群判 
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:81") != null);
     try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[6];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Failed") == null);
 
@@ -3066,7 +3101,7 @@ test "runOnce：作者名片解析成功但 card/nickname 都是空串时不刷�
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:82") != null);
     try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[6];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "$8\r\nfrom_who\r\n$0\r\n\r\n") != null);
     // 关键断言：memberCard 确实被问到了（NapCat 那一侧调用发生过），但因为
@@ -3383,7 +3418,7 @@ test "runOnce：✨ @某人 内容 → 作者是被 at 的人，creator 仍是�
 
     try std.testing.expectEqual(@as(usize, 7), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[6];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 
     // 两次 get_group_member_info 分别问的是被 at 的作者和管理员本人。
     try std.testing.expect(std.mem.indexOf(u8, nap_srv.bodies.items[4], "\"user_id\":50001") != null);
@@ -3479,7 +3514,7 @@ test "runOnce：✨ @某人 无正文 → 计 skipped 且即使带 ✨ 回应也
 
     try std.testing.expectEqual(@as(usize, 6), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[5];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 1 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 1).") != null);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "HSET") == null);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:211") != null);
 }
@@ -3544,7 +3579,7 @@ test "runOnce：裸 💤 锚点的 get_msg 两次失败也只是未确认，不�
     try std.testing.expectEqualStrings("{\"message_id\":2}", nap_srv.bodies.items[3]);
     try std.testing.expectEqualStrings("{\"message_id\":2}", nap_srv.bodies.items[4]);
     const forward = nap_srv.bodies.items[6];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 0 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Collection paused") == null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in ") != null);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:lastrun:305") != null);
@@ -3642,7 +3677,7 @@ test "runOnce：💤 只让那一个群不收录，同一轮里的兄弟群照�
     try std.testing.expect(std.mem.indexOf(u8, sleepy, "Successfully in ") != null);
 
     const busy = nap_srv.bodies.items[13];
-    try std.testing.expect(std.mem.indexOf(u8, busy, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, busy, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 
     const received = redis_srv.received.items;
     // 兄弟群的语录确实落库了……
@@ -3823,7 +3858,7 @@ test "runOnce：管理员 💦 引用那条 💤 → 取消跳过，这一轮照
 
     try std.testing.expectEqual(@as(usize, 9), nap_srv.bodies.items.len);
     const forward = nap_srv.bodies.items[8];
-    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 
     const received = redis_srv.received.items;
     try std.testing.expect(std.mem.indexOf(u8, received, "$8\r\nhitokoto\r\n$18\r\n照常收录的话\r\n") != null);
