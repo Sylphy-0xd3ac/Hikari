@@ -816,10 +816,17 @@ pub const Store = struct {
             try members.append(self.gpa, mid);
         }
         if (members.items.len == 0) {
-            // 兜底：hikari:chain:{pid} 缺失或损坏时，至少把 revoke() 原始收到
-            // 的 id 纳入清理，不让这一步彻底什么都不做——这个 id 本身仍然是
-            // 一个真实的、需要被 tombstone 的 message_id。
-            try members.append(self.gpa, fallback_id);
+            // 兜底：hikari:chain:{pid} 缺失或损坏时，至少把主键和 revoke()
+            // 原始收到的 id 纳入清理，不让这一步彻底什么都不做——两个都是
+            // 真实的、需要被 tombstone 的 message_id。
+            //
+            // 主键必须在列表里，哪怕撤的是别的成员：下面那条 DEL 删的是
+            // 主键的 hash（整条链只有主键有 hash），清理列表少了它就会在
+            // hikari:index 里留下一个没有 hash 的悬空 id——revokeSingleLocked
+            // 的注释点名了这个状态"永远不会自愈"：randomAny 抽中它、
+            // HGETALL 回空，一个非空的库对外返回 404。
+            try members.append(self.gpa, pid);
+            if (fallback_id != pid) try members.append(self.gpa, fallback_id);
         }
 
         const member_strs = try formatIds(self.gpa, members.items);
@@ -2188,6 +2195,43 @@ test "revoke：hikari:chain 集合意外为空时兜底用原始 id 完成撤稿
         // 兜底只把 fallback_id（12345 自己）纳入清理，所以最后这条 DEL 只有
         // 两个 key：它自己的 chainmember 键 + chain 集合本身，不是三个成员。
         "*3\r\n$3\r\nDEL\r\n$24\r\nhikari:chainmember:12345\r\n$18\r\nhikari:chain:12345\r\n",
+    });
+}
+
+test "revoke：链集合为空且撤的是非主键成员时，兜底必须连主键一起清理" {
+    const gpa = std.testing.allocator;
+    // 撤的是成员 2，它映射到主键 1；SMEMBERS hikari:chain:1 意外为空。
+    // 兜底如果只纳入 fallback_id（2），下面那条 DEL hikari:quote:1 就会把
+    // 主键的 hash 删掉，而主键 1 仍然留在 hikari:index / bylen / byuser 里
+    // ——正是 revokeSingleLocked 注释里点名"永远不会自愈"的那个悬空 id：
+    // randomAny 抽中它、HGETALL 回空，一个非空的库对外返回 404。
+    const script = "$1\r\n1\r\n" ++ "*0\r\n" ++ "$5\r\n10001\r\n" ++ ":1\r\n:1\r\n:1\r\n:1\r\n:1\r\n:1\r\n";
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    try store.revoke(2);
+
+    c.deinit();
+    srv.stop();
+
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$20\r\nhikari:chainmember:2\r\n",
+        "*2\r\n$8\r\nSMEMBERS\r\n$14\r\nhikari:chain:1\r\n",
+        "*3\r\n$4\r\nHGET\r\n$14\r\nhikari:quote:1\r\n$7\r\nuser_id\r\n",
+        // 主键 1 和原始 id 2 都要进 tombstone 与三个索引的清理。
+        "*4\r\n$4\r\nSADD\r\n$11\r\nhikari:tomb\r\n$1\r\n1\r\n$1\r\n2\r\n",
+        "*4\r\n$4\r\nSREM\r\n$12\r\nhikari:index\r\n$1\r\n1\r\n$1\r\n2\r\n",
+        "*4\r\n$4\r\nZREM\r\n$12\r\nhikari:bylen\r\n$1\r\n1\r\n$1\r\n2\r\n",
+        "*4\r\n$4\r\nZREM\r\n$19\r\nhikari:byuser:10001\r\n$1\r\n1\r\n$1\r\n2\r\n",
+        "*2\r\n$3\r\nDEL\r\n$14\r\nhikari:quote:1\r\n",
+        "*4\r\n$3\r\nDEL\r\n$20\r\nhikari:chainmember:1\r\n$20\r\nhikari:chainmember:2\r\n$14\r\nhikari:chain:1\r\n",
     });
 }
 
