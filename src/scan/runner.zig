@@ -967,26 +967,94 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_sec
     return .{ .start = win.start, .commit_at = run_at };
 }
 
-/// 把这一轮允许提交的 lastrun 再往回压到"最早一条探针失败的消息"的时刻。
+/// 这一轮有引用目标彻底解析不了时，lastrun 该顶在哪个时刻。没有则 null。
 ///
-/// 探针（get_msg）连着失败两次时，那条消息挂没挂 ✨ / 🔥 这一轮无从得知；
-/// 若照常把 lastrun 推到 run_at，下一轮的窗口就从它后面开始，这条语录永远
-/// 不会再被看到——一次网络抖动换一条永久丢失。
+/// `outcome.unresolved` 里最要命的是 💦：一条撤稿指令的目标解析不了，旧行为
+/// 只打一条 warn，lastrun 照常前移，下一轮的窗口从它后面开始——这条 💦 就
+/// **永久**丢失了。丢一条语录只是少收一句；丢一条撤稿是一句本该下架的话继续
+/// 挂在公开 API 上，性质严重得多（design.md 反复强调"💦 只会被看到一次"）。
 ///
-/// 这里不做"重探队列"，而是顶住窗口：🔥 链的归并和 💨 的补丁判定都依赖这条
-/// 消息在窗口里的邻居，单独把一个 message_id 捞回来重探会脱离上下文、改变
-/// 分类语义。顶住窗口则让下一轮把它连同邻居一起重新覆盖，判定逻辑一个字
-/// 都不用改；重复覆盖的部分由 exists / tombstone / chainmember 各自挡掉。
+/// 顶在**窗口里那条发出指令的消息**的时刻上，而不是解析不了的目标本身——
+/// 目标的时刻正因为解析不了而无从得知，而下一轮只要窗口重新盖住这条 💦，
+/// 整条指令就会被原样重放一次。
 ///
-/// 最坏情况是有界的：某条消息永久探不到时，窗口起点钉在它那里逐日变长，
-/// 到 7 天上限被 clamp 跳过并告警，届时自愈。期间收录照常进行。
-fn commitAfterProbeHold(plan_commit: ?i64, earliest_failed_probe: ?i64) ?i64 {
-    // 本来就不许推进（--last 接不上、getLastRun 读失败）时，探针失败无从加码。
+/// 两种找法，对应 classify 记录 unresolved 的两类来源：
+///
+///   - 窗口里某条消息**直接**引用了这个 id；
+///   - 窗口里某条消息引用的目标（在 pool 里）本身是一条 ✨ 触发消息 / 管理员
+///     `✨ @某人` 命令，而它的一跳终点解析不了。这是 💦 的常见形状：语录是
+///     几天前收录的，那条 ✨ 只在 pool 里（靠 get_msg 回补），不在窗口里，
+///     所以必须顺着 `rules.triggerTarget` 找回发指令的那条。
+///
+/// 取所有命中里最早的一条：下一轮的窗口要能同时盖住它们全部。
+///
+/// 与 `commitAfterHold` 同样的有界性论证：某个目标永久解析不了（消息被
+/// 真正删除、超出 NapCat 的缓存）时，窗口起点钉在指令那里逐日变长，到 7 天
+/// 上限被 clamp 跳过并告警，届时自愈。选顶窗口而不是干脆判这个群失败，正是
+/// 为了避免"永远卡住"——那是 design.md 点名要躲开的那种 bug 形状。
+fn unresolvedHold(
+    window: []const onebot.Message,
+    pool: []const onebot.Message,
+    unresolved: []const i64,
+    p: rules.Params,
+) ?i64 {
+    if (unresolved.len == 0) return null;
+
+    var earliest: ?i64 = null;
+    for (window) |m| {
+        const rid = m.replyTarget() orelse continue;
+        const hit = blk: {
+            if (containsId(unresolved, rid)) break :blk true;
+            for (pool) |candidate| {
+                if (candidate.message_id != rid) continue;
+                const hop = rules.triggerTarget(candidate, p) orelse break;
+                break :blk containsId(unresolved, hop);
+            }
+            break :blk false;
+        };
+        if (!hit) continue;
+        earliest = if (earliest) |cur| @min(cur, m.time) else m.time;
+    }
+    return earliest;
+}
+
+fn containsId(ids: []const i64, id: i64) bool {
+    for (ids) |x| if (x == id) return true;
+    return false;
+}
+
+/// 把这一轮允许提交的 lastrun 再往回压到 `hold`——"这个时刻起的窗口必须被
+/// 下一轮重新覆盖一次"。
+///
+/// 目前有两个来源，都是"这一轮有件事没看清楚，而窗口一滑过去就再也没机会了"：
+///
+///   - 表情探针（`get_msg`）连着失败两次：那条消息挂没挂 ✨/🔥 无从得知，
+///     照常前移的话这条语录永远不会再被看到——一次网络抖动换一条永久丢失。
+///   - 引用目标彻底解析不了（`unresolvedHold`）：最要命的是 💦，一条撤稿
+///     指令就此蒸发，一句本该下架的话继续挂在公开 API 上。
+///
+/// 两者都不做"重试队列"，而是顶住窗口：🔥 链的归并、💨 的补丁判定、💦 的
+/// 一跳都依赖这条消息在窗口里的上下文，单独把一个 message_id 捞回来重放会
+/// 脱离上下文、改变语义。顶住窗口则让下一轮把它连同邻居一起重新覆盖，判定
+/// 逻辑一个字都不用改；重复覆盖的部分由 exists / tombstone / chainmember
+/// 三道既有关卡各自挡掉。
+///
+/// 最坏情况是有界的：某件事永久看不清楚时，窗口起点钉在那里逐日变长，到 7 天
+/// 上限被 clamp 跳过并告警，届时自愈。期间收录照常进行。
+fn commitAfterHold(plan_commit: ?i64, hold: ?i64) ?i64 {
+    // 本来就不许推进（--last 接不上、getLastRun 读失败）时，这里无从加码。
     const commit = plan_commit orelse return null;
-    const failed = earliest_failed_probe orelse return commit;
-    // 取较小者：失败消息的时间戳理论上一定 < run_at，但时间戳来自群消息、
-    // 不可全信，拿 min 兜住，绝不让这条路径反过来把 lastrun 推得更远。
-    return @min(commit, failed);
+    const held = hold orelse return commit;
+    // 取较小者：hold 理论上一定 < run_at，但它来自群消息的时间戳、不可全信，
+    // 拿 min 兜住，绝不让这条路径反过来把 lastrun 推得更远。
+    return @min(commit, held);
+}
+
+/// 两个 hold 来源合流：都为 null 才是 null，否则取更早的那个。
+fn mergeHold(a: ?i64, b: ?i64) ?i64 {
+    const x = a orelse return b;
+    const y = b orelse return x;
+    return @min(x, y);
 }
 
 /// `--last <duration>` 这一轮的计划。窗口起点完全由参数决定（这正是这个开关
@@ -1072,8 +1140,8 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
         pushLine(a, &lines, gid, processing_line);
 
         const plan = resolveWindowStart(deps.st, gid, run_at, options.lookback_seconds);
-        var probe_hold: ?i64 = null;
-        const ok = scanGroup(deps, a, &lines, gid, plan.start, run_at, &probe_hold) catch |e| catch_blk: {
+        var window_hold: ?i64 = null;
+        const ok = scanGroup(deps, a, &lines, gid, plan.start, run_at, &window_hold) catch |e| catch_blk: {
             const msg = failedLine(a, @errorName(e)) catch {
                 // 格式化 Failed 行本身失败（理论上只会是 arena 背后的 gpa
                 // OOM）：不能因此中断整个 runOnce——那样会连带跳过其余尚未
@@ -1086,16 +1154,17 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
             pushLine(a, &lines, gid, msg);
             break :catch_blk false;
         };
-        const commit_at = commitAfterProbeHold(plan.commit_at, probe_hold);
+        const commit_at = commitAfterHold(plan.commit_at, window_hold);
         // 顶住窗口这件事本身要看得见。它的代价是下一轮窗口变长；稳态窗口长度
-        // 约等于（每轮双重失败数 + 1）天，撞到 4.1 节的 7 天上限才会被 clamp
-        // 跳过。这条 warn 就是运维判断"每轮几条"的唯一入口：偶尔一条无所谓，
-        // 天天几条说明 NapCat 侧在持续吃不消，该去查那边而不是等 clamp 兜底。
+        // 约等于（每轮顶窗口的事件数 + 1）天，撞到 4.1 节的 7 天上限才会被
+        // clamp 跳过。这条 warn 就是运维判断这个数的唯一入口：偶尔一次无所谓，
+        // 天天几次说明 NapCat 侧在持续吃不消，该去查那边而不是等 clamp 兜底。
+        // 具体是探针失败还是引用目标解析不了，各自在发生的地方已经打过一条。
         if (ok) {
             if (plan.commit_at) |planned| {
                 if (commit_at) |actual| {
                     if (actual < planned) std.log.warn(
-                        "group {d}: reaction probe failure holds lastrun at {d} instead of {d} ({d}s earlier); next run rescans from there so the unprobed message gets another chance",
+                        "group {d}: holding lastrun at {d} instead of {d} ({d}s earlier) because something in this window could not be read; the next run rescans from there",
                         .{ gid, actual, planned, planned - actual },
                     );
                 }
@@ -1157,9 +1226,9 @@ fn scanGroup(
     win_start: i64,
     win_end: i64,
     /// 出参：这一轮探针失败的消息里最早的那条的时刻，没有失败则保持 null。
-    /// 由调用方喂给 commitAfterProbeHold，把 lastrun 顶在它前面，让下一轮的
+    /// 由调用方喂给 commitAfterHold，把 lastrun 顶在它前面，让下一轮的
     /// 窗口重新覆盖这条消息及其邻居。
-    probe_hold: *?i64,
+    window_hold: *?i64,
 ) !bool {
     // `a` 与 `lines` 由 runOnce 传入并拥有——它们的寿命跨过这次调用本身
     // （包括这次调用以 `try` 错误告终的情形），理由见 runOnce 里对应注释。
@@ -1352,12 +1421,10 @@ fn scanGroup(
             //
             // 但被观察成员的消息是另一回事：探不到就不知道它挂没挂 ✨/🔥，
             // 而窗口一旦滑过去这条语录就永远不会再被看到。记下最早的一条，
-            // 让 commitAfterProbeHold 把 lastrun 顶在它前面——下一轮连同它的
+            // 让 commitAfterHold 把 lastrun 顶在它前面——下一轮连同它的
             // 邻居一起重扫，🔥 链与 💨 补丁的判定才有完整上下文。
             // 只探 💤 的非观察成员不参与顶窗口，理由见上一段。
-            if (observed) {
-                probe_hold.* = if (probe_hold.*) |cur| @min(cur, m.time) else m.time;
-            }
+            if (observed) window_hold.* = mergeHold(window_hold.*, m.time);
             continue;
         };
         var matched = false;
@@ -1432,6 +1499,13 @@ fn scanGroup(
 
     for (outcome.unresolved) |rid| {
         std.log.warn("group {d}: reply target {d} unresolvable", .{ gid, rid });
+    }
+    // 解析不了的引用目标同样顶住窗口。最要命的是 💦：旧行为只打上面那条
+    // warn、lastrun 照常前移，下一轮窗口从它后面开始，这条撤稿指令就此永久
+    // 蒸发，一句本该下架的话继续挂在公开 API 上。顶住之后下一轮会把这条指令
+    // 连同它的上下文重新盖一遍，NapCat 的瞬时抖动因此只是推迟、不是丢失。
+    if (unresolvedHold(window.items, pool.items, outcome.unresolved, rule_params)) |at| {
+        window_hold.* = mergeHold(window_hold.*, at);
     }
 
     // ---- 6. 作废先落盘 ----
@@ -2393,24 +2467,87 @@ test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口�
     try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null).start);
 }
 
-test "commitAfterProbeHold：探针失败时把 lastrun 顶在最早那条失败消息处，不让它跳过去" {
+// unresolvedHold 的测试夹具。跟 rules.zig 里的同名辅助一样用 comptime 形参，
+// 理由见那边的长注释：`&.{...}` 的存储要归属于编译期常量而不是某次调用的栈帧。
+fn holdReplyMsg(comptime id: i64, comptime uid: u64, comptime at: i64, comptime target: i64, comptime txt: []const u8) onebot.Message {
+    return .{
+        .message_id = id,
+        .user_id = uid,
+        .time = at,
+        .segments = &.{ .{ .reply = target }, .{ .text = txt } },
+    };
+}
+
+fn holdTextMsg(comptime id: i64, comptime uid: u64, comptime at: i64, comptime txt: []const u8) onebot.Message {
+    return .{
+        .message_id = id,
+        .user_id = uid,
+        .time = at,
+        .segments = &.{.{ .text = txt }},
+    };
+}
+
+test "unresolvedHold：💦 的目标解析不了时，顶在那条 💦 自己的时刻上" {
+    const p: rules.Params = .{ .observed_qqs = &.{10001}, .admin_qqs = &.{20001} };
+    const window = [_]onebot.Message{
+        holdTextMsg(1, 10001, 1_700_000_000, "普通聊天"),
+        holdReplyMsg(2, 20001, 1_700_000_500, 999, "💦"),
+    };
+    // 999 既不在窗口里也没能靠 get_msg 回补 → classify 记进 unresolved。
+    // 顶在 💦 那条（1_700_000_500）而不是 999：999 的时刻无从得知，而下一轮
+    // 只要窗口重新盖住这条 💦，撤稿就会被原样重放一次。
+    try std.testing.expectEqual(
+        @as(?i64, 1_700_000_500),
+        unresolvedHold(&window, &window, &.{999}, p),
+    );
+}
+
+test "unresolvedHold：一跳落空时顶在窗口里那条 💦 上——中间那条 ✨ 是几天前的，不在窗口里" {
+    const p: rules.Params = .{ .observed_qqs = &.{10001}, .admin_qqs = &.{20001} };
+    // 这是 💦 一跳的真实形状（见步骤 3 的注释）：语录是几天前收录的，管理员
+    // 今天看到它才回群里 💦，所以那条 ✨ 触发消息只在 pool 里（靠 get_msg
+    // 回补），不在窗口里。classify 记进 unresolved 的是一跳的终点 999——
+    // 窗口里没有任何一条消息**直接**引用它，只能顺着 triggerTarget 找回来。
+    const trigger = holdReplyMsg(2, 30001, 1_699_000_000, 999, "✨");
+    const window = [_]onebot.Message{holdReplyMsg(3, 20001, 1_700_000_900, 2, "💦")};
+    const pool = [_]onebot.Message{ trigger, window[0] };
+    try std.testing.expectEqual(
+        @as(?i64, 1_700_000_900),
+        unresolvedHold(&window, &pool, &.{999}, p),
+    );
+}
+
+test "unresolvedHold：没有解析不了的目标时不顶窗口；多条时取最早的一条" {
+    const p: rules.Params = .{ .observed_qqs = &.{10001}, .admin_qqs = &.{20001} };
+    const window = [_]onebot.Message{
+        holdReplyMsg(2, 20001, 1_700_000_800, 998, "💦"),
+        holdReplyMsg(3, 20001, 1_700_000_300, 999, "💦"),
+    };
+    try std.testing.expectEqual(@as(?i64, null), unresolvedHold(&window, &window, &.{}, p));
+    try std.testing.expectEqual(
+        @as(?i64, 1_700_000_300),
+        unresolvedHold(&window, &window, &.{ 998, 999 }, p),
+    );
+}
+
+test "commitAfterHold：探针失败时把 lastrun 顶在最早那条失败消息处，不让它跳过去" {
     const run_at: i64 = 1_700_100_000;
     const failed_at: i64 = run_at - 7200;
 
     // 没有探针失败：照常推进到 run_at。
-    try std.testing.expectEqual(@as(?i64, run_at), commitAfterProbeHold(run_at, null));
+    try std.testing.expectEqual(@as(?i64, run_at), commitAfterHold(run_at, null));
 
     // 有探针失败：只能推进到那条消息的时刻——它的 ✨ 这一轮没被看到，
     // 窗口必须留着它，下一轮才能连同它的邻居一起重新覆盖（🔥 链与 💨
     // 补丁的判定都依赖邻居，所以顶住窗口比单独重探那一条更正确）。
-    try std.testing.expectEqual(@as(?i64, failed_at), commitAfterProbeHold(run_at, failed_at));
+    try std.testing.expectEqual(@as(?i64, failed_at), commitAfterHold(run_at, failed_at));
 
     // 本来就不许推进（--last 接不上、getLastRun 读失败）时，探针失败改变不了结论。
-    try std.testing.expectEqual(@as(?i64, null), commitAfterProbeHold(null, failed_at));
-    try std.testing.expectEqual(@as(?i64, null), commitAfterProbeHold(null, null));
+    try std.testing.expectEqual(@as(?i64, null), commitAfterHold(null, failed_at));
+    try std.testing.expectEqual(@as(?i64, null), commitAfterHold(null, null));
 
     // 失败的消息比 run_at 还新（时钟漂移之类）：取较小者，绝不倒退成前移。
-    try std.testing.expectEqual(@as(?i64, run_at), commitAfterProbeHold(run_at, run_at + 500));
+    try std.testing.expectEqual(@as(?i64, run_at), commitAfterHold(run_at, run_at + 500));
 }
 
 test "resolveWindowStart：getLastRun 读失败时不许推进 lastrun，否则一次读抖动会留下永久空洞" {
@@ -3543,6 +3680,77 @@ test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成
     try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 2 messages.") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
+}
+
+test "runOnce：💦 的目标解析不了时顶住 lastrun，这条撤稿指令下一轮还有机会重放" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const revoke_msg_time: i64 = 1_700_050_000;
+
+    // GET lastrun(nil) → SET groupname → SET lastrun。多给两条 +OK 富余，
+    // 少一条会让失败表现成 ReadFailed 而不是一句清楚的断言失败。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 管理员 💦 了一条几天前的消息（999），而 999 既不在窗口里、get_msg 也
+    // 连着两次回补失败。旧行为：打一条 "reply target 999 unresolvable" 的
+    // warn，lastrun 照常推到 run_at，下一轮窗口从它后面开始——这条撤稿指令
+    // 就此永久蒸发，那句本该下架的话继续挂在公开 API 上。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":3,\"user_id\":20001,\"time\":1700050000,\"message\":[" ++
+            "{\"type\":\"reply\",\"data\":{\"id\":\"999\"}},{\"type\":\"text\",\"data\":{\"text\":\"💦\"}}" ++
+            "]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{20001},
+        .group_ids = &.{81},
+        .get_msg_retry_delay_ns = 0,
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    const held = try std.fmt.allocPrint(gpa, "{d}", .{revoke_msg_time});
+    defer gpa.free(held);
+    const expected = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:81", held });
+    defer gpa.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, expected) != null);
+
+    const wrong = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:81", "1700100000" });
+    defer gpa.free(wrong);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, wrong) == null);
 }
 
 test "runOnce：🔥 桥由非观察成员发出时链仍要跨过去——探针不能只盖被观察者" {
