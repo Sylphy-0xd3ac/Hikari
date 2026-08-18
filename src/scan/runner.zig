@@ -1086,7 +1086,22 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
             pushLine(a, &lines, gid, msg);
             break :catch_blk false;
         };
-        applyLastRun(deps.st, gid, ok, commitAfterProbeHold(plan.commit_at, probe_hold));
+        const commit_at = commitAfterProbeHold(plan.commit_at, probe_hold);
+        // 顶住窗口这件事本身要看得见。它的代价是下一轮窗口变长；稳态窗口长度
+        // 约等于（每轮双重失败数 + 1）天，撞到 4.1 节的 7 天上限才会被 clamp
+        // 跳过。这条 warn 就是运维判断"每轮几条"的唯一入口：偶尔一条无所谓，
+        // 天天几条说明 NapCat 侧在持续吃不消，该去查那边而不是等 clamp 兜底。
+        if (ok) {
+            if (plan.commit_at) |planned| {
+                if (commit_at) |actual| {
+                    if (actual < planned) std.log.warn(
+                        "group {d}: reaction probe failure holds lastrun at {d} instead of {d} ({d}s earlier); next run rescans from there so the unprobed message gets another chance",
+                        .{ gid, actual, planned, planned - actual },
+                    );
+                }
+            }
+        }
+        applyLastRun(deps.st, gid, ok, commit_at);
 
         // 不管这一轮是正常收尾还是在 scanGroup 中途被 catch 住，lines 里已经
         // 排队的内容都要发出去：哪怕只排进了横幅四行就崩了，群里也会看到那
@@ -1306,13 +1321,30 @@ fn scanGroup(
     // 更直接，见 probeSummaryLine 的说明。
     const probe_started_ms = std.time.milliTimestamp();
     var probed_count: usize = 0;
+    // 上一条被探过的窗口消息带没带 🔥。没探过的一律按"没带"处理——这跟
+    // buildChains 的读法一致：不知道就等于连续段在这里断掉。
+    var prev_has_fire = false;
     for (window.items) |m| {
         const observed = probe_params.isObserved(m.user_id);
         const sleep_anchor = rules.sleepAnchor(m, probe_params);
         // 配置了观察子集时管理员可能不在集合里；单独 💤 是控制锚点，仍必须
         // 探测它的回应，否则这条命令会随配置不同而静默失效。
-        if (!observed and !sleep_anchor) continue;
+        //
+        // 第三种要探的：上一条带着 🔥，那这一条可能是**桥**。design.md §4.4
+        // 说桥可以是任何人发的——它存在的全部理由就是让一条链跨过别人的插话。
+        // 只探被观察者的话，配了 OBSERVED_QQS 的生产环境里跨人桥接会静默失效
+        // （路人那条永远进不了 fire_ids，carriesFire 判 false，链在这里断成
+        // 两条碎句），而观察全员时 isObserved 恒真、这条路径看起来一直是好的。
+        //
+        // 只在"紧跟一条 🔥 之后"才多探一次，而不是无差别探整个窗口：额外开销
+        // 因此正比于真实的链延续尝试次数（连续几座桥会一座接一座地把条件传下去），
+        // 而不是群里的聊天总量。生产上一个窗口 2300 次探针，无差别探会翻好几倍。
+        if (!observed and !sleep_anchor and !prev_has_fire) {
+            prev_has_fire = false;
+            continue;
+        }
         probed_count += 1;
+        prev_has_fire = false;
         const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: reaction probe for message {d} failed", .{ gid, m.message_id });
             // 控制效果必须以"本人回应已确认"为准。任何探针失败都按未确认
@@ -1329,15 +1361,20 @@ fn scanGroup(
             continue;
         };
         var matched = false;
-        if (observed) {
-            if (napcat.hasStarReaction(data)) {
-                try star_ids.append(a, m.message_id);
-                matched = true;
-            }
-            if (napcat.hasFireReaction(data)) {
-                try fire_ids.append(a, m.message_id);
-                matched = true;
-            }
+        // ✨ 只对被观察者有意义：它是"这句话值得收录"的标记，而非观察成员的
+        // 消息不该因为被点了 ✨ 就变成一条语录（isChainContent 与路径1都另外
+        // 查了作者，这里不放进 star_ids 是把这条约束提前到探针层，省得下游
+        // 每处都要重判一遍）。
+        if (observed and napcat.hasStarReaction(data)) {
+            try star_ids.append(a, m.message_id);
+            matched = true;
+        }
+        // 🔥 相反，是**作者无关**的：carriesFire 只问"这条消息带没带 🔥"，
+        // 内容成员的作者要求由 isChainContent 单独把关。桥正是靠这一条成立的。
+        if (napcat.hasFireReaction(data)) {
+            try fire_ids.append(a, m.message_id);
+            prev_has_fire = true;
+            matched = true;
         }
         if (napcat.hasSleepReaction(data)) {
             matched = true;
@@ -3506,6 +3543,90 @@ test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成
     try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 2 messages.") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
+}
+
+test "runOnce：🔥 桥由非观察成员发出时链仍要跨过去——探针不能只盖被观察者" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+
+    // Redis 侧的形状跟上面那个 🔥 链测试完全一样：链有两个内容成员（1 和 3），
+    // 中间那条路人插话是桥，正文不进语录、不进 members，也就不产生任何额外
+    // 的 Redis 往返。
+    const redis_srv = try FakeServer.start(
+        gpa,
+        "$-1\r\n+OK\r\n:0\r\n:0\r\n$-1\r\n+OK\r\n:1\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n+OK\r\n",
+    );
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 关键在第 5 次调用：对 message_id=2（user_id=99999，**不在**
+    // OBSERVED_QQS 里）的 get_msg 探测。design.md §4.4 明确写着"桥可以是任何
+    // 人发的，这正是它存在的理由——它让一条链跨过别人的插话"，可旧代码的探针
+    // 循环开头就 `if (!observed and !sleep_anchor) continue`，路人那条永远进
+    // 不了 fire_ids，于是 carriesFire 判 false、连续段在这里断掉，两句话退回
+    // 两条独立语录。配了 OBSERVED_QQS 才会踩到：观察全员时 isObserved 恒真，
+    // 这条路径看起来一直是好的。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"你们有钱\"}}]}," ++
+            "{\"message_id\":2,\"user_id\":99999,\"time\":1700050001,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"哈哈哈\"}}]}," ++
+            "{\"message_id\":3,\"user_id\":10001,\"time\":1700050002,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"你们潇洒\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1},{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        // 桥：只有 🔥，没有 ✨——它的正文不该进语录，但它必须让连续段走下去。
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[{\"emoji_id\":\"10024\",\"likes_cnt\":1},{\"emoji_id\":\"128293\",\"likes_cnt\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"晴\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{},
+        .group_ids = &.{79},
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    const received = redis_srv.received.items;
+    // 1 和 3 并成一条链：两个内容成员各有一条映射，桥（2）没有——它的正文
+    // 从来不在这条语录里，映射它会让一次 💦 桥变成撤掉别人语录的开关。
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chainmember:1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chainmember:3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chainmember:2") == null);
+    try std.testing.expect(std.mem.indexOf(u8, received, "hikari:chain:1") != null);
+
+    // 桥确实被探了一次：9 次调用而不是 8 次。
+    try std.testing.expectEqual(@as(usize, 9), nap_srv.bodies.items.len);
+    const forward = nap_srv.bodies.items[8];
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 3 messages.") != null);
+    // 一条语录，不是两条碎句——桥的"哈哈哈"也没混进正文。
+    try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
 }
 
 test "runOnce：isChainMember 拦下一个已属于其它链的候选——即便它这次单独满足路径1格式" {
