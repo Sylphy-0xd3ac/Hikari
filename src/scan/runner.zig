@@ -904,12 +904,26 @@ fn ocrMessage(deps: Deps, arena: std.mem.Allocator, group_id: u64, m: onebot.Mes
 /// 读起来是"扫、然后按结果决定写不写"这一步一步，二是让这条"失败的群不写、
 /// 成功的群写"的规则能绕开 scanGroup（依赖真实 NapCat HTTP，测试环境起不来）
 /// 直接单测：只需要一个 *Store，不需要一整套 Deps/NapCat。
-fn applyLastRun(st: *store.Store, group_id: u64, ok: bool, run_at: i64) void {
+fn applyLastRun(st: *store.Store, group_id: u64, ok: bool, commit_at: ?i64) void {
     if (!ok) return;
-    st.setLastRun(group_id, run_at) catch |e| {
+    const at = commit_at orelse return;
+    st.setLastRun(group_id, at) catch |e| {
         std.log.warn("group {d}: setLastRun failed: {s}", .{ group_id, @errorName(e) });
     };
 }
+
+/// `resolveWindowStart` 的返回值：这一轮要扫的窗口起点，以及这一轮成功之后
+/// 允许把 `hikari:lastrun:{group_id}` 推进到哪个时刻。
+///
+/// 两者必须一起算、不能各算各的。`lastrun` 的语义是"这个时刻之前的消息都已经
+/// 被检查过了"，所以只有当这一轮的窗口跟上一次扫到的位置**接得上**时，推进它
+/// 才是真话。接不上还照推，那段空隙就再也不会被任何一次扫描覆盖——里面的
+/// 💦 撤稿只会被看到一次，等于永久丢失。
+const WindowPlan = struct {
+    start: i64,
+    /// null = 这一轮不许推进 lastrun（哪怕扫描本身成功）。
+    commit_at: ?i64,
+};
 
 /// 单个群这一轮扫描窗口的起点：读它自己的 `hikari:lastrun:{group_id}`交给
 /// `scheduler.windowStart` 算。抽成独立函数的理由跟 applyLastRun 一样——
@@ -922,21 +936,26 @@ fn applyLastRun(st: *store.Store, group_id: u64, ok: bool, run_at: i64) void {
 ///
 /// `clamped`（停机跨度超过 7 天回看上限）也在这里报警：那一段里的 💦
 /// 撤稿指令永久不可恢复，运营方需要知道是哪个群、丢了哪一段时间。
-fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_seconds: ?i64) i64 {
+fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_seconds: ?i64) WindowPlan {
     if (lookback_seconds) |seconds| {
         std.log.info(
-            "group {d}: --last forces a {d}s lookback window; stored lastrun is not read for this run",
+            "group {d}: --last forces a {d}s lookback window; stored lastrun does not size this run's window",
             .{ group_id, seconds },
         );
-        return run_at - seconds;
+        return forcedWindowPlan(st, group_id, run_at, seconds);
     }
 
-    const last_run = st.getLastRun(group_id) catch |e| blk: {
+    const last_run = st.getLastRun(group_id) catch |e| {
+        // 读失败仍然扫（退化成固定 24h 窗口，总比整个群跳过强），但**不推进
+        // lastrun**：真正的 lastrun 可能远早于 24h 前，推进它就把中间那段
+        // 永久跳过去了，一次瞬时读抖动会变成永久的空洞，里面的 💦 撤稿只会
+        // 被看到一次。不推进的代价只是下一轮重扫一遍这 24h，而重扫是幂等的
+        // （tombstone / exists / isChainMember 三道关卡）。
         std.log.warn(
-            "group {d}: getLastRun failed ({s}); falling back to a fixed 24h window instead of the real catch-up span since last run",
+            "group {d}: getLastRun failed ({s}); scanning a fixed 24h window instead of the real catch-up span, and NOT advancing lastrun — the next run will retry from the stored value",
             .{ group_id, @errorName(e) },
         );
-        break :blk null;
+        return .{ .start = run_at - 86400, .commit_at = null };
     };
     const win = scheduler.windowStart(run_at, last_run);
     if (win.clamped) {
@@ -945,7 +964,47 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_sec
             .{ group_id, run_at - last_run.?, scheduler.max_lookback_seconds, win.start, last_run.?, win.start },
         );
     }
-    return win.start;
+    return .{ .start = win.start, .commit_at = run_at };
+}
+
+/// `--last <duration>` 这一轮的计划。窗口起点完全由参数决定（这正是这个开关
+/// 的意义），真正需要判断的是"扫完之后能不能推进 lastrun"。
+///
+/// 能推进的前提是这个强制窗口跟上一次扫到的位置**接得上**（`last >= start`）。
+/// 接不上就原地不动：否则 `[last, start)` 这一段会被永久跳过，而它里面的
+/// 💦 撤稿只会被看到一次。这是个很容易踩到的现实场景——停机几天之后随手跑
+/// 一句 `hikari run --last 1h` 确认服务还活着，就足以把几天的待补扫窗口连同
+/// 里面的撤稿一起抹掉，而且不会有任何提示。
+fn forcedWindowPlan(st: *store.Store, group_id: u64, run_at: i64, seconds: i64) WindowPlan {
+    const start = run_at - seconds;
+
+    const last_run = st.getLastRun(group_id) catch |e| {
+        std.log.warn(
+            "group {d}: --last: getLastRun failed ({s}); scanning the forced window but NOT advancing lastrun — cannot tell whether that would skip an unscanned span",
+            .{ group_id, @errorName(e) },
+        );
+        return .{ .start = start, .commit_at = null };
+    };
+
+    const last = last_run orelse {
+        // 从未跑过：强制窗口之前的历史全都没检查过，推进 lastrun 等于宣称
+        // 它们已经检查过了。让后续的定时扫描照常自己算窗口。
+        std.log.info(
+            "group {d}: --last: no stored lastrun for this group; scanning the forced window without advancing lastrun",
+            .{group_id},
+        );
+        return .{ .start = start, .commit_at = null };
+    };
+
+    if (last < start) {
+        std.log.warn(
+            "group {d}: --last: the forced window starts at {d} but this group was only scanned up to {d} — the span [{d}, {d}) ({d}s) has NOT been examined, so lastrun is left untouched; run without --last (or with a longer duration) to actually catch up",
+            .{ group_id, start, last, last, start, start - last },
+        );
+        return .{ .start = start, .commit_at = null };
+    }
+
+    return .{ .start = start, .commit_at = run_at };
 }
 
 /// 跑一次完整扫描。失败不抛出，改为在日志里发 Failed 行。
@@ -990,8 +1049,8 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
         for (banner) |line| pushLine(a, &lines, gid, line);
         pushLine(a, &lines, gid, processing_line);
 
-        const win_start = resolveWindowStart(deps.st, gid, run_at, options.lookback_seconds);
-        const ok = scanGroup(deps, a, &lines, gid, win_start, run_at) catch |e| catch_blk: {
+        const plan = resolveWindowStart(deps.st, gid, run_at, options.lookback_seconds);
+        const ok = scanGroup(deps, a, &lines, gid, plan.start, run_at) catch |e| catch_blk: {
             const msg = failedLine(a, @errorName(e)) catch {
                 // 格式化 Failed 行本身失败（理论上只会是 arena 背后的 gpa
                 // OOM）：不能因此中断整个 runOnce——那样会连带跳过其余尚未
@@ -1004,7 +1063,7 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
             pushLine(a, &lines, gid, msg);
             break :catch_blk false;
         };
-        applyLastRun(deps.st, gid, ok, run_at);
+        applyLastRun(deps.st, gid, ok, plan.commit_at);
 
         // 不管这一轮是正常收尾还是在 scanGroup 中途被 catch 住，lines 里已经
         // 排队的内容都要发出去：哪怕只排进了横幅四行就崩了，群里也会看到那
@@ -2217,7 +2276,7 @@ test "resolveWindowStart：正常回补——窗口起点就是 Redis 里的 las
     defer c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(last_run, resolveWindowStart(&st, 100, run_at, null));
+    try std.testing.expectEqual(last_run, resolveWindowStart(&st, 100, run_at, null).start);
 }
 
 test "resolveWindowStart：Redis 里没有这个群的键（nil）→ 退化成固定 24h 窗口" {
@@ -2233,7 +2292,7 @@ test "resolveWindowStart：Redis 里没有这个群的键（nil）→ 退化成�
     defer c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null));
+    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null).start);
 }
 
 test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口，不让这个群直接崩" {
@@ -2251,7 +2310,28 @@ test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口�
     c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null));
+    try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null).start);
+}
+
+test "resolveWindowStart：getLastRun 读失败时不许推进 lastrun，否则一次读抖动会留下永久空洞" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const srv = try FakeServer.start(gpa, "$10\r\n1699840800\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    // 真实的 lastrun 可能远早于 24h 前（比如停机五天）。读不到就退化成 24h
+    // 窗口是对的——总比整个群跳过强；但如果这一轮还照常把 lastrun 推到
+    // run_at，中间那几天就再也不会被任何一次扫描覆盖，里面的 💦 撤稿只会被
+    // 看到一次，等于永久丢失。不推进的代价只是下一轮重扫一遍这 24h，而重扫
+    // 是幂等的。
+    try std.testing.expectEqual(@as(?i64, null), resolveWindowStart(&st, 100, run_at, null).commit_at);
 }
 
 test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clamped 的 warn 只影响日志，不影响返回值）" {
@@ -2272,12 +2352,14 @@ test "resolveWindowStart：停机超过 7 天上限 → 截断到上限（clampe
     defer c.deinit();
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - scheduler.max_lookback_seconds, resolveWindowStart(&st, 100, run_at, null));
+    try std.testing.expectEqual(run_at - scheduler.max_lookback_seconds, resolveWindowStart(&st, 100, run_at, null).start);
 }
 
-test "resolveWindowStart：--last 强制使用指定窗口且完全不读取 Redis lastrun" {
+test "resolveWindowStart：--last 的窗口起点完全由参数决定，存量 lastrun 不参与" {
     const gpa = std.testing.allocator;
     const run_at: i64 = 1_700_100_000;
+    // 空脚本：连 lastrun 都读不出来（EndOfStream），窗口起点依然是参数算的那个。
+    // 读 lastrun 只用来判断"能不能推进"，从不参与窗口大小。
     const srv = try FakeServer.start(gpa, "");
     defer {
         srv.stop();
@@ -2287,11 +2369,70 @@ test "resolveWindowStart：--last 强制使用指定窗口且完全不读取 Red
     var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
     var st = store.Store.init(gpa, &c);
 
-    try std.testing.expectEqual(run_at - 3 * 3600, resolveWindowStart(&st, 100, run_at, 3 * 3600));
+    try std.testing.expectEqual(run_at - 3 * 3600, resolveWindowStart(&st, 100, run_at, 3 * 3600).start);
 
     c.deinit();
     srv.stop();
-    try std.testing.expectEqual(@as(usize, 0), srv.received.items.len);
+}
+
+test "resolveWindowStart：--last 的窗口跟存量 lastrun 接不上时，扫但不推进 lastrun" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    // 这个群只扫到 1699000000（约 12.7 天前），而 --last 1h 的窗口从
+    // run_at-3600 开始。中间那一大段从来没被检查过，推进 lastrun 就等于
+    // 宣称它已经检查过了——停机几天后随手跑一句 `hikari run --last 1h`
+    // 确认服务还活着，就足以把整个待补扫窗口连同里面的 💦 一起抹掉。
+    const srv = try FakeServer.start(gpa, "$10\r\n1699000000\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    const plan = resolveWindowStart(&st, 100, run_at, 3600);
+    // 窗口本身仍然完全由 --last 决定，不受 lastrun 影响。
+    try std.testing.expectEqual(run_at - 3600, plan.start);
+    try std.testing.expectEqual(@as(?i64, null), plan.commit_at);
+}
+
+test "resolveWindowStart：--last 的窗口覆盖得住存量 lastrun 时，照常推进" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    // 上次扫到 30 分钟前，--last 1h 的窗口把它整个包住：没有任何未检查的
+    // 空隙，推进 lastrun 是真话。
+    const srv = try FakeServer.start(gpa, "$10\r\n1700098200\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    const plan = resolveWindowStart(&st, 100, run_at, 3600);
+    try std.testing.expectEqual(run_at - 3600, plan.start);
+    try std.testing.expectEqual(@as(?i64, run_at), plan.commit_at);
+}
+
+test "resolveWindowStart：--last 且这个群从未跑过时，不推进 lastrun" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const srv = try FakeServer.start(gpa, "$-1\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    // 强制窗口之前的历史全都没扫过，推进 lastrun 等于宣称它们检查过了。
+    try std.testing.expectEqual(@as(?i64, null), resolveWindowStart(&st, 100, run_at, 3600).commit_at);
 }
 
 // ---------------------------------------------------------------------------

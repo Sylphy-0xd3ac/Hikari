@@ -134,8 +134,12 @@ QQ 表情回应有两类：`emoji_type=1` 是 QQ 系统表情（id 为两三位�
 **显式重扫命令**：`hikari run --last <时长>` 只对这一次调用覆盖窗口起点，不读各群的
 `hikari:lastrun:{group_id}`；例如 `--last 3h` 得到 `[now-3h, now)`，`--last 24h` 得到
 `[now-24h, now)`。时长接受正整数 `m`/`h`/`d`，最大 7 天（与上面的安全回看上限相同）；零、负数、
-小数、无单位或超限都在连接 Redis/NapCat 前拒绝。它既不删除也不临时改写旧进度，只在各群本轮
-成功后沿用 `runOnce` 的统一收尾，把 `lastrun` 写到本次 `now`。重扫是幂等补漏：候选依次经过
+小数、无单位或超限都在连接 Redis/NapCat 前拒绝。它既不删除也不临时改写旧进度。
+
+`lastrun` 的写回是有条件的：本轮成功**且**强制窗口跟该群已扫到的位置接得上（`last_run >= now-时长`）
+时才写到本次 `now`；接不上则保持原值并打警告。否则 `[last_run, now-时长)` 这一段会被永久跳过——
+停机五天后跑一句 `--last 1h`，那五天连同其中的 💦 撤稿就再也不会被检查。同理，`getLastRun` 读失败
+时退化成 24h 窗口照常扫，但也不推进 `lastrun`，避免一次瞬时读抖动留下永久空洞。重扫是幂等补漏：候选依次经过
 `hikari:tomb`、`hikari:index` 与 `hikari:chainmember:*` 三道既有去重关卡，已经收录、已经作废或
 已经并入 🔥 链的消息都只计 `skipped`，不会生成重复语录。
 
@@ -715,7 +719,7 @@ src/
 - 纯图片或个人/商城表情候选 → 使用 URL 调本机 OCR；image 与原生 mface 都能取得图源，NapCat 裸文件名跳过；有可用识别文本则收录，多图/多行按顺序换行，否则仍按 empty skip。无图源的内置 face 仍直接 skip
 - `at` 段有 / 无 `name` 字段
 - 中文长度按码点计算
-- `hikari run --last`：`1m`/`1h`/`24h`/`7d` 正确换算；坏单位、零/负数/小数、超 7 天和多余参数拒绝；强制窗口不发 `GET hikari:lastrun:*`，成功后仍发 `SET hikari:lastrun:*`
+- `hikari run --last`：`1m`/`1h`/`24h`/`7d` 正确换算；坏单位、零/负数/小数、超 7 天和多余参数拒绝；强制窗口的起点不受存量 `lastrun` 影响；接得上时成功后发 `SET hikari:lastrun:*`，接不上／键为 nil／读失败时不发
 - `.env`：缺文件不报错；空行/注释/`export`/单双引号可用；`$VAR` 保持字面量；文件内后值覆盖前值，进程 env 再覆盖文件值；坏 key、未闭合引号与引号后垃圾拒绝
 - `hikari import --user <qq> <file>`：`--user` 缺失/非法/多余参数在联网前拒绝；显式 QQ 在 `OBSERVED_QQS` 为空时仍正确写进 `user_id` 与 `hikari:byuser:{qq}`；归属查询失败时零写入
 - 路径 4：两条 / 三条相邻内容消息合并为一条，正文空格拼接，成员不再各自单独入选路径1
