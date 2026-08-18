@@ -12,9 +12,12 @@ pub const Error = error{
     StreamTooLong,
 };
 
-/// 传输层失败：连接本身不可信了（socket 断了，或者读缓冲里可能卡着半条回复）。
-/// 跟服务端正常回的 -ERR（RedisError）、以及分配失败（OutOfMemory）严格区分开：
-/// 只有这一类才触发拆连接重拨。
+/// 传输层失败：连接断了或对端没反应，重拨一次有希望恢复。这个判据只决定
+/// **要不要重试**，不决定要不要拆连接——command() 对 roundTrip 的任何一种
+/// 失败都会先无条件 teardown（理由见那里：帧边界一旦不确定就只能丢连接）。
+/// 分配失败（OutOfMemory）因此仍然不在这一类里：它会拆连接但不会被重放，
+/// 原地重试大概率还是同样的结果。服务端正常回的 -ERR（RedisError）压根不
+/// 走这条路径，它是一条完整读完的回复。
 ///
 /// `error.ReadFailed` 已经覆盖了 SO_RCVTIMEO 触发的接收超时，不需要再加一支
 /// 专门的 `error.Timeout` 分支：SO_RCVTIMEO 到期时内核对阻塞 socket 的 read()
@@ -212,13 +215,24 @@ pub const Client = struct {
         if (!self.connected) try self.dial();
 
         return self.roundTrip(payload) catch |e| {
-            if (!isTransportFailure(e)) return e;
+            // 先无条件拆连接，再决定要不要重试：这两件事的判据不一样。
+            //
+            // roundTrip 的任何一种失败都可能已经从流里吃掉了半条回复，
+            // 最典型的是 OutOfMemory——readValue 读 bulk string 时先把
+            // `$N\r\n` 这一行消费掉，再 alloc(N)，所以分配失败的那一刻头
+            // 已经没了、body 还在 socket 里。留着这条连接的话，下一条命令
+            // 读到的是上一条的残留：commandInt 会把它当成自己的回复，而
+            // commandOk 只要不是 .err 就算成功，于是"写失败"会被报成写成功。
+            // 帧边界一旦不确定，唯一安全的做法就是丢掉这条连接。
             self.teardown();
+            // 重试只给传输层失败：OutOfMemory 这类失败原地重放大概率还是
+            // 同样的结果，且它不是"连接坏了"，没有靠重拨恢复的道理。
+            if (!isTransportFailure(e)) return e;
             // 重拨失败就把 ConnectionFailed 交给调用方（原始错误已经在这里丢了，
             // 但两者语义一致：这条命令没做成，连接也没了）。
             try self.dial();
             return self.roundTrip(payload) catch |e2| {
-                if (isTransportFailure(e2)) self.teardown();
+                self.teardown();
                 return e2;
             };
         };
@@ -293,6 +307,36 @@ const FakeServer = struct {
         self.thread.join();
     }
 };
+
+test "回复读到一半分配失败：连接必须被拆掉，不能带着错位的流继续用" {
+    const gpa = std.testing.allocator;
+    // 服务端只回一个 bulk 头，宣称后面跟着 1MB。readValue 会先把 `$1000000\r\n`
+    // 这一行从流里吃掉，再去 alloc——所以分配失败的那一刻，头已经没了、body
+    // 还在 socket 里。此时如果不拆连接，下一条命令读到的就是这段残留：
+    // commandInt 会把它当成自己的回复，而 commandOk 只要不是 .err 就算成功，
+    // 于是扫描器会以为语录写进去了。
+    const srv = try FakeServer.start(gpa, "$1000000\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+
+    var c = try Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+
+    // 把分配器换成一个只够编码命令、装不下 1MB 回复体的定长分配器。
+    // 换回来之后 deinit 才能用原分配器释放 read_buf/write_buf/host。
+    var scratch: [4096]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&scratch);
+    const real_gpa = c.gpa;
+    c.gpa = fba.allocator();
+    const result = c.command(&.{"PING"});
+    c.gpa = real_gpa;
+
+    try std.testing.expectError(error.OutOfMemory, result);
+    try std.testing.expect(!c.connected);
+}
 
 test "connect 不带密码不带 db 时不发 AUTH / SELECT" {
     const gpa = std.testing.allocator;

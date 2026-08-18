@@ -381,6 +381,43 @@ WantedBy=multi-user.target
 journalctl -u hikari -f
 ```
 
+### 持久化与备份
+
+语录不可再生：扫描窗口有 7 天回看硬上限，💦 撤稿是一次性的，丢了就是丢了。所以数据库必须开
+AOF，只靠默认的 RDB 快照规则（`save 3600 1 300 100 60 10000`）最坏会丢掉近一小时的写入：
+
+```bash
+valkey-cli config set appendonly yes
+valkey-cli config rewrite   # 写回 /etc/valkey/valkey.conf，重启后仍然生效
+valkey-cli info persistence | grep -E "aof_enabled|aof_last_write_status"
+```
+
+RDB 快照保留着，作为 AOF 之外的第二层。
+
+定时备份用仓库里的 `deploy/` 三件套，每天 04:30 导出一份全量 RDB 到 `/var/backups/hikari`，
+保留最近 14 份：
+
+```bash
+sudo install -m 0755 deploy/hikari-backup.sh /usr/local/bin/hikari-backup.sh
+sudo install -m 0644 deploy/hikari-backup.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now hikari-backup.timer
+sudo systemctl start hikari-backup.service   # 立刻跑一次，别等到明天才发现装错了
+```
+
+备份脚本走 `valkey-cli --rdb`，让服务端现场生成快照通过连接传回来，不依赖读数据目录的权限，
+也不跟服务端自己的 BGSAVE 抢文件。装完之后验一次副本是否真的可读——没验证过的备份不算备份：
+
+```bash
+sudo valkey-check-rdb /var/backups/hikari/hikari-*.rdb   # 末尾应报 "RDB looks OK!" 与键数
+```
+
+恢复：停掉 Hikari 与 Valkey，把选中的备份复制成 `/var/lib/valkey/dump.rdb`，**并把 AOF 目录
+（`appenddirname`，默认 `appendonlydir`）移开**——AOF 存在时 Valkey 优先从它加载，不移开的话
+恢复的 RDB 会被忽略，看起来像"恢复没生效"。启动 Valkey 确认键数正确后再启动 Hikari。
+
+这套是**同机**备份：能扛住 FLUSHALL、误删和文件损坏，扛不住磁盘或整机损失。异地副本需要另外
+指定目的地（另一台机器的 rsync 目标、对象存储等），目前没有配置。
+
 ## 开发
 
 ```bash

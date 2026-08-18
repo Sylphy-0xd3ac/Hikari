@@ -1,0 +1,12 @@
+[Unit]
+Description=Hikari Valkey dataset backup (daily)
+
+[Timer]
+# 04:30 跑：错开 03:00 的语录扫描，让备份落在当天收录已经写完之后。
+OnCalendar=*-*-* 04:30:00
+# 机器在计划时间点没开机时，开机后补跑一次——单机部署经常整夜关机。
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target

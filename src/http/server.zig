@@ -19,10 +19,15 @@ pub const Server = struct {
     /// 就一直不发请求行的连接，会让 receiveHead 永久阻塞，整个公开 API 停摆
     /// （Slowloris，一条连接就够）。有了它，静默连接最多占住这么久就会被踢掉，
     /// 循环继续接下一条。测试里调小以便快速验证。
-    ///
-    /// 只设收方向、不设发方向：响应体都在几 KB 以内，塞得进内核发送缓冲区，
-    /// 写不会阻塞；真正的暴露面在读。
     recv_timeout_s: u32 = 10,
+    /// 已 accept 连接的发送超时（秒）。曾经这里只设收方向，理由是"响应体都在
+    /// 几 KB 以内，塞得进内核发送缓冲区，写不会阻塞"——这个前提对 /extra/all
+    /// 不成立：289 条语录每条 13 个字段，序列化出来约 100KB，远超发送缓冲区。
+    /// 一个发完请求就不再读的客户端会让对端接收窗口关闭，respond 里的 write
+    /// 永久阻塞；而本服务是串行 accept 的，于是整个公开 API 停摆到有人重启
+    /// 为止，且没有超时、没有报错、没有日志。同仓库 napcat.zig 的 socket 一直
+    /// 是两个方向都设的，这里是漏了，不是权衡。
+    send_timeout_s: u32 = 10,
 
     pub fn listen(
         gpa: std.mem.Allocator,
@@ -56,25 +61,31 @@ pub const Server = struct {
         }
     }
 
-    /// 给已 accept 的连接装上 SO_RCVTIMEO。设置失败不致命：拿不到超时保护也
-    /// 比直接拒绝这条连接强，记一行警告继续处理。
-    fn setRecvTimeout(self: *Server, sock: std.posix.socket_t) void {
-        const tv: std.posix.timeval = .{ .sec = @intCast(self.recv_timeout_s), .usec = 0 };
-        std.posix.setsockopt(
-            sock,
-            std.posix.SOL.SOCKET,
-            std.posix.SO.RCVTIMEO,
-            std.mem.asBytes(&tv),
-        ) catch |e| {
-            std.log.warn("http: could not set SO_RCVTIMEO: {s}", .{@errorName(e)});
+    /// 给已 accept 的连接装上 SO_RCVTIMEO 与 SO_SNDTIMEO。设置失败不致命：
+    /// 拿不到超时保护也比直接拒绝这条连接强，记一行警告继续处理。
+    fn setSocketTimeouts(self: *Server, sock: std.posix.socket_t) void {
+        const opts = .{
+            .{ std.posix.SO.RCVTIMEO, self.recv_timeout_s, "SO_RCVTIMEO" },
+            .{ std.posix.SO.SNDTIMEO, self.send_timeout_s, "SO_SNDTIMEO" },
         };
+        inline for (opts) |o| {
+            const tv: std.posix.timeval = .{ .sec = @intCast(o[1]), .usec = 0 };
+            std.posix.setsockopt(
+                sock,
+                std.posix.SOL.SOCKET,
+                o[0],
+                std.mem.asBytes(&tv),
+            ) catch |e| {
+                std.log.warn("http: could not set {s}: {s}", .{ o[2], @errorName(e) });
+            };
+        }
     }
 
     /// 供测试单步驱动：只 accept 一次、处理一个请求就返回。
     pub fn serveOnce(self: *Server) !void {
         const conn = try self.listener.accept();
         defer conn.stream.close();
-        self.setRecvTimeout(conn.stream.handle);
+        self.setSocketTimeouts(conn.stream.handle);
 
         var rbuf: [8192]u8 = undefined;
         var wbuf: [8192]u8 = undefined;
@@ -571,6 +582,37 @@ test "静默客户端撞上接收超时，serveOnce 出错返回而不是永久�
     defer sock.close();
 
     try std.testing.expectError(error.ReadFailed, srv.serveOnce());
+}
+
+test "已 accept 的连接收发两个方向都装上超时，不只是收方向" {
+    const gpa = std.testing.allocator;
+    const fake = try FakeRedis.start(gpa, &[_][]const u8{});
+    defer {
+        fake.stop();
+        fake.destroy(gpa);
+    }
+    var client = try redis.Client.connect(gpa, "127.0.0.1", fake.listener.listen_address.getPort(), null, 0);
+    defer client.deinit();
+    var st = store.Store.init(gpa, &client);
+
+    var srv = try Server.listen(gpa, &st, "127.0.0.1", 0);
+    defer srv.deinit();
+    srv.recv_timeout_s = 7;
+    srv.send_timeout_s = 9;
+
+    const sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
+    defer std.posix.close(sock);
+    srv.setSocketTimeouts(sock);
+
+    // 发方向是这里的重点：/extra/all 在 289 条语录时约 100KB，远超发送缓冲区，
+    // 一个连上来发完请求就不再读的客户端会让 respond 里的 write 永久阻塞。
+    // 服务是串行 accept 的，于是整个公开 API 停摆到有人重启为止。
+    var tv: std.posix.timeval = undefined;
+    try std.posix.getsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.SNDTIMEO, std.mem.asBytes(&tv));
+    try std.testing.expectEqual(@as(@TypeOf(tv.sec), 9), tv.sec);
+
+    try std.posix.getsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv));
+    try std.testing.expectEqual(@as(@TypeOf(tv.sec), 7), tv.sec);
 }
 
 test "GET / 返回 hitokoto JSON" {
