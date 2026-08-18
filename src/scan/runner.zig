@@ -700,28 +700,41 @@ fn resolveAtNames(
 /// 作废指令漏掉就永远不会被重看一次。
 pub const Page = struct {
     msgs: []onebot.Message,
-    stop: ?[]const u8,
+    stop: ?PageStop,
 };
 
 /// 从 get_group_msg_history 的 data 与解析出的条数，判断"这一页为什么不能再往前翻"。
 /// null 表示这一页正常。抽成纯函数是为了能单测：翻页截断的可见性正是 I3 的全部内容，
 /// 而 fetchPage 本身要发 HTTP，测不了。
-pub fn pageStopReason(data: std.json.Value, parsed_len: usize) ?[]const u8 {
+/// 翻页在这一页停下的原因，以及这个停法算不算"已经把窗口看完了"。
+///
+/// 两者必须分开：`reached_start` 为 true 的停法是**正常收尾**（再往前没有
+/// 消息了），false 的是**窗口没被完整覆盖**——后者意味着更早的那一段连同
+/// 其中只会被看到一次的 💦 这一轮完全没被检查过，scanGroup 据此既打警告
+/// 又顶住 lastrun，不让窗口滑过去。
+pub const PageStop = struct {
+    reason: []const u8,
+    reached_start: bool,
+};
+
+pub fn pageStopReason(data: std.json.Value, parsed_len: usize) ?PageStop {
     const obj = switch (data) {
         .object => |o| o,
-        else => return "get_group_msg_history reply was not an object",
+        else => return .{ .reason = "get_group_msg_history reply was not an object", .reached_start = false },
     };
     const arr = obj.get("messages") orelse
-        return "get_group_msg_history reply has no messages field";
+        return .{ .reason = "get_group_msg_history reply has no messages field", .reached_start = false };
     if (parsed_len > 0) return null;
     const raw_len: usize = switch (arr) {
         .array => |items| items.items.len,
-        else => return "get_group_msg_history messages field is not an array",
+        else => return .{ .reason = "get_group_msg_history messages field is not an array", .reached_start = false },
     };
     return if (raw_len == 0)
-        "empty page (reached the start of the group's history)"
+        // 空页 = 这个群的历史到头了，再往前**没有**消息。窗口是被完整覆盖过的，
+        // 哪怕它的起点比这个群的第一条消息还早。
+        .{ .reason = "empty page (reached the start of the group's history)", .reached_start = true }
     else
-        "page carried messages but none of them could be parsed";
+        .{ .reason = "page carried messages but none of them could be parsed", .reached_start = false };
 }
 
 fn fetchPage(
@@ -1290,8 +1303,9 @@ fn scanGroup(
 
     while (guard < 200) : (guard += 1) {
         const page = try fetchPage(deps, a, gid, before);
-        if (page.stop) |why| {
-            stop_reason = why;
+        if (page.stop) |stop| {
+            stop_reason = stop.reason;
+            if (stop.reached_start) reached_start = true;
             break;
         }
         try pool.appendSlice(a, page.msgs);
@@ -1327,9 +1341,21 @@ fn scanGroup(
     // 所以这里必须留下可见的痕迹，而不是安静地按截断后的结果报 Successfully in Ns.。
     if (!reached_start) {
         std.log.warn(
-            "group {d}: history window NOT fully covered — stopped after {d} page(s) with {d} message(s) pooled, before reaching window start {d}; reason: {s}. Messages and 💦 revocations older than this run's oldest page were never examined and will not be revisited.",
+            "group {d}: history window NOT fully covered — stopped after {d} page(s) with {d} message(s) pooled, before reaching window start {d}; reason: {s}. Holding lastrun at the window start so the next run re-covers the whole span.",
             .{ gid, pages, pool.items.len, win_start, stop_reason },
         );
+        // 顶回窗口起点。旧行为是只打上面这条警告、lastrun 照常推到 run_at，
+        // 而警告正文自己就写着"漏掉的那一段永远不会被重扫，里面的 💦 不可
+        // 恢复"——警告再响也拦不住数据丢失，何况这一段从来没被人看过，连
+        // "丢了什么"都不知道。
+        //
+        // 顶在 win_start 而不是"这一轮拉到的最老一条"：没覆盖到的正是
+        // [win_start, 最老一条) 这一段，顶在最老一条上等于把它原样再跳一次。
+        //
+        // 有界性由既有的 7 天回看上限提供：lastrun 不前进时 win_start 会随
+        // `scheduler.windowStart` 的 clamp 一起往前挪，所以持续覆盖不全的群
+        // 最多每轮重扫 7 天，并在 clamp 生效时另有一条明确告警。
+        window_hold.* = mergeHold(window_hold.*, win_start);
     }
 
     // ---- 2. 切出判定集 ----
@@ -2105,34 +2131,31 @@ test "pageStopReason 区分「翻到头了」与「响应看不懂」" {
 
     // 正常页：能继续翻
     try std.testing.expectEqual(
-        @as(?[]const u8, null),
+        @as(?PageStop, null),
         pageStopReason(try jsonVal(a, "{\"messages\":[{}]}"), 1),
     );
 
-    // 空数组 = 群历史到头了，属于正常收尾
-    try std.testing.expectEqualStrings(
-        "empty page (reached the start of the group's history)",
-        pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0).?,
-    );
+    // 空数组 = 群历史到头了，属于正常收尾。reached_start 必须为 true：
+    // 再往前**没有**消息了，这一轮的窗口是被完整覆盖过的。判成 false 的话
+    // 每个历史比窗口还短的小群都会天天挨一条"NOT fully covered"的假警报，
+    // 而且下面那条顶住 lastrun 的规则会把它永久钉在原地。
+    const empty = pageStopReason(try jsonVal(a, "{\"messages\":[]}"), 0).?;
+    try std.testing.expectEqualStrings("empty page (reached the start of the group's history)", empty.reason);
+    try std.testing.expectEqual(true, empty.reached_start);
 
-    // 下面三种都是"响应看不懂"，跟到头了必须能分辨——原先它们全都退化成同一个
-    // `&.{}`，日志里看不出区别，而这三种意味着窗口没被完整覆盖。
-    try std.testing.expectEqualStrings(
-        "page carried messages but none of them could be parsed",
-        pageStopReason(try jsonVal(a, "{\"messages\":[{\"nope\":1},{\"nope\":2}]}"), 0).?,
-    );
-    try std.testing.expectEqualStrings(
-        "get_group_msg_history reply has no messages field",
-        pageStopReason(try jsonVal(a, "{\"data\":[]}"), 0).?,
-    );
-    try std.testing.expectEqualStrings(
-        "get_group_msg_history reply was not an object",
-        pageStopReason(try jsonVal(a, "[]"), 0).?,
-    );
-    try std.testing.expectEqualStrings(
-        "get_group_msg_history messages field is not an array",
-        pageStopReason(try jsonVal(a, "{\"messages\":\"nope\"}"), 0).?,
-    );
+    // 下面四种都是"响应看不懂"，跟到头了必须能分辨——原先它们全都退化成同一个
+    // `&.{}`，日志里看不出区别，而这四种意味着窗口没被完整覆盖。
+    const cases = [_]struct { src: []const u8, reason: []const u8 }{
+        .{ .src = "{\"messages\":[{\"nope\":1},{\"nope\":2}]}", .reason = "page carried messages but none of them could be parsed" },
+        .{ .src = "{\"data\":[]}", .reason = "get_group_msg_history reply has no messages field" },
+        .{ .src = "[]", .reason = "get_group_msg_history reply was not an object" },
+        .{ .src = "{\"messages\":\"nope\"}", .reason = "get_group_msg_history messages field is not an array" },
+    };
+    for (cases) |c| {
+        const got = pageStopReason(try jsonVal(a, c.src), 0).?;
+        try std.testing.expectEqualStrings(c.reason, got.reason);
+        try std.testing.expectEqual(false, got.reached_start);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -3774,6 +3797,77 @@ test "runOnce：🔥链候选走 addChain，Redis 收到成员映射 + chain 成
     try std.testing.expect(std.mem.indexOf(u8, forward, "Will process 2 messages.") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Added 1 messages, skipped 0 messages (existing 0, tombstoned 0, chain member 0, target missing 0, empty 0).") != null);
     try std.testing.expect(std.mem.indexOf(u8, forward, "Successfully in") != null);
+}
+
+test "runOnce：翻页没覆盖完窗口时顶住 lastrun，不让漏掉的那一段被宣布为已扫" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    // lastrun 未命中 → 固定 24h 窗口。
+    const win_start: i64 = run_at - 86400;
+
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n+OK\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 第二页回了一条谁也解析不了的东西 → pageStopReason 判"page carried
+    // messages but none of them could be parsed"，reached_start 保持 false。
+    // 也就是说 [win_start, 1700050000) 这一段这一轮**完全没被看过**。
+    //
+    // 旧行为：打一条很响的 "history window NOT fully covered" 警告，然后照常
+    // 把 lastrun 推到 run_at——那条警告的正文自己都写着"漏掉的那一段永远不会
+    // 被重扫，里面的 💦 不可恢复"。警告再响也拦不住数据丢失。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[" ++
+            "{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"半夜的一句\"}}]}" ++
+            "]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[{\"nope\":1}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"emoji_likes_list\":[]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":1,\"res_id\":\"x\",\"forward_id\":\"x\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{},
+        .group_ids = &.{82},
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    // lastrun 顶回窗口起点：下一轮从同一个起点重新覆盖整段。窗口长度受 7 天
+    // 上限约束，所以持续覆盖不全时它也只会长到 7 天就被 clamp 跳过并告警。
+    const held = try std.fmt.allocPrint(gpa, "{d}", .{win_start});
+    defer gpa.free(held);
+    const expected = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:82", held });
+    defer gpa.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, expected) != null);
+
+    const wrong = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:82", "1700100000" });
+    defer gpa.free(wrong);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, wrong) == null);
 }
 
 test "runOnce：💦 的目标解析不了时顶住 lastrun，这条撤稿指令下一轮还有机会重放" {
