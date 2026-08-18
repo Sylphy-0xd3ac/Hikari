@@ -1,0 +1,12 @@
+[Unit]
+Description=Hikari Valkey dataset backup
+Documentation=https://github.com/Sylphy-0xd3ac/Hikari
+# 数据库没起来就没什么可备份的，直接不跑，不留一份空快照。
+Requires=valkey.service
+After=valkey.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hikari-backup.sh
+# 备份目录归 root，脚本只写这一处。
+UMask=0077
