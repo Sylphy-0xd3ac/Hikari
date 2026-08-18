@@ -94,10 +94,24 @@ pub const Message = struct {
 };
 
 /// NapCat 的数字字段有时是 number 有时是 string，两种都接受。
+///
+/// `.float` 一支必须先验范围再转：`@intFromFloat` 在目标类型装不下时是
+/// 安全检查触发的 panic，不是可捕获的错误，而这里的输入全部来自 NapCat
+/// （再往上是任意 QQ 用户）。std.json 把任何带 `.`/`e`/`E` 的数字都交给
+/// parseFloat，只有非有限值才退回 `.number_string`，所以 `1e19` 这种
+/// "有限但装不进 i64" 的写法会原样以 `.float` 到达这里——不验范围的话，
+/// 任意一个数字字段这么回一次就能把整个守护进程连同 HTTP 一起打崩。
+///
+/// 边界用 ±2^63 的字面量而不是 `maxInt(i64)`：后者转成 f64 会向上舍入到
+/// 2^63，把恰好等于 2^63 的输入放进来，正好是会 panic 的那个值。NaN 和
+/// ±inf 在这组比较里一律为假，自然落到 null。
 pub fn asInt(v: std.json.Value) ?i64 {
     return switch (v) {
         .integer => |i| i,
-        .float => |f| @intFromFloat(f),
+        .float => |f| if (f >= -9223372036854775808.0 and f < 9223372036854775808.0)
+            @intFromFloat(f)
+        else
+            null,
         .string => |s| std.fmt.parseInt(i64, std.mem.trim(u8, s, ws), 10) catch null,
         else => null,
     };
@@ -252,6 +266,33 @@ test "user_id 与 message_id 可以是字符串" {
     try std.testing.expectEqual(@as(i64, 7), m.message_id);
     try std.testing.expectEqual(@as(u64, 10001), m.user_id);
     try std.testing.expectEqual(@as(i64, 100), m.time);
+}
+
+test "asInt：超出 i64 范围的浮点数返回 null，不是让 @intFromFloat 把进程打崩" {
+    // std.json 把带 . / e / E 的数字一律走 parseFloat，只有非有限值才退回
+    // .number_string。所以 1e19 这种"有限但装不进 i64"的写法会以 .float
+    // 到达这里，未检查的 @intFromFloat 在 ReleaseSafe 下是直接 panic——
+    // NapCat 任意一个数字字段这么回一次，整个守护进程连同 HTTP 一起死。
+    try std.testing.expectEqual(@as(?i64, null), asInt(.{ .float = 1e19 }));
+    try std.testing.expectEqual(@as(?i64, null), asInt(.{ .float = -1e19 }));
+    try std.testing.expectEqual(@as(?i64, null), asInt(.{ .float = std.math.inf(f64) }));
+    try std.testing.expectEqual(@as(?i64, null), asInt(.{ .float = std.math.nan(f64) }));
+}
+
+test "asInt：范围内的浮点数照常取整数部分" {
+    try std.testing.expectEqual(@as(?i64, 7), asInt(.{ .float = 7.0 }));
+    try std.testing.expectEqual(@as(?i64, -7), asInt(.{ .float = -7.9 }));
+}
+
+test "parseMessage：message_id 是超范围浮点数时整条消息被丢弃" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const parsed = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"message_id":1e19,"user_id":10001,"time":100,"message":[]}
+    , .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(?Message, null), try parseMessage(a, parsed.value));
 }
 
 test "at 段一律渲染成带 QQ 号的占位，NapCat 附带的群展示名进不了正文" {
