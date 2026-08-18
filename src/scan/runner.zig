@@ -221,10 +221,26 @@ pub fn inWindow(t: i64, start: i64, end: i64) bool {
     return t >= start and t < end;
 }
 
+/// 这条消息的时间戳能不能用来定位它。
+///
+/// `onebot.parseMessage` 在 `time` 缺失或解析不了时填 0（那里的 `orelse 0`）。
+/// 0 必然早于任何真实的窗口起点，所以放任它参与"这一页最老是什么时候"的判断，
+/// 一条坏消息就能让翻页在**第一页**认定已经翻到窗口起点、再拉一页缓冲就收工
+/// ——连"history window NOT fully covered"那条警告都不会打，更早的那一段
+/// （连同其中只会被看到一次的 💦）就此永久跳过，而群里照报 Successfully in Ns.。
+///
+/// 真实的 QQ 群消息不可能来自 1970 年及更早，所以 `time <= 0` 一律当"这条的
+/// 时间戳不可用"处理。
+fn hasUsableTime(m: onebot.Message) bool {
+    return m.time > 0;
+}
+
 pub fn oldestTime(msgs: []const onebot.Message) ?i64 {
-    if (msgs.len == 0) return null;
-    var lo = msgs[0].time;
-    for (msgs[1..]) |m| lo = @min(lo, m.time);
+    var lo: ?i64 = null;
+    for (msgs) |m| {
+        if (!hasUsableTime(m)) continue;
+        lo = if (lo) |cur| @min(cur, m.time) else m.time;
+    }
     return lo;
 }
 
@@ -233,14 +249,18 @@ pub fn oldestTime(msgs: []const onebot.Message) ?i64 {
 /// （下一页的 message_seq）就可能因为并列消息里挑中了不是最老的那条
 /// 而漏掉同一秒内排在它前面的消息。
 pub fn oldestId(msgs: []const onebot.Message) ?i64 {
-    if (msgs.len == 0) return null;
-    var best = msgs[0];
-    for (msgs[1..]) |m| {
-        if (m.time < best.time or (m.time == best.time and m.message_id < best.message_id)) {
+    var best: ?onebot.Message = null;
+    for (msgs) |m| {
+        // 时间戳不可用的消息不能当锚点：它按 (time, id) 排序会一路排到最前面，
+        // 把翻页方向锚在一条位置未知的消息上。理由同 hasUsableTime。
+        if (!hasUsableTime(m)) continue;
+        const cur = best orelse {
             best = m;
-        }
+            continue;
+        };
+        if (m.time < cur.time or (m.time == cur.time and m.message_id < cur.message_id)) best = m;
     }
-    return best.message_id;
+    return if (best) |m| m.message_id else null;
 }
 
 /// 群消息的统一时间顺序：先按秒级时间戳，再按 message_id 打破同秒并列。
@@ -763,6 +783,20 @@ fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
     );
 }
 
+/// 一页里出现时间戳不可用的消息时逐条点名。这类消息既进不了判定窗口
+/// （`inWindow(0, ...)` 恒假），也不参与翻页锚点（见 `hasUsableTime`），
+/// 也就是说它对这一轮完全不存在——如果它恰好是一条 💦，那条撤稿指令就丢了。
+/// 不打这一条的话，整个现象在日志上跟"这条消息压根没发过"一模一样。
+fn warnUnusableTimes(gid: u64, msgs: []const onebot.Message) void {
+    for (msgs) |m| {
+        if (hasUsableTime(m)) continue;
+        std.log.warn(
+            "group {d}: message {d} carries no usable timestamp (time={d}); it is excluded from this run's window and from pagination anchoring",
+            .{ gid, m.message_id, m.time },
+        );
+    }
+}
+
 /// 单次 get_msg 调用，失败**恰好重试一次**——policy 跟 redis.Client.command 的
 /// "传输层失败拆连接重拨、只重试一次"是同一个纪律：生产实测显示这类失败是
 /// 跟同一时间窗口内其它 NapCat 调用挤在一起造成的瞬时拥堵，不是消息真的没了
@@ -1262,6 +1296,7 @@ fn scanGroup(
         }
         try pool.appendSlice(a, page.msgs);
         logPage(gid, pages, page.msgs);
+        warnUnusableTimes(gid, page.msgs);
         pages += 1;
 
         const oldest = oldestTime(page.msgs) orelse {
@@ -2233,6 +2268,49 @@ test "oldestId 取最早那条的 message_id" {
 
 test "oldestId 空切片返回 null" {
     try std.testing.expectEqual(@as(?i64, null), oldestId(&.{}));
+}
+
+// ---------------------------------------------------------------------------
+// time 缺失/解析不了时 onebot.parseMessage 会填 0（见那边的 `orelse 0`）。0 必然
+// 早于任何真实窗口起点，所以翻页会在**第一页**就认定"已经翻到窗口起点了"，
+// 再多拉一页缓冲就收工，reached_start 为 true——连"history window NOT fully
+// covered"那条警告都不会打。这个群窗口里更早的那一段（连同其中只会被看到
+// 一次的 💦）就此永久跳过，而日志上一切正常、群里照报 Successfully in Ns.。
+//
+// 真实的 QQ 群消息不可能来自 1970 年，所以 time <= 0 一律当"这条的时间戳不
+// 可用"处理：它不参与选最老时间，也不参与选翻页锚点。整页都不可用时两个函数
+// 都返回 null，翻页循环里既有的两个 break 会带着各自的 stop_reason 收尾，
+// 警告照打。
+
+test "oldestTime：时间戳不可用（<= 0）的消息不参与选最老，否则一条坏消息会假装翻到了窗口起点" {
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = 1, .time = 300, .segments = &.{} },
+        .{ .message_id = 2, .user_id = 1, .time = 0, .segments = &.{} },
+        .{ .message_id = 3, .user_id = 1, .time = 200, .segments = &.{} },
+    };
+    try std.testing.expectEqual(@as(?i64, 200), oldestTime(&msgs));
+
+    // 整页都不可用 → null，翻页循环据此打 "page carried no usable timestamp"
+    // 并保持 reached_start 为 false，于是 NOT fully covered 警告照常出现。
+    const all_bad = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = 1, .time = 0, .segments = &.{} },
+        .{ .message_id = 2, .user_id = 1, .time = -5, .segments = &.{} },
+    };
+    try std.testing.expectEqual(@as(?i64, null), oldestTime(&all_bad));
+}
+
+test "oldestId：翻页锚点同样跳过时间戳不可用的消息" {
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 10, .user_id = 1, .time = 300, .segments = &.{} },
+        // 它的 time 是 0，按 (time, id) 排序会被选成最老的那条，翻页锚点
+        // 就此落在一条位置未知的消息上，往前翻的方向整个乱掉。
+        .{ .message_id = 20, .user_id = 1, .time = 0, .segments = &.{} },
+        .{ .message_id = 30, .user_id = 1, .time = 200, .segments = &.{} },
+    };
+    try std.testing.expectEqual(@as(?i64, 30), oldestId(&msgs));
+
+    const all_bad = [_]onebot.Message{.{ .message_id = 20, .user_id = 1, .time = 0, .segments = &.{} }};
+    try std.testing.expectEqual(@as(?i64, null), oldestId(&all_bad));
 }
 
 test "oldestId 时间并列时按 message_id 取最小者，与输入顺序无关" {
