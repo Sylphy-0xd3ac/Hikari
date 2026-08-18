@@ -1,6 +1,7 @@
 const std = @import("std");
 const runner = @import("scan/runner.zig");
 const store = @import("store.zig");
+const atname = @import("atname.zig");
 
 const ws = " \t\r\n";
 
@@ -136,7 +137,7 @@ pub fn formatSummary(gpa: std.mem.Allocator, s: Summary) ![]u8 {
 /// exists() 还是 false）。
 fn importLine(
     deps: runner.Deps,
-    text: []const u8,
+    raw_text: []const u8,
     from: []const u8,
     from_who: []const u8,
     group_id: u64,
@@ -146,6 +147,19 @@ fn importLine(
     now: i64,
     summary: *Summary,
 ) !void {
+    // 文件的一行也是外部输入。存储文本里的 `atname` 占位只能由真正的 at 段
+    // 产生（渲染时会被展开成 `@某人`），而 import 这条路径压根没有 at 段，
+    // 所以夹带的占位控制字节一律剔除——否则一份精心构造的种子文件就能让导入
+    // 的语录在渲染时冒充成 at 了某个人。
+    //
+    // id 也从剔除之后的文本派生，重复导入同一份文件才仍然幂等（`deriveId`
+    // 必须对同一行两次算出同一个值，见它自己的说明）。真实种子文件不含这两个
+    // 字节，所以这对已经导入过的生产数据没有任何影响。
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(deps.gpa);
+    try atname.appendSanitized(deps.gpa, &buf, raw_text);
+    const text = std.mem.trim(u8, buf.items, ws);
+
     const mid = deriveId(text);
 
     // 短路：跟 scanGroup 一样，查到已作废就不用再多打一次 Redis 往返去查
@@ -561,6 +575,63 @@ test "run 端到端：新文本正常入库，已存在的候选被 exists 关�
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "新的一行文本") != null);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:byuser:123456") != null);
     const want_id = try std.fmt.allocPrint(gpa, "{d}", .{deriveId("新的一行文本")});
+    defer gpa.free(want_id);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, want_id) != null);
+}
+
+test "run 端到端：种子文件里手打的 at 占位控制字节不会落库" {
+    const gpa = std.testing.allocator;
+
+    // 一行文本走完 isTombstoned/exists/nextId + add 的四条写命令 = 7 条回复。
+    const redis_script = ":0\r\n" ++ ":0\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":1\r\n" ++ ":1\r\n";
+    const redis_srv = try FakeRedisServer.start(gpa, redis_script);
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    const group_info = "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"group_name\":\"测试群\"}}";
+    const member_info = "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"\",\"nickname\":\"小明\"}}";
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{ group_info, member_info });
+    defer nap_srv.stop();
+
+    var c = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    defer c.deinit();
+    var st = store.Store.init(gpa, &c);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: runner.Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{},
+        .admin_qqs = &.{},
+        .group_ids = &.{10001},
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    // 一份构造过的种子文件：如果这两个控制字节原样落库，渲染时会被展开成
+    // "@某人"，等于凭空给这条导入语录安上一个它从来没有过的 at。
+    const path = try writeTempInput(gpa, &tmp, "\x011393309348\x02 是我说的\n");
+    defer gpa.free(path);
+
+    const summary = try run(deps, path, 123456, 1_700_000_000);
+    try std.testing.expectEqual(@as(usize, 1), summary.added);
+
+    c.deinit();
+    redis_srv.stop();
+    // 落库的是剔除之后的文本：占位没了，被冒充的那个 QQ 变成了普通数字。
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "1393309348 是我说的") != null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "\x01") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "\x02") == null);
+    // id 也从剔除之后的文本派生，所以重复导入同一份文件仍然幂等。
+    const want_id = try std.fmt.allocPrint(gpa, "{d}", .{deriveId("1393309348 是我说的")});
     defer gpa.free(want_id);
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, want_id) != null);
 }

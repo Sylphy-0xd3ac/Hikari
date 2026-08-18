@@ -93,8 +93,9 @@ curl 'http://127.0.0.1:8080/'
 内容消息就在那里断开、由它另起一条链），且至少两条，否则不成链、退回路径 1。
 
 **💨 追加正文**：任意人引用一条本轮最终成立的候选，除引用外发 `💨 内容`，可同时带任意数量的 at 段。
-Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到补丁最前（如 `💨 内容 @甲 @乙` →
-`@甲 @乙 内容`），再把整个补丁**不插空格**地追加到原正文末尾。除 reply/text/at 外夹带图片等其它段
+Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到补丁最前（如 `💨 内容 @甲 @乙` → 渲染后是
+`@甲 @乙 内容`），再把整个补丁**不插空格**地追加到原正文末尾。补丁里的 at 跟正文里的 at 走同一套
+（存占位、渲染时按当前昵称展开），所以它同样跟着改名走。除 reply/text/at 外夹带图片等其它段
 则语法无效。多条补充按时间、再按 message_id 排序
 依次追加；引用 🔥 链任意内容成员时追加到整条链。💨 回复自身是控制消息，即使又被贴 ✨ 也不会单独
 入库；它在同窗口被 💦 撤掉时不参与追加。这个语法只影响本轮尚未入库的候选：原消息因 `existing`、
@@ -141,7 +142,25 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 `"Hikari"`/`0`；用了 `✨ @某人 内容` 语法时 `from_who` 是被 at 的作者、`creator` 仍是管理员，两个人
 的 `hikari:username:{qq}` 都会在这一轮刷新。
 
-所有数字 QQ 的 `at` 段也遵循同一个来源：NapCat 消息自带的 `at.data.name` 会被丢弃（它可能是群名片），只显示 `get_group_member_info.nickname` 返回的 QQ 原始昵称。查不到或昵称为空就显示 `@QQ`，绝不把群名片写进正文或 Redis；`@全体成员` 这类非数字目标保留原有专用表示。
+**渲染时解析的名字一共四类**，全部走同一次 Redis 往返：`from_who` ←
+`hikari:username:{user_id}`、`from` ← `hikari:groupname:{group_id}`、`creator` ←
+`hikari:username:{creator_uid}`（仅当 `creator_uid` 非 0，也就是管理员显式收录的语录）、以及
+**正文里的每一个 at** ← `hikari:username:{被 at 的 QQ}`。后两类补上之前会当场自相矛盾：同一个
+QQ 在同一条 JSON 里给出两个名字，`from_who` 是解析出来的当前昵称，`creator` 却是收录当天冻结的
+那一份。`creator` 的修复不需要迁移（hash 里一直存着 `creator_uid`，下一次被读到就自己变对），
+但它读的 `hikari:username` 本身可能是脏的——见下面 `hikari refresh-names`。
+
+所有数字 QQ 的 `at` 段也遵循同一个来源：NapCat 消息自带的 `at.data.name` 会被丢弃（它可能是群
+名片）。**存储文本里 at 段不写名字，只写一个带 QQ 号的占位**（`\x01{qq}\x02`，见
+`src/atname.zig`），渲染时才用当前的 `hikari:username:{qq}` 展开成 `@昵称`；查不到或昵称为空就
+显示 `@QQ号`，绝不把群名片写进正文或 Redis。于是"改一次名反映到全部历史语录"这条承诺从
+`from_who` 扩展到了正文本身——过去 `@昵称` 在入库时就被烧死、QQ 号随之丢失，那个人改名之后再没
+有任何办法把历史语录里的旧名字修正回来。文本段里如果原样带着这两个控制字节会在拼接时被丢掉，
+所以占位只可能由真正的 at 段产生，谁也没法靠发一条消息伪造出"我 at 了某人"。`@全体成员` 这类
+非数字目标没有 QQ 号可查，保留原有专用表示。
+
+这个占位只影响**这次改动之后**收录的语录：更早的语录正文里名字早就烧死、QQ 号已经丢失，不可
+逆，它们的 `@某某` 保持原样。
 
 ## 环境变量
 
@@ -176,12 +195,14 @@ Hikari 会剥掉 `💨` 与两侧语法空白，把所有 at 按原顺序移到�
 | `hikari run --last <时长>` | 忽略本次窗口起点的 `lastrun`，强制重扫最近一段时间；支持正整数 `m`/`h`/`d`，最大 `7d` |
 | `hikari import --user <qq> <file>` | 从换行分隔的文本文件批量导入语录；`--user` 必填，全部导入内容明确归到这个 QQ 名下 |
 | `hikari reindex` | 把 `hikari:index` 里已有的语录逐条补进作者维度的索引 `hikari:byuser:{user_id}`，然后退出。幂等、可重复跑；只读语录 hash，绝不创造或改动语录。只有显式敲这条命令才会跑——启动、定时扫描、HTTP 读路径都不碰它 |
+| `hikari refresh-names` | 把语录引用到的每个 QQ（作者 ∪ 收录者）的 `hikari:username:{qq}` 用当前的 QQ 原始昵称重写一遍，然后退出。修的是早期代码采用群名片留下的脏值。幂等、可重复跑；只写 `hikari:username`，不碰任何一条语录。同样只在显式敲它时才跑 |
 
 ```bash
 ./zig-out/bin/hikari run
 ./zig-out/bin/hikari run --last 24h
 ./zig-out/bin/hikari import --user 10001 seed.txt
 ./zig-out/bin/hikari reindex
+./zig-out/bin/hikari refresh-names
 ```
 
 `run --last` 是补漏/重扫入口。例如 `--last 1h`、`--last 3h`、`--last 24h` 分别强制使用
@@ -277,7 +298,7 @@ curl 'http://127.0.0.1:8080/extra/batch/5?user_id=10001&from_who=%E5%B0%8F%E6%98
 | `hikari:tomb` | SET | 被作废的 `message_id`（永久） |
 | `hikari:seq` | STRING | 自增计数器，供 `INCR` 生成 `id` 字段 |
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次成功扫描的窗口终点（Unix 秒），逐群独立 |
-| `hikari:username:{user_id}` | STRING | 这个人当前的 QQ 原始昵称；每次扫描按遇到的候选作者刷新，渲染时覆盖语录 hash 里冻结的 `from_who` 快照 |
+| `hikari:username:{user_id}` | STRING | 这个人当前的 QQ 原始昵称；每次扫描按遇到的候选作者与被 at 的人刷新。渲染时它同时决定三处显示名：语录的 `from_who`、`creator`（按 `creator_uid` 查）、以及正文里 at 占位展开出来的 `@昵称` |
 | `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，每次扫描刷新；渲染时覆盖语录 hash 里冻结的 `from` 快照 |
 | `hikari:byuser:{user_id}` | ZSET | score = 语录长度（UTF-8 码点数），member = `message_id`——作者维度的索引，`/?user_id=` 在全部三个 HTTP 端点上都靠它 |
 
@@ -291,6 +312,23 @@ curl 'http://127.0.0.1:8080/extra/batch/5?user_id=10001&from_who=%E5%B0%8F%E6%98
 `hikari reindex` 就是那条只回填索引、不改动语录本身的路径：`SMEMBERS hikari:index` → 逐 id
 `HMGET hikari:quote:{id} user_id length` → `ZADD hikari:byuser:{user_id} {length} {id}`，跑完打
 一行摘要。它幂等、可重复跑，且只在运营方显式敲它时才运行。
+
+**`hikari:username` 里可能存着群名片，修复手段是 `hikari refresh-names`**：这些键最初是由一段
+`card` 优先、`nickname` 兜底的代码写下的，于是相当一部分值根本不是 QQ 原始昵称。写入端后来改成
+只认 `nickname`，但**存量的错值不会自愈**——只有那个人再次出现在某次扫描窗口里才会被重写。
+`creator` 与正文里的 at 改成渲染时解析之后，这些键的值就是对外显示的名字本身，不先洗一遍，那两
+处修复只是把"冻结的群名片"换成"当前存着的群名片"。
+
+`hikari refresh-names` 的路径：`SMEMBERS hikari:index` → 逐 id
+`HMGET hikari:quote:{id} user_id creator_uid` 收集去重后的 QQ 集合 → 逐个按 `QQ_GROUP_IDS` 顺序
+问 `get_group_member_info`，拿到**非空**的 `nickname` 且跟存着的值不同才 `SET`。跑完打一行摘要
+（处理了几个、改了几个、本来就对的几个、问不到的几个）。一个群都问不出昵称的人（已经离开了全部
+被观察的群）原样不动：留着旧值至少还是"最后已知的名字"，而写空串会赢过 hash 里的快照，把这个人
+的历史语录作者名一次性抹成空白。它幂等——跑第二遍是零写命令的。
+
+集合取的是"渲染时会被读到的 QQ"而不是"曾经写过的键"（也就是没有去 `SCAN hikari:username:*`）：
+后者会漏掉从来没被刷新过、因此压根不存在的键，而管理员的 `creator_uid` 很容易正好落在这一类里，
+这时 `creator` 会退回 hash 里冻结的那张群名片，跟污染一样错。
 
 ## 构建
 

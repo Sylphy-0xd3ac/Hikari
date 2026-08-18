@@ -1,6 +1,7 @@
 const std = @import("std");
 const redis = @import("redis/client.zig");
 const resp = @import("redis/resp.zig");
+const atname = @import("atname.zig");
 
 pub const Error = redis.Error || error{OutOfMemory};
 
@@ -633,6 +634,77 @@ pub const Store = struct {
         return summary;
     }
 
+    /// `hikari refresh-names`（`main.zig` 的子命令）的读一半：把渲染时会被
+    /// `resolveDisplayNames` 拿去查 `hikari:username:{uid}` 的那些 QQ 一次性
+    /// 列出来，去重、按首次出现的顺序。纯读，不发任何写命令。
+    ///
+    /// 集合 = 每条语录的 `user_id`（作者，决定 `from_who`）∪ 非 0 的
+    /// `creator_uid`（把这条语录加进来的管理员，决定 `creator`）。
+    ///
+    /// 它要修的是什么：`hikari:username` 这些键最初是由一段**采用群名片**的
+    /// 代码写下的（`card` 优先、`nickname` 兜底），于是相当一部分键里存的根本
+    /// 不是 QQ 原始昵称。写入端后来改成只认 `nickname` 了，但**存量的错值不会
+    /// 自愈**——只有那个人再次出现在某次扫描窗口里才会被重写一遍。而
+    /// `creator` 改成渲染时解析（见 `resolveDisplayNames`）之后，这些键的值
+    /// 直接就是对外显示的名字：不先洗一遍，那个修复只是把"冻结的群名片"换成
+    /// 了"当前存着的群名片"。
+    ///
+    /// **为什么不去 SCAN `hikari:username:*`**：那是"曾经写过的键"，这里要的是
+    /// "渲染时会被读到的键"，后者才是错值会显形的地方，而且它还包含前者漏掉的
+    /// 一类——从来没被任何一次扫描刷新过、因此压根不存在的键。管理员的
+    /// `creator_uid` 很容易落在这一类里（他自己不一定是任何一条语录的作者），
+    /// 而这类键缺失时 `creator` 会退回 hash 里冻结的那张群名片，跟污染一样错。
+    /// 正文里 at 占位携带的 QQ 不在这个集合里，因为它们不需要：占位只可能出现
+    /// 在这次改动之后收录的语录里，而收录它们的那次扫描（`resolveAtNames` →
+    /// `authorNickname`）已经用新代码把对应的键刷成 QQ 原始昵称了。
+    ///
+    /// 跟 `reindexByUser` 一样先把 `SMEMBERS` 的结果解析成自有的 `[]i64` 再进
+    /// 循环，理由相同：索引成员的合法性在碰任何一条 hash 之前就查完，整张索引
+    /// 的回复也能在循环开始前释放掉。
+    pub fn collectNameUids(self: *Store, gpa: std.mem.Allocator) Error![]u64 {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        var ids: std.ArrayList(i64) = .empty;
+        defer ids.deinit(self.gpa);
+        {
+            const v = try self.client.command(&.{ "SMEMBERS", key_index });
+            defer v.deinit(self.client.gpa);
+            const items: []const resp.Value = switch (v) {
+                .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+                else => &[_]resp.Value{},
+            };
+            for (items) |item| {
+                const member = bulkOrNull(item) orelse continue;
+                const id = std.fmt.parseInt(i64, member, 10) catch continue;
+                try ids.append(self.gpa, id);
+            }
+        }
+
+        var uids: std.ArrayList(u64) = .empty;
+        errdefer uids.deinit(gpa);
+        for (ids.items) |id| {
+            var kb: [64]u8 = undefined;
+            const v = try self.client.command(&.{ "HMGET", quoteKey(&kb, id), "user_id", "creator_uid" });
+            defer v.deinit(self.client.gpa);
+            const pair: []const resp.Value = switch (v) {
+                .array => |a| if (a) |arr| arr else &[_]resp.Value{},
+                else => &[_]resp.Value{},
+            };
+            for (0..2) |k| {
+                const s = if (pair.len > k) bulkOrNull(pair[k]) else null;
+                const uid = std.fmt.parseInt(u64, s orelse continue, 10) catch continue;
+                // 0 是 creator_uid 的哨兵值（自动路径，creator 固定是
+                // "Hikari"），不是谁的 QQ；user_id 为 0 则是坏数据。两者
+                // 都不该产生一次 get_group_member_info。
+                if (uid == 0) continue;
+                if (std.mem.indexOfScalar(u64, uids.items, uid) != null) continue;
+                try uids.append(gpa, uid);
+            }
+        }
+        return uids.toOwnedSlice(gpa);
+    }
+
     /// 撤一条语录。`message_id` 先按 `hikari:chainmember:{message_id}` 查它是
     /// 不是某条 🔥 链的成员——不管是不是主键——查到就走 revokeChainLocked
     /// 撤整条链；查不到（GET 回 nil，最常见的情形：路径1/2/3 收录的普通语录，
@@ -848,6 +920,28 @@ pub const Store = struct {
         try self.client.commandOk(&.{ "SET", key, name });
     }
 
+    /// 读回 `hikari:username:{user_id}` 当前的值，键从来没写过时返回 null。
+    /// 返回新分配的内存，调用方负责 free。
+    ///
+    /// 渲染路径不用它（`resolveDisplayNames` 把这些键跟别的合进一次 MGET）；
+    /// 它是给 `hikari refresh-names` 的：那条命令要能分清"这次真的把一张群
+    /// 名片换成了 QQ 原始昵称"和"这个键本来就已经是对的"。不比一比就全量
+    /// SET 一遍，结果状态完全相同，但摘要里只剩一个"处理了 N 个"，看不出
+    /// N 里到底有几个曾经是错的——而一条只跑一次的数据修复命令，它的价值有
+    /// 一半就在于跑完之后能说清楚它改了什么。
+    pub fn getUsername(self: *Store, gpa: std.mem.Allocator, user_id: u64) Error!?[]const u8 {
+        var kb: [64]u8 = undefined;
+        const key = usernameKey(&kb, user_id);
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const v = try self.client.command(&.{ "GET", key });
+        defer v.deinit(self.client.gpa);
+        return switch (v) {
+            .bulk => |b| if (b) |s| try gpa.dupe(u8, s) else null,
+            else => null,
+        };
+    }
+
     /// 刷新这个群当前的群名快照（`hikari:groupname:{group_id}`），用法和理由
     /// 跟 setUsername 对称。
     pub fn setGroupName(self: *Store, group_id: u64, name: []const u8) Error!void {
@@ -898,10 +992,33 @@ pub const Store = struct {
         return q;
     }
 
-    /// 渲染前用当前的 `hikari:username:{user_id}` / `hikari:groupname:{group_id}`
-    /// 覆盖 hash 里冻结的 `from_who` / `from` 快照——这是"改名一次性反映到这个人
-    /// 说过的全部历史语录"的落点。只在 fetchById 内部调用，此时锁已经被持有
-    /// （同 fetchById 本身的纪律），这里不再加锁。
+    /// 渲染前用当前的 `hikari:username:{...}` / `hikari:groupname:{group_id}`
+    /// 覆盖 hash 里冻结的名字快照——这是"改名一次性反映到这个人说过的全部历史
+    /// 语录"的落点。只在 fetchById 内部调用，此时锁已经被持有（同 fetchById
+    /// 本身的纪律），这里不再加锁。
+    ///
+    /// **覆盖四类名字，全部走同一次 MGET**：
+    ///
+    ///   1. `from_who` ← `hikari:username:{user_id}`（语录作者）
+    ///   2. `from`     ← `hikari:groupname:{group_id}`（群名）
+    ///   3. `creator`  ← `hikari:username:{creator_uid}`（把这条语录加进来的
+    ///      管理员），仅当 `creator_uid != 0`
+    ///   4. 正文里的 at ← `hikari:username:{占位携带的 QQ}`（见 atname.zig）
+    ///
+    /// 3 和 4 是后补的，补之前它们是这套机制上仅剩的两个漏洞，而且是**会
+    /// 显形的**漏洞：`creator` 与正文都在收录当时被烧成了那一刻的名字，于是
+    /// 同一个 QQ 会在同一条 JSON 里给出两个不同的名字——`from_who` 是解析出
+    /// 来的当前昵称，`creator` 是冻结的旧值。线上真实存在过这一幕：QQ
+    /// 1393309348 的 `from_who` 已经是 `Sylphy`，他加的语录的 `creator` 却
+    /// 还停在群名片 `前辈前辈!` 上。因为 hash 里一直存着 `creator_uid`
+    /// （`hashFields`/`quoteFromPairs` 从一开始就读写它），这条修复不需要
+    /// 任何迁移：存量语录下一次被读到就自己变对了。
+    ///
+    /// 把这四类合进**一次** MGET 而不是分几次，是因为 Store 是单连接、
+    /// 请求/响应严格配对的：多发一条命令就多一个"读到一半失败、帧对齐从此
+    /// 不可信"的窗口（下面 MGET 失败那一段解释了为什么这件事比"这次渲染用了
+    /// 旧名字"严重得多）。at 的 QQ 在 `quoteFromPairs` 之后就已经能从正文里
+    /// 解析出来，所以它们完全来得及搭上同一班车。
     ///
     /// **哪个赢，为什么**：MGET 命中（哪怕命中的值本身是空串）就覆盖，因为
     /// 命中代表"这个 user_id / group_id 最近一次被成功刷新过"，是比收录当时
@@ -937,29 +1054,85 @@ pub const Store = struct {
     fn resolveDisplayNames(self: *Store, gpa: std.mem.Allocator, q: *Quote) Error!void {
         var ukb: [64]u8 = undefined;
         var gkb: [64]u8 = undefined;
-        const ukey = usernameKey(&ukb, q.user_id);
-        const gkey = groupNameKey(&gkb, q.group_id);
-        const v = try self.client.command(&.{ "MGET", ukey, gkey });
+        var ckb: [64]u8 = undefined;
+
+        // 正文里的 at 占位携带的 QQ。绝大多数语录（全部存量语录、以及任何
+        // 一条不含 at 的新语录）在这里拿到一个空切片，下面的 key 列表就退化
+        // 成改动之前那两个键、命令字节完全一致。
+        const at_uids = try atname.collectUids(gpa, q.hitokoto);
+        defer gpa.free(at_uids);
+
+        // creator_uid == 0 是自动路径（路径1/2/4 与 import）的哨兵值，
+        // 对应的 creator 固定是字符串 "Hikari"，没有哪个 QQ 可查——查了只会
+        // 拿 `hikari:username:0` 这个永远不存在的键换一次 nil。只有两条显式
+        // 管理员路径（`✨ 内容` / `✨ @某人 内容` 与 admin_quoted）才会写下
+        // 真实的 creator_uid。
+        const want_creator = q.creator_uid != 0;
+
+        var at_bufs = try gpa.alloc([64]u8, at_uids.len);
+        defer gpa.free(at_bufs);
+
+        var keys: std.ArrayList([]const u8) = .empty;
+        defer keys.deinit(gpa);
+        try keys.append(gpa, "MGET");
+        try keys.append(gpa, usernameKey(&ukb, q.user_id));
+        try keys.append(gpa, groupNameKey(&gkb, q.group_id));
+        if (want_creator) try keys.append(gpa, usernameKey(&ckb, q.creator_uid));
+        for (at_uids, 0..) |uid, i| try keys.append(gpa, usernameKey(&at_bufs[i], uid));
+
+        const v = try self.client.command(keys.items);
         defer v.deinit(self.client.gpa);
         const items: []const resp.Value = switch (v) {
             .array => |a| a orelse return error.ProtocolError,
             .err => return error.RedisError,
             else => return error.ProtocolError,
         };
-        if (items.len >= 1) {
-            if (bulkOrNull(items[0])) |name| {
+
+        var idx: usize = 0;
+        if (items.len > idx) {
+            if (bulkOrNull(items[idx])) |name| {
                 const dup = try gpa.dupe(u8, name);
                 gpa.free(q.from_who);
                 q.from_who = dup;
             }
         }
-        if (items.len >= 2) {
-            if (bulkOrNull(items[1])) |name| {
+        idx += 1;
+        if (items.len > idx) {
+            if (bulkOrNull(items[idx])) |name| {
                 const dup = try gpa.dupe(u8, name);
                 gpa.free(q.from);
                 q.from = dup;
             }
         }
+        idx += 1;
+        if (want_creator) {
+            if (items.len > idx) {
+                if (bulkOrNull(items[idx])) |name| {
+                    const dup = try gpa.dupe(u8, name);
+                    gpa.free(q.creator);
+                    q.creator = dup;
+                }
+            }
+            idx += 1;
+        }
+
+        if (at_uids.len == 0) return;
+        // at 名字借用 `v` 的内存，必须在上面那个 `defer v.deinit` 生效之前
+        // （也就是本函数返回之前）用完，`expand` 会把它们拷进新正文里。
+        const at_names = try gpa.alloc(?[]const u8, at_uids.len);
+        defer gpa.free(at_names);
+        for (at_names, 0..) |*slot, k| {
+            slot.* = if (items.len > idx + k) bulkOrNull(items[idx + k]) else null;
+        }
+        const expanded = try atname.expand(gpa, q.hitokoto, at_uids, at_names);
+        gpa.free(q.hitokoto);
+        q.hitokoto = expanded;
+        // 正文既然按当前昵称重新展开了，随它一起变的 length 也要重算，否则
+        // 返回给调用方的这条 JSON 自己就对不上（`length` 声称的是 `hitokoto`
+        // 的码点数）。`hikari:bylen` 里的分数仍是收录当时那一份，改名之后会
+        // 有几个码点的漂移——跟 `from_who` 改名后不重排索引是同一个取舍：
+        // 长度过滤是个粗筛，不值得为它在每次改名时重写全库索引。
+        q.length = utf8Length(expanded);
     }
 
     pub fn randomAny(self: *Store, gpa: std.mem.Allocator) Error!?Quote {
@@ -1574,11 +1747,17 @@ fn encodeArrayReply(gpa: std.mem.Allocator, items: []const []const u8) ![]u8 {
     return resp.encodeCommand(gpa, items);
 }
 
-/// fetchById 现在在每次 HGETALL 之后紧跟着发一条 `MGET hikari:username:{id}
-/// hikari:groupname:{id}`（resolveDisplayNames）。绝大多数既有测试关心的是
-/// hash 本身的内容，不关心改名覆盖这件事，所以给它们喂一对 nil——两个键都
-/// 没写过，回退到 hash 里的旧值，测试原有的内容断言不用跟着改。改名覆盖 /
-/// fallback 本身的行为在下面单独的测试里覆盖。
+/// fetchById 在每次 HGETALL 之后紧跟着发一条 MGET（resolveDisplayNames）。
+/// 绝大多数既有测试关心的是 hash 本身的内容，不关心改名覆盖这件事，所以给
+/// 它们喂一对 nil——两个键都没写过，回退到 hash 里的旧值，测试原有的内容
+/// 断言不用跟着改。改名覆盖 / fallback 本身的行为在下面单独的测试里覆盖。
+///
+/// 这条回复固定是**两个** nil，而 MGET 的键数其实是随 `creator_uid` 与正文
+/// 里的 at 占位增长的（见 resolveDisplayNames）。之所以仍然对得上：这些测试
+/// 一律基于 `sampleQuote()`，它的 `creator_uid` 是 0、正文里没有占位，于是
+/// 键数恰好停在 `hikari:username` + `hikari:groupname` 这两个。用别的语录
+/// （带 creator_uid 或带 at）的测试必须自己写出长度匹配的回复，否则多出来的
+/// 键会读到数组末尾之外——那正是下面几条测试要钉住的下标算术。
 const mget_nil_reply = "*2\r\n$-1\r\n$-1\r\n";
 
 /// 按给定顺序在 `bytes` 里逐帧定位：每一帧都必须存在，且必须出现在前一帧之后。
@@ -2533,6 +2712,290 @@ test "randomAny 的 hikari:username/hikari:groupname 覆盖路径（resolveDispl
 }
 
 // ---------------------------------------------------------------------------
+// creator 与正文里的 at —— 同一次 MGET 里另外两类渲染时解析的名字。
+//
+// 这两类补上之前是"改一次名反映到全部历史语录"这套机制上仅剩的两个漏洞，而且
+// 是会当场自相矛盾的漏洞：同一个 QQ 在同一条 JSON 里给出两个名字（`from_who`
+// 是解析出来的当前昵称，`creator` 是收录当天冻结的那一份）。
+//
+// 下面几条测试反复钉同一件事：**MGET 的键顺序与 `items` 的下标算术**。四类
+// 名字（from_who / from / creator / 正文 at）挤在一条命令里，键数还随语录内容
+// 变化（creator_uid 为 0 时少一个键，正文里的 at 有几个不同 QQ 就多几个键），
+// 一旦下标错位，症状不是崩溃而是"某个人显示成了另一个人的名字"——最不容易在
+// 眼睛扫一遍时发现的那种错。所以每条都连命令帧一起断言，不只看结果字符串。
+
+/// 把 `sampleQuote()` 换掉正文与 creator，用来构造上面那几种键数。
+fn quoteWith(hitokoto: []const u8, creator: []const u8, creator_uid: u64) Quote {
+    var q = sampleQuote();
+    q.hitokoto = hitokoto;
+    q.length = utf8Length(hitokoto);
+    q.creator = creator;
+    q.creator_uid = creator_uid;
+    return q;
+}
+
+test "randomAny：creator 按 creator_uid 重新解析，收录当天冻结的旧名字被当前昵称覆盖" {
+    const gpa = std.testing.allocator;
+    // 线上真实的一幕：QQ 1393309348 的 from_who 早就解析成了 `Sylphy`，他加的
+    // 语录的 creator 却还停在收录当天那张群名片 `前辈前辈!` 上。
+    const args = try hashFields(gpa, quoteWith("今天也是好天气", "前辈前辈!", 1393309348));
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // 前两个键回 nil（跟这条测试无关，走 fallback），第三个是 creator 的。
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*3\r\n$-1\r\n$-1\r\n$6\r\nSylphy\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("Sylphy", q.creator);
+    try std.testing.expectEqual(@as(u64, 1393309348), q.creator_uid);
+    // 存量语录不需要迁移：hash 里一直存着 creator_uid，下一次被读到就自己变对。
+    try std.testing.expectEqualStrings("小明", q.from_who);
+
+    c.deinit();
+    srv.stop();
+    try expectFrameSequence(srv.received.items, &.{
+        "*4\r\n$4\r\nMGET\r\n$21\r\nhikari:username:10001\r\n$20\r\nhikari:groupname:999\r\n$26\r\nhikari:username:1393309348\r\n",
+    });
+}
+
+test "randomAny：creator_uid == 0（自动路径的 Hikari）时不多问一个键，MGET 与改动之前逐字节相同" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, sampleQuote()); // creator="Hikari"、creator_uid=0
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    const script = try std.mem.concat(gpa, u8, &.{ "$5\r\n12345\r\n", hgetall_reply, mget_nil_reply });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    // "Hikari" 不是谁的昵称，没有 QQ 可查，原样留着。
+    try std.testing.expectEqualStrings("Hikari", q.creator);
+
+    c.deinit();
+    srv.stop();
+    // 键数停在两个（`*3` = MGET + 2 个键），路径1/2/4 与 import 收录的语录
+    // 因此在读路径上一个字节的额外成本都没有。
+    try expectFrameSequence(srv.received.items, &.{
+        "*3\r\n$4\r\nMGET\r\n$21\r\nhikari:username:10001\r\n$20\r\nhikari:groupname:999\r\n",
+    });
+    // 尤其不能去问 hikari:username:0 —— 那是个永远不存在的键。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "hikari:username:0\r\n") == null);
+}
+
+test "randomAny：正文里的 at 占位按当前昵称展开，length 跟着重算" {
+    const gpa = std.testing.allocator;
+    // 存进去的是占位（`atname.append` 的产物），不是名字。
+    const args = try hashFields(gpa, quoteWith("\x011393309348\x02 说得对", "Hikari", 0));
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*3\r\n$-1\r\n$-1\r\n$6\r\nSylphy\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("@Sylphy 说得对", q.hitokoto);
+    // 展开之后正文短了 5 个码点：hash 里那个 16 必须跟着变，否则返回的这条
+    // JSON 自己就对不上（length 声称的是 hitokoto 的码点数）。
+    try std.testing.expectEqual(@as(usize, 16), utf8Length("\x011393309348\x02 说得对"));
+    try std.testing.expectEqual(@as(usize, 11), q.length);
+
+    c.deinit();
+    srv.stop();
+    // creator_uid 是 0，所以第三个键是正文里那个 at 的，不是 creator 的。
+    try expectFrameSequence(srv.received.items, &.{
+        "*4\r\n$4\r\nMGET\r\n$21\r\nhikari:username:10001\r\n$20\r\nhikari:groupname:999\r\n$26\r\nhikari:username:1393309348\r\n",
+    });
+}
+
+test "randomAny：at 占位查不到昵称时退回 @QQ号，跟改动之前 at.name 缺失的表现一致" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, quoteWith("\x011393309348\x02 说得对", "Hikari", 0));
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // 三个键全 nil：被 at 的这个人从来没被任何一次扫描刷新过（比如他已经离群）。
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*3\r\n$-1\r\n$-1\r\n$-1\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    // 退回来的是 QQ 号，不是占位——控制字节绝不能漏进 HTTP 响应。
+    try std.testing.expectEqualStrings("@1393309348 说得对", q.hitokoto);
+    try std.testing.expect(!atname.has(q.hitokoto));
+    try std.testing.expectEqual(@as(usize, 15), q.length);
+}
+
+test "randomAny：creator 与正文 at 同时存在时四类名字各就各位（下标算术）" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, quoteWith("\x0110002\x02 说得对", "前辈前辈!", 1393309348));
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    // 四个键四个值，全部命中：这条测试的全部意义就是"哪个值落到哪个字段"。
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply,
+        "*4\r\n$7\r\nNewName\r\n$8\r\nNewGroup\r\n$6\r\nSylphy\r\n$6\r\n小红\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    try std.testing.expectEqualStrings("NewName", q.from_who);
+    try std.testing.expectEqualStrings("NewGroup", q.from);
+    try std.testing.expectEqualStrings("Sylphy", q.creator);
+    try std.testing.expectEqualStrings("@小红 说得对", q.hitokoto);
+    try std.testing.expectEqual(@as(usize, 7), q.length);
+
+    c.deinit();
+    srv.stop();
+    try expectFrameSequence(srv.received.items, &.{
+        "*5\r\n$4\r\nMGET\r\n$21\r\nhikari:username:10001\r\n$20\r\nhikari:groupname:999\r\n$26\r\nhikari:username:1393309348\r\n$21\r\nhikari:username:10002\r\n",
+    });
+}
+
+test "randomAny：正文里同一个 QQ 被 at 多次只占一个键" {
+    const gpa = std.testing.allocator;
+    const args = try hashFields(gpa, quoteWith("\x0110002\x02 和 \x0110002\x02 都说过", "Hikari", 0));
+    defer freeHashFields(gpa, args);
+    const hgetall_reply = try encodeArrayReply(gpa, args[2..]);
+    defer gpa.free(hgetall_reply);
+
+    const script = try std.mem.concat(gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply, "*3\r\n$-1\r\n$-1\r\n$6\r\n小红\r\n",
+    });
+    defer gpa.free(script);
+
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    var q = (try store.randomAny(gpa)).?;
+    defer q.deinit(gpa);
+
+    // 一个键，两处展开。
+    try std.testing.expectEqualStrings("@小红 和 @小红 都说过", q.hitokoto);
+    try std.testing.expectEqual(@as(usize, 13), q.length);
+
+    c.deinit();
+    srv.stop();
+    // `*4` 把键数钉死：去重要是丢了，这里会变成 `*5`，而 MGET 的规模是由
+    // 消息内容（外部输入）决定的，不能让它随 at 的**次数**长。
+    try expectFrameSequence(srv.received.items, &.{
+        "*4\r\n$4\r\nMGET\r\n$21\r\nhikari:username:10001\r\n$20\r\nhikari:groupname:999\r\n$21\r\nhikari:username:10002\r\n",
+    });
+}
+
+fn checkRandomAnyCreatorAndAtAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+    const args = try hashFields(net_gpa, quoteWith("\x0110002\x02 说得对", "前辈前辈!", 1393309348));
+    defer freeHashFields(net_gpa, args);
+    const hgetall_reply = try encodeArrayReply(net_gpa, args[2..]);
+    defer net_gpa.free(hgetall_reply);
+
+    const script = try std.mem.concat(net_gpa, u8, &.{
+        "$5\r\n12345\r\n", hgetall_reply,
+        "*4\r\n$7\r\nNewName\r\n$8\r\nNewGroup\r\n$6\r\nSylphy\r\n$6\r\n小红\r\n",
+    });
+    defer net_gpa.free(script);
+
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(net_gpa, &c);
+
+    if (try st.randomAny(gpa)) |q| q.deinit(gpa);
+}
+
+test "randomAny 的 creator / 正文 at 覆盖路径在分配失败时不泄漏（checkAllAllocationFailures）" {
+    // 这条路径上新增的分配比 from_who/from 那两次 dupe 多得多：collectUids 的
+    // 切片、每个 at 一份 key 缓冲、keys 列表、expand 出来的新正文，还有中途要
+    // 把旧 hitokoto 换掉这一步。任何一次失败都不能让已经分配出来的那些漏掉，
+    // 也不能让 Quote 半新半旧地交出去。
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkRandomAnyCreatorAndAtAlloc, .{});
+}
+
+// ---------------------------------------------------------------------------
 // allQuotes / randomMany —— `/extra/all` 与 `/extra/batch/:count` 的存储层。
 
 test "allQuotes 用 SMEMBERS 拿全部 id 再逐个 HGETALL 展开" {
@@ -3224,4 +3687,118 @@ fn checkFormatReindexSummaryAlloc(gpa: std.mem.Allocator) !void {
 
 test "formatReindexSummary 在分配失败时不泄漏（checkAllAllocationFailures）" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, checkFormatReindexSummaryAlloc, .{});
+}
+
+// ---------------------------------------------------------------------------
+// getUsername / collectNameUids —— `hikari refresh-names` 的读一半。
+// 写一半（问 NapCat、决定改不改）在 scan/runner.zig 的 refreshNames 里，因为
+// 它跟扫描时刷新昵称是同一套机制、共用同一个 memberNickname。
+
+test "collectNameUids：SMEMBERS 之后逐条 HMGET user_id/creator_uid，去重保序" {
+    const gpa = std.testing.allocator;
+    // 三条语录：
+    //   1 —— 作者 10001，creator_uid 0（自动路径，creator 固定是 "Hikari"）
+    //   2 —— 作者 10002，收录者 1393309348（管理员显式加的）
+    //   3 —— 作者又是 10001（重复），creator_uid 是个负数（坏数据）
+    const script = "*3\r\n$1\r\n1\r\n$1\r\n2\r\n$1\r\n3\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$1\r\n0\r\n" ++
+        "*2\r\n$5\r\n10002\r\n$10\r\n1393309348\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$2\r\n-7\r\n";
+    const srv = try FakeServer.start(gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const uids = try store.collectNameUids(gpa);
+    defer gpa.free(uids);
+
+    // 0 与坏值都不在里面：它们会各自换来一次注定问不到人的
+    // get_group_member_info，而 hikari:username:0 是个永远不该存在的键。
+    try std.testing.expectEqualSlices(u64, &.{ 10001, 10002, 1393309348 }, uids);
+
+    c.deinit();
+    srv.stop();
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$8\r\nSMEMBERS\r\n$12\r\nhikari:index\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$14\r\nhikari:quote:1\r\n$7\r\nuser_id\r\n$11\r\ncreator_uid\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$14\r\nhikari:quote:2\r\n$7\r\nuser_id\r\n$11\r\ncreator_uid\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$14\r\nhikari:quote:3\r\n$7\r\nuser_id\r\n$11\r\ncreator_uid\r\n",
+    });
+    // 纯读：这个方法自己不写任何东西，写只发生在 refreshNames 那一侧，且只
+    // 可能落在 hikari:username 上。
+    try std.testing.expect(std.mem.indexOf(u8, srv.received.items, "SET") == null);
+}
+
+test "collectNameUids：空索引只发一条 SMEMBERS，返回空切片（仍然是 gpa 拥有的）" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "*0\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const uids = try store.collectNameUids(gpa);
+    defer gpa.free(uids);
+    try std.testing.expectEqual(@as(usize, 0), uids.len);
+
+    c.deinit();
+    srv.stop();
+    try std.testing.expectEqualStrings("*2\r\n$8\r\nSMEMBERS\r\n$12\r\nhikari:index\r\n", srv.received.items);
+}
+
+test "getUsername：命中回一份自有拷贝，键没写过时回 null" {
+    const gpa = std.testing.allocator;
+    const srv = try FakeServer.start(gpa, "$6\r\nSylphy\r\n" ++ "$-1\r\n");
+    defer {
+        srv.stop();
+        srv.received.deinit(gpa);
+        gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var store = Store.init(gpa, &c);
+
+    const hit = (try store.getUsername(gpa, 1393309348)).?;
+    defer gpa.free(hit);
+    try std.testing.expectEqualStrings("Sylphy", hit);
+    try std.testing.expect((try store.getUsername(gpa, 10001)) == null);
+
+    c.deinit();
+    srv.stop();
+    try expectFrameSequence(srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$26\r\nhikari:username:1393309348\r\n",
+        "*2\r\n$3\r\nGET\r\n$21\r\nhikari:username:10001\r\n",
+    });
+}
+
+fn checkCollectNameUidsAlloc(gpa: std.mem.Allocator) !void {
+    const net_gpa = std.testing.allocator;
+    const script = "*2\r\n$1\r\n1\r\n$1\r\n2\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$1\r\n0\r\n" ++
+        "*2\r\n$5\r\n10002\r\n$10\r\n1393309348\r\n";
+    const srv = try FakeServer.start(net_gpa, script);
+    defer {
+        srv.stop();
+        srv.received.deinit(net_gpa);
+        net_gpa.destroy(srv);
+    }
+    var c = try redis.Client.connect(net_gpa, "127.0.0.1", srv.port(), null, 0);
+    defer c.deinit();
+    var st = Store.init(net_gpa, &c);
+
+    const uids = try st.collectNameUids(gpa);
+    gpa.free(uids);
+}
+
+test "collectNameUids 在分配失败时不泄漏（checkAllAllocationFailures）" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, checkCollectNameUidsAlloc, .{});
 }
