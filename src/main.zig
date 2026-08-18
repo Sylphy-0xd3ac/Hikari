@@ -98,7 +98,14 @@ pub fn main() !void {
             }
             return runReindexCommand(gpa);
         }
-        std.log.err("unknown subcommand: {s} (usage: hikari [import --user <qq> <file>|run [--last <duration>]|reindex])", .{args[1]});
+        if (std.mem.eql(u8, args[1], "refresh-names")) {
+            if (args.len != 2) {
+                std.log.err("usage: hikari refresh-names", .{});
+                std.process.exit(1);
+            }
+            return runRefreshNamesCommand(gpa);
+        }
+        std.log.err("unknown subcommand: {s} (usage: hikari [import --user <qq> <file>|run [--last <duration>]|reindex|refresh-names])", .{args[1]});
         std.process.exit(1);
     }
 
@@ -329,6 +336,68 @@ fn runReindexCommand(gpa: std.mem.Allocator) !void {
     try std.fs.File.stdout().writeAll(text);
 }
 
+/// `hikari refresh-names`：把每条语录引用到的 QQ（作者与收录者）的
+/// `hikari:username:{uid}` 用当前的 QQ 原始昵称重写一遍，然后退出。装配方式跟
+/// `import`/`run`/`reindex` 一致——自己的 config.load、自己的一条 Redis 连接、
+/// 同一种 `runner.Deps` 构造方式，因为它要问的正是扫描器在问的那个
+/// `get_group_member_info`。
+///
+/// 它存在的理由：这些键最初由一段**采用群名片**的代码写下（`card` 优先），
+/// 写入端后来改成只认 `nickname`，但存量的错值不会自愈——只有那个人再次出现
+/// 在某次扫描窗口里才会被重写。而 `creator` 与正文里的 at 改成渲染时解析之后
+/// （见 `store.Store.resolveDisplayNames`），这些键的值直接就是对外显示的
+/// 名字：不先洗一遍，那个修复只是把"冻结的群名片"换成"当前存着的群名片"。
+/// 见 `scan/runner.zig` 的 `refreshNames`。
+///
+/// 它**不改变任何自动行为**，也不改动任何一条语录：只写 `hikari:username`
+/// 这一类键。跑第二遍会把全部命中算进 unchanged，一条写命令都不发。
+///
+/// 退出码：config 加载失败、Redis 连不上、或者过程中 Redis 报错都是非零。
+/// 问不到昵称的那些人不算失败——他们已经离开了全部被观察的群，NapCat 回答不
+/// 了，再跑多少遍也一样，如实记进摘要的 unresolved 就够了。
+fn runRefreshNamesCommand(gpa: std.mem.Allocator) !void {
+    var bad: ?[]const u8 = null;
+    var cfg = config.load(gpa, &bad) catch |e| {
+        std.log.err("config error ({s}) at env var: {s}", .{ @errorName(e), bad orelse "?" });
+        std.process.exit(1);
+    };
+    defer cfg.deinit();
+
+    var refresh_redis = redis.Client.connect(gpa, cfg.redis_host, cfg.redis_port, cfg.redis_password, cfg.redis_db) catch |e| {
+        std.log.err("redis connect failed: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
+    defer refresh_redis.deinit();
+    var refresh_store = store.Store.init(gpa, &refresh_redis);
+
+    var nap = napcat.Client.init(gpa, cfg.napcat_url, cfg.napcat_token);
+    defer nap.deinit();
+
+    // OCR 引擎这条命令用不上（它不看图，也不产生候选），但 Deps 要求一个；
+    // 传 local ocr 跟另外几条命令保持同一种装配，且因为从不调用它，
+    // OCR_PYTHON_PATH 配得对不对不影响这条命令能不能跑。
+    var local_ocr = ocr.Local.init(gpa, cfg.ocr_python_path);
+
+    const deps: runner.Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &refresh_store,
+        .observed_qqs = cfg.observed_qqs,
+        .admin_qqs = cfg.admin_qqs,
+        .group_ids = cfg.group_ids,
+        .ocr_engine = local_ocr.engine(),
+    };
+
+    const summary = runner.refreshNames(deps) catch |e| {
+        std.log.err("refresh-names failed: {s}", .{@errorName(e)});
+        std.process.exit(1);
+    };
+
+    const text = try runner.formatRefreshNamesSummary(gpa, summary);
+    defer gpa.free(text);
+    try std.fs.File.stdout().writeAll(text);
+}
+
 test "import CLI：--user 必填，option-first 与 file-first 都解析到同一结果" {
     const a = try parseImportCommandArgs(&.{ "--user", "123456", "seed.txt" });
     try std.testing.expectEqualStrings("seed.txt", a.path);
@@ -384,6 +453,7 @@ test "run CLI：--last 拒绝零、负数、小数、无单位、超 7 天及多
 test {
     _ = @import("config.zig");
     _ = @import("onebot.zig");
+    _ = @import("atname.zig");
     _ = @import("ocr.zig");
     _ = @import("scan/rules.zig");
     _ = @import("redis/resp.zig");

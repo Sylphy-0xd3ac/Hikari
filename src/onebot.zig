@@ -1,4 +1,5 @@
 const std = @import("std");
+const atname = @import("atname.zig");
 
 pub const At = struct { qq: []const u8, name: ?[]const u8 };
 
@@ -64,19 +65,27 @@ pub const Message = struct {
         return false;
     }
 
-    /// text 段原样，at 段渲染为 @昵称（缺昵称或昵称为空时用 @QQ号），其余段丢弃，首尾 trim。
-    /// `name` 只能由 runner 的 `resolveAtNames` 写入 QQ 原始昵称；parseMessage
-    /// 会刻意丢弃 NapCat 的 `at.data.name`，因此这里绝不能把群名片带回输出。
+    /// 渲染成**存储文本**：text 段原样（但按 `atname.appendSanitized` 剔除占位
+    /// 控制字节），数字 QQ 的 at 段写成 `atname` 占位（带 QQ 号，不带名字），
+    /// 其余段丢弃，首尾 trim。
+    ///
+    /// **at 段不再在这里烧成 `@昵称`**：名字改成渲染时才解析（`atname` 文件头
+    /// 说明了为什么）。`@全体成员` 这类 `qq` 不是数字的目标没有 QQ 号可查，
+    /// 保留改动之前的 `@{qq}` 字面写法。`a.name` 因此不再参与存储文本，但
+    /// `resolveAtNames` 仍然要跑：它顺带把 `hikari:username:{uid}` 刷成 QQ
+    /// 原始昵称，那正是渲染时展开占位要读的键。
+    ///
     /// 返回新分配的内存，调用方负责 free。
     pub fn renderText(self: Message, gpa: std.mem.Allocator) ![]u8 {
         var list: std.ArrayList(u8) = .empty;
         defer list.deinit(gpa);
         for (self.segments) |s| switch (s) {
-            .text => |t| try list.appendSlice(gpa, t),
-            .at => |a| {
+            .text => |t| try atname.appendSanitized(gpa, &list, t),
+            .at => |a| if (std.fmt.parseInt(u64, std.mem.trim(u8, a.qq, ws), 10)) |uid|
+                try atname.append(gpa, &list, uid)
+            else |_| {
                 try list.append(gpa, '@');
-                const display = if (a.name) |name| if (name.len > 0) name else a.qq else a.qq;
-                try list.appendSlice(gpa, display);
+                try atname.appendSanitized(gpa, &list, a.qq);
             },
             else => {},
         };
@@ -245,29 +254,63 @@ test "user_id 与 message_id 可以是字符串" {
     try std.testing.expectEqual(@as(i64, 100), m.time);
 }
 
-test "at 段忽略 NapCat 附带的群展示名，补全前一律渲染为 @QQ号" {
+test "at 段一律渲染成带 QQ 号的占位，NapCat 附带的群展示名进不了正文" {
     var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer ar.deinit();
     const a = ar.allocator();
 
+    // 三种上报形态（带 name、无 name、name 为空串）渲染出来完全一样：存储
+    // 文本只认 QQ 号。`name` 在这里出现多少次都不影响结果，这正是"群名片
+    // 绝不落库"要钉住的东西。
     const m1 = try parseOne(a,
         \\{"message_id":1,"user_id":2,"time":0,"message":[
         \\ {"type":"at","data":{"qq":"999","name":"小明"}},
         \\ {"type":"text","data":{"text":" 你好"}}]}
     );
-    try std.testing.expectEqualStrings("@999 你好", try m1.renderText(a));
+    try std.testing.expectEqualStrings("\x01999\x02 你好", try m1.renderText(a));
 
     const m2 = try parseOne(a,
         \\{"message_id":1,"user_id":2,"time":0,"message":[
         \\ {"type":"at","data":{"qq":"999"}},{"type":"text","data":{"text":" hi"}}]}
     );
-    try std.testing.expectEqualStrings("@999 hi", try m2.renderText(a));
+    try std.testing.expectEqualStrings("\x01999\x02 hi", try m2.renderText(a));
 
     const m3 = try parseOne(a,
         \\{"message_id":1,"user_id":2,"time":0,"message":[
         \\ {"type":"at","data":{"qq":"999","name":""}},{"type":"text","data":{"text":" hi"}}]}
     );
-    try std.testing.expectEqualStrings("@999 hi", try m3.renderText(a));
+    try std.testing.expectEqualStrings("\x01999\x02 hi", try m3.renderText(a));
+
+    // 展开之后才是给人看的样子：查得到用昵称，查不到退回 @QQ号。
+    const shown = try atname.expand(a, try m1.renderText(a), &.{999}, &.{"Sylphy"});
+    try std.testing.expectEqualStrings("@Sylphy 你好", shown);
+    const unknown = try atname.expand(a, try m1.renderText(a), &.{}, &.{});
+    try std.testing.expectEqualStrings("@999 你好", unknown);
+}
+
+test "at 的 qq 不是数字（@全体成员）时没有 QQ 号可查，保留 @{qq} 字面写法" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const m = try parseOne(a,
+        \\{"message_id":1,"user_id":2,"time":0,"message":[
+        \\ {"type":"at","data":{"qq":"all","name":"全体成员"}},
+        \\ {"type":"text","data":{"text":" 集合"}}]}
+    );
+    const rendered = try m.renderText(a);
+    try std.testing.expectEqualStrings("@all 集合", rendered);
+    try std.testing.expect(!atname.has(rendered));
+}
+
+test "文本段里原样带着的占位控制字节被丢弃，无法伪造成别人的 at" {
+    var ar = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer ar.deinit();
+    const a = ar.allocator();
+    const segments = [_]Segment{.{ .text = "\x011393309348\x02 是我说的" }};
+    const m = Message{ .message_id = 1, .user_id = 2, .time = 0, .segments = &segments };
+    const rendered = try m.renderText(a);
+    try std.testing.expectEqualStrings("1393309348 是我说的", rendered);
+    try std.testing.expect(!atname.has(rendered));
 }
 
 test "image / face 等非文本段不产生占位符，但保留 OCR 所需的图片定位字段" {

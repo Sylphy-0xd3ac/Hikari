@@ -1,5 +1,6 @@
 const std = @import("std");
 const onebot = @import("../onebot.zig");
+const atname = @import("../atname.zig");
 
 pub const star = "✨";
 pub const drop = "💦";
@@ -137,22 +138,30 @@ pub const Manual = struct {
 };
 
 /// 按 `onebot.Message.renderText` 的同一套规则渲染一段 segment 序列
-/// （text 原样、at → `@昵称`（缺 name 退回 `@QQ号`）、其余段丢弃），**不** trim，
-/// 前面先拼上 `prefix`（承载 `✨` 的那个 text 段被剥掉前缀后剩下的尾巴）。
+/// （text 原样但剔除占位控制字节、数字 QQ 的 at → `atname` 占位、其余段丢弃），
+/// **不** trim，前面先拼上 `prefix`（承载 `✨` 的那个 text 段被剥掉前缀后剩下
+/// 的尾巴）。
 ///
-/// 单独抽出来是因为路径3现在必须在**段列表**上判定而不是渲染文本上：
-/// renderText 把 at 段烧成 `@昵称` 并把 QQ 号彻底丢掉，而 `✨ @某人 内容`
-/// 恰恰需要那个 QQ 号。判定完之后正文仍然要按同一套规则渲染，于是渲染这一
-/// 半在这里复用，两处不会漂移。
+/// 单独抽出来是因为路径3必须在**段列表**上判定而不是渲染文本上：
+/// `✨ @某人 内容` 需要那个 at 的 QQ 号来决定作者，而判定完之后正文仍然要按
+/// 同一套规则渲染，于是渲染这一半在这里复用，两处不会漂移。占位化之后 QQ 号
+/// 其实也留在了渲染结果里，但判定照旧走段列表——从文本里反解占位既多绕一圈，
+/// 也会把"紧跟 `✨` 的那个 at 才是作者标记"这条**位置**规则弄丢。
+///
+/// `prefix` 来自承载 `✨` 的那个 text 段，同样是用户可控的文本，所以跟 text 段
+/// 走同一条 `appendSanitized`：否则管理员发一条 `✨` + 手打占位字节 + 内容，
+/// 就能让这条语录在渲染时伪造出一个 at。
 fn renderSegments(gpa: std.mem.Allocator, segs: []const onebot.Segment, prefix: []const u8) ![]u8 {
     var list: std.ArrayList(u8) = .empty;
     errdefer list.deinit(gpa);
-    try list.appendSlice(gpa, prefix);
+    try atname.appendSanitized(gpa, &list, prefix);
     for (segs) |s| switch (s) {
-        .text => |t| try list.appendSlice(gpa, t),
-        .at => |a| {
+        .text => |t| try atname.appendSanitized(gpa, &list, t),
+        .at => |a| if (std.fmt.parseInt(u64, std.mem.trim(u8, a.qq, ws), 10)) |uid|
+            try atname.append(gpa, &list, uid)
+        else |_| {
             try list.append(gpa, '@');
-            try list.appendSlice(gpa, a.name orelse a.qq);
+            try atname.appendSanitized(gpa, &list, a.qq);
         },
         else => {},
     };
@@ -304,6 +313,11 @@ pub fn quotedAuthorCommand(m: onebot.Message, p: Params) ?QuotedAuthor {
 /// `reply + 💨 + text/at` 的正文补丁。所有 at 段按原顺序移动到补丁最前面，
 /// 再接控制符后的文本；at 之间、at 与文本之间规范化为一个空格。返回值由
 /// gpa 分配，调用方负责释放。系统把它追加到原语录时不会再补任何空格。
+///
+/// at 与 text 的处理跟 `renderSegments` / `onebot.Message.renderText` 完全
+/// 一致（数字 QQ 写成 `atname` 占位、text 剔除占位控制字节）：补丁最终是
+/// 语录正文的一部分，一条 `💨 @某人` 追加进去的名字没有理由比正文里的 at
+/// 少一层改名同步，用户也没有理由能从这条路径伪造出一个 at。
 pub fn tailAppendBody(gpa: std.mem.Allocator, m: onebot.Message) !?[]u8 {
     if (replyCount(m) != 1) return null;
 
@@ -320,16 +334,29 @@ pub fn tailAppendBody(gpa: std.mem.Allocator, m: onebot.Message) !?[]u8 {
 
     const trimmed = std.mem.trim(u8, texts.items, ws);
     if (!std.mem.startsWith(u8, trimmed, append)) return null;
-    const text_body = std.mem.trim(u8, trimmed[append.len..], ws);
+
+    // 补丁正文跟别处的 text 段一样是用户可控的，夹带 `atname` 占位控制字节
+    // 的话渲染时会被展开成一个"@某人"。先剔除、再判空：一条只由这些字节
+    // 组成的补丁剔除后什么都不剩，那跟"控制符后面本来就是空的"是同一回事，
+    // 不该凭空成立一条补丁。剔除可能在中间留下多余空白，所以再 trim 一次。
+    var sanitized: std.ArrayList(u8) = .empty;
+    defer sanitized.deinit(gpa);
+    try atname.appendSanitized(gpa, &sanitized, std.mem.trim(u8, trimmed[append.len..], ws));
+    const text_body = std.mem.trim(u8, sanitized.items, ws);
     if (text_body.len == 0 and ats.items.len == 0) return null;
 
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(gpa);
     for (ats.items, 0..) |at, i| {
         if (i > 0) try out.append(gpa, ' ');
-        try out.append(gpa, '@');
-        const display = if (at.name) |name| if (name.len > 0) name else at.qq else at.qq;
-        try out.appendSlice(gpa, display);
+        // 跟 renderSegments / renderText 同一套：数字 QQ 写占位，名字留到
+        // 渲染时再解析。补丁是语录正文的一部分，没有理由在这里另立一套。
+        if (std.fmt.parseInt(u64, std.mem.trim(u8, at.qq, ws), 10)) |uid|
+            try atname.append(gpa, &out, uid)
+        else |_| {
+            try out.append(gpa, '@');
+            try atname.appendSanitized(gpa, &out, at.qq);
+        }
     }
     if (text_body.len > 0) {
         if (out.items.len > 0) try out.append(gpa, ' ');
@@ -2070,7 +2097,7 @@ test "路径3 · at 语法：✨ 内容（没有 at）行为逐字不变，autho
     try std.testing.expectEqual(@as(?u64, null), out.candidates[0].author_uid);
 }
 
-test "路径3 · at 语法：只有紧跟 ✨ 的 at 是作者标记，后面的 at 是普通正文（渲染成 @昵称）" {
+test "路径3 · at 语法：只有紧跟 ✨ 的 at 是作者标记，后面的 at 是普通正文（渲染成占位）" {
     const gpa = std.testing.allocator;
     // `✨ 你好 @小明` —— at 前面已经有正文了，它不是作者标记。
     const msgs = [_]onebot.Message{.{
@@ -2086,11 +2113,12 @@ test "路径3 · at 语法：只有紧跟 ✨ 的 at 是作者标记，后面的
     defer out.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
-    try std.testing.expectEqualStrings("你好 @小明", out.candidates[0].text_override.?);
+    // 正文里的 at 是占位而不是名字：`小明` 是段上带的群展示名，它进不了正文。
+    try std.testing.expectEqualStrings("你好 \x0150001\x02", out.candidates[0].text_override.?);
     try std.testing.expectEqual(@as(?u64, null), out.candidates[0].author_uid);
 }
 
-test "路径3 · at 语法：作者标记之后的 at 仍然渲染成 @昵称，只有第一个被吃掉" {
+test "路径3 · at 语法：作者标记之后的 at 仍然渲染进正文，只有第一个被吃掉" {
     const gpa = std.testing.allocator;
     const msgs = [_]onebot.Message{.{
         .message_id = 1,
@@ -2106,8 +2134,12 @@ test "路径3 · at 语法：作者标记之后的 at 仍然渲染成 @昵称，
     var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
     defer out.deinit(gpa);
 
-    try std.testing.expectEqualStrings("谢谢 @小红", out.candidates[0].text_override.?);
+    try std.testing.expectEqualStrings("谢谢 \x0160001\x02", out.candidates[0].text_override.?);
     try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
+    // 展开之后才是给人看的样子，昵称来自渲染时的 hikari:username，不是段上的 name。
+    const shown = try atname.expand(gpa, out.candidates[0].text_override.?, &.{60001}, &.{"小红"});
+    defer gpa.free(shown);
+    try std.testing.expectEqualStrings("谢谢 @小红", shown);
 }
 
 test "路径3 · at 语法：✨ @某人 后面没有正文 → 空路径3候选，计 skipped 且不能跌落路径1" {
@@ -2151,11 +2183,14 @@ test "路径3 · at 语法：@全体成员（qq 不是数字）不是作者标�
     defer out.deinit(gpa);
 
     try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
-    try std.testing.expectEqualStrings("@全体成员 大家好", out.candidates[0].text_override.?);
+    // 非数字目标没有 QQ 号可查，保留 `@{qq}` 字面写法（`parseMessage` 本来就
+    // 会把 at.data.name 丢掉，线上渲染出来的一直是 `@all`，不是 `@全体成员`）。
+    try std.testing.expectEqualStrings("@all 大家好", out.candidates[0].text_override.?);
+    try std.testing.expect(!atname.has(out.candidates[0].text_override.?));
     try std.testing.expectEqual(@as(?u64, null), out.candidates[0].author_uid);
 }
 
-test "路径3 · at 语法：at 缺 name 时正文里退化成 @QQ号，作者标记本身仍按 qq 解析" {
+test "路径3 · at 语法：at 的 name 不参与正文，作者标记本身仍按 qq 解析" {
     const gpa = std.testing.allocator;
     // 第一个 at 是作者标记（被吃掉），第二个 at 缺 name → 渲染成 @60001。
     const msgs = [_]onebot.Message{.{
@@ -2173,7 +2208,11 @@ test "路径3 · at 语法：at 缺 name 时正文里退化成 @QQ号，作者�
     var out = try classify(gpa, &msgs, &msgs, &.{}, &.{}, params());
     defer out.deinit(gpa);
 
-    try std.testing.expectEqualStrings("对 @60001 说的", out.candidates[0].text_override.?);
+    try std.testing.expectEqualStrings("对 \x0160001\x02 说的", out.candidates[0].text_override.?);
+    // 渲染时查不到昵称 → 退回 @QQ号，跟改动之前 name 缺失的表现一致。
+    const shown = try atname.expand(gpa, out.candidates[0].text_override.?, &.{}, &.{});
+    defer gpa.free(shown);
+    try std.testing.expectEqualStrings("对 @60001 说的", shown);
     try std.testing.expectEqual(@as(?u64, NAMED), out.candidates[0].author_uid);
 }
 
@@ -2307,8 +2346,34 @@ test "💨：at 段移动到补丁最前面，多个 at 保持顺序" {
     var out = try classify(gpa, &msgs, &msgs, &.{1}, &.{}, params());
     defer out.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 1), out.candidates.len);
-    // 追加到原文时仍不额外插空格，最终正文是“原文@甲 @乙 内容”。
-    try std.testing.expectEqualStrings("@甲 @乙 内容", out.candidates[0].text_suffix.?);
+    // 补丁里的 at 跟正文里的 at 走同一套：写占位、名字留到渲染时解析，段上
+    // 带的展示名（甲/乙）进不了存储文本。
+    try std.testing.expectEqualStrings("\x019\x02 \x0110\x02 内容", out.candidates[0].text_suffix.?);
+    // 追加到原文时仍不额外插空格，展开之后最终正文是“原文@甲 @乙 内容”。
+    const shown = try atname.expand(gpa, out.candidates[0].text_suffix.?, &.{ 9, 10 }, &.{ "甲", "乙" });
+    defer gpa.free(shown);
+    try std.testing.expectEqualStrings("@甲 @乙 内容", shown);
+}
+
+test "💨：补丁正文里手打的占位控制字节被丢弃，无法从这条路径伪造 at" {
+    const gpa = std.testing.allocator;
+    const forged = replyMsg(2, OUTSIDER, 1, "💨 \x011393309348\x02 是我说的");
+    const body = (try tailAppendBody(gpa, forged)).?;
+    defer gpa.free(body);
+    try std.testing.expectEqualStrings("1393309348 是我说的", body);
+    try std.testing.expect(!atname.has(body));
+
+    // 只剩下裸数字，所以伪造的目标 QQ 反而暴露成正文的一部分，跟别处
+    // （onebot.renderText、renderSegments）的表现逐字一致。
+    const digits = replyMsg(3, OUTSIDER, 1, "💨 \x0177\x02");
+    const kept = (try tailAppendBody(gpa, digits)).?;
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings("77", kept);
+
+    // 整条补丁只由控制字节组成时，剔除之后什么都不剩 —— 跟"控制符后面是
+    // 空的"是同一回事，这条补丁不成立。
+    const empty = replyMsg(4, OUTSIDER, 1, "💨 \x01\x02");
+    try std.testing.expectEqual(@as(?[]u8, null), try tailAppendBody(gpa, empty));
 }
 
 test "💨：没有正文、夹带 image、或目标不是候选时完全无效" {

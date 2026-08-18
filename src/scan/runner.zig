@@ -2,6 +2,7 @@ const std = @import("std");
 const napcat = @import("../napcat.zig");
 const ocr = @import("../ocr.zig");
 const onebot = @import("../onebot.zig");
+const atname = @import("../atname.zig");
 const rules = @import("rules.zig");
 const store = @import("../store.zig");
 const uuid = @import("../uuid.zig");
@@ -531,6 +532,107 @@ pub fn authorNickname(deps: Deps, arena: std.mem.Allocator, group_id: u64, user_
         }
     }
     return name;
+}
+
+/// `hikari refresh-names` 一次运行的结果。`uids` 是 `collectNameUids` 列出的
+/// 待处理 QQ 数，另外三个把它分完：`refreshed` 真的写了一次
+/// `hikari:username:{uid}`，`unchanged` 问出来的名字跟存着的一模一样、一条写
+/// 命令都没发，`unresolved` 是**一个群都没问出昵称**、因此原样不动的。
+///
+/// `unresolved` 不算失败：这个人已经离开了全部被观察的群，NapCat 就是回答不了
+/// "他现在叫什么"。这时把键留在原地（哪怕留着的是一张旧群名片）严格优于清空
+/// 它——渲染时至少还有"最后已知的名字"，而空串会赢过 hash 里的快照，把这个人
+/// 说过的全部历史语录的作者名一次性抹成空白。见 `store.Store.setUsername`。
+pub const RefreshNamesSummary = struct {
+    uids: usize = 0,
+    refreshed: usize = 0,
+    unchanged: usize = 0,
+    unresolved: usize = 0,
+};
+
+pub fn formatRefreshNamesSummary(gpa: std.mem.Allocator, s: RefreshNamesSummary) ![]u8 {
+    return std.fmt.allocPrint(gpa,
+        \\Checked {d} QQ number(s) referenced by stored quotes.
+        \\Refreshed {d} hikari:username key(s), {d} already correct, {d} unresolved (left untouched).
+        \\
+    , .{ s.uids, s.refreshed, s.unchanged, s.unresolved });
+}
+
+/// `hikari refresh-names`（`main.zig` 的子命令）的执行体：把每条语录引用到的
+/// QQ（`store.Store.collectNameUids`：作者 ∪ 收录者）逐个问一遍
+/// `get_group_member_info`，用 QQ 原始昵称重写 `hikari:username:{uid}`。
+///
+/// 存在的理由在 `collectNameUids` 的注释里：这些键最初是由一段采用群名片的
+/// 代码写下的，写入端改对之后**存量的错值不会自愈**，而 `creator` 与正文里的
+/// at 改成渲染时解析之后，这些键的值就是对外显示的名字本身。
+///
+/// 它是"扫描时刷新昵称"这件事的同一套机制，只是驱动来源换了：`authorNickname`
+/// 由**扫描窗口里遇到的人**驱动，这里由**库里存着的人**驱动。所以它跟
+/// `authorNickname` 共用 `memberNickname`，也共用后者那条最重要的纪律——只认
+/// `nickname`，绝不采用 `card`。真正的写入同样只经 `setUsername` 一个出口。
+///
+/// 三条纪律，跟 `reindexByUser` 是同一套：
+///
+///   - **只碰 `hikari:username`**：语录 hash、各个索引、`lastrun` 一律不写。
+///     跑这条命令不可能改变任何一条语录的内容，最坏情况是某个人的显示名被刷
+///     成了另一个同样来自 NapCat 的名字。
+///   - **幂等、可重复跑**：第二遍会把全部命中都算进 `unchanged`、一条写命令
+///     都不发。中途失败（网络断了、Redis 重启）的修复手段就是原样再跑一遍。
+///   - **绝不自动触发**：进程启动不跑，定时扫描不跑，读路径更不会顺手写一笔。
+///
+/// 错误分工：Redis 出错一律向上抛、整条命令就此中止——`Store` 是单连接、请求/
+/// 响应严格配对的，一次读到一半的失败之后帧对齐不再可信，继续往下发命令是在
+/// 拿"下一个人的名字被写进上一个人的键"冒险。NapCat 那一侧相反，逐个 QQ 各算
+/// 各的：某个人问不到只让他自己进 `unresolved`，不牵连其余的人。
+///
+/// 每个 QQ 一个 arena：一次运行要问几十上百次 NapCat，每次的 JSON 回复都活在
+/// arena 里，不逐个释放的话峰值内存是所有回复之和。
+pub fn refreshNames(deps: Deps) !RefreshNamesSummary {
+    var summary: RefreshNamesSummary = .{};
+
+    const uids = try deps.st.collectNameUids(deps.gpa);
+    defer deps.gpa.free(uids);
+    summary.uids = uids.len;
+
+    for (uids) |uid| {
+        var ar = std.heap.ArenaAllocator.init(deps.gpa);
+        defer ar.deinit();
+        const a = ar.allocator();
+
+        // 一个人只可能在被观察的某一个群里，所以逐群问到第一个非空昵称为止。
+        // 空串跟问不到一样继续往下问：`memberNickname` 用空串表示"这个群回答
+        // 了，但他的原始昵称确实是空的"，而空串永远不该被写进这个键。
+        const fresh: ?[]const u8 = found: {
+            for (deps.group_ids) |gid| {
+                const n = memberNickname(deps, a, gid, uid) orelse continue;
+                if (n.len > 0) break :found n;
+            }
+            break :found null;
+        };
+        const name = fresh orelse {
+            summary.unresolved += 1;
+            std.log.warn(
+                "hikari:username:{d}: no observed group could resolve an original nickname; leaving the stored value as-is",
+                .{uid},
+            );
+            continue;
+        };
+
+        const current = try deps.st.getUsername(a, uid);
+        if (current) |old| {
+            if (std.mem.eql(u8, old, name)) {
+                summary.unchanged += 1;
+                continue;
+            }
+        }
+        try deps.st.setUsername(uid, name);
+        summary.refreshed += 1;
+        // 逐条打出改了什么：这条命令的结果全部落在 Redis 里，不打的话运营方
+        // 除了一个计数之外没有任何办法知道它究竟把谁改成了谁。
+        std.log.info("hikari:username:{d}: {s} -> {s}", .{ uid, current orelse "(unset)", name });
+    }
+
+    return summary;
 }
 
 /// `at.data.name` 是群展示名，不能信任。这里在规则判定和正文拼接之前，对每个
@@ -2050,6 +2152,21 @@ const FakeServer = struct {
     }
 };
 
+/// 按给定顺序在 `bytes` 里逐帧定位：每一帧都必须存在，且必须出现在前一帧之后。
+/// 跟 store.zig 里的同名函数逐字相同（那边的注释解释了为什么断言的必须是完整
+/// 的命令帧而不是命令名子串）；跟 FakeServer / FakeNapcatServer 一样，本仓库
+/// 的测试设施是按模块各留一份的。
+fn expectFrameSequence(bytes: []const u8, frames: []const []const u8) !void {
+    var at: usize = 0;
+    for (frames) |f| {
+        const idx = std.mem.indexOfPos(u8, bytes, at, f) orelse {
+            std.debug.print("missing or out-of-order RESP frame: {s}\n", .{f});
+            return error.TestUnexpectedResult;
+        };
+        at = idx + f.len;
+    }
+}
+
 test "applyLastRun：失败的群不写 setLastRun，成功的兄弟群照写——互不影响" {
     const gpa = std.testing.allocator;
     // 脚本只放一条 "+OK\r\n"：失败的那次 applyLastRun 调用必须完全不发命令
@@ -2430,8 +2547,14 @@ test "resolveAtNames：覆盖群名片为 QQ 原始昵称，同一 QQ 每轮只�
     defer cache.deinit();
     try resolveAtNames(deps, ar.allocator(), 99, &messages, &cache);
 
-    try std.testing.expectEqualStrings("你好 @昵称", try messages[0].renderText(ar.allocator()));
-    try std.testing.expectEqualStrings("@昵称 再见", try messages[1].renderText(ar.allocator()));
+    // 存储文本里是占位（QQ 号），不是名字——群名片和 QQ 原始昵称都不进正文。
+    try std.testing.expectEqualStrings("你好 \x0150001\x02", try messages[0].renderText(ar.allocator()));
+    try std.testing.expectEqualStrings("\x0150001\x02 再见", try messages[1].renderText(ar.allocator()));
+    // 渲染时用刚刷进 hikari:username 的那个昵称展开，仍然是"昵称"而不是"群名片"。
+    try std.testing.expectEqualStrings(
+        "你好 @昵称",
+        try atname.expand(ar.allocator(), try messages[0].renderText(ar.allocator()), &.{50001}, &.{"昵称"}),
+    );
 
     rc.deinit();
     redis_srv.stop();
@@ -2479,8 +2602,190 @@ test "resolveAtNames：昵称缺失时清除群名片，退化为 @QQ" {
     var cache: AuthorCache = .init(ar.allocator());
     defer cache.deinit();
     try resolveAtNames(deps, ar.allocator(), 99, &messages, &cache);
-    try std.testing.expectEqualStrings("@50001", try messages[0].renderText(ar.allocator()));
+    const rendered = try messages[0].renderText(ar.allocator());
+    try std.testing.expectEqualStrings("\x0150001\x02", rendered);
+    // 昵称查不到 → hikari:username 不被空值覆盖，展开也就退回 @QQ号，
+    // 群名片在这两步里都没有任何机会挤进来。
+    try std.testing.expectEqualStrings("@50001", try atname.expand(ar.allocator(), rendered, &.{}, &.{}));
     try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:username:50001") == null);
+}
+
+// ---------------------------------------------------------------------------
+// refreshNames —— `hikari refresh-names` 的执行体。
+//
+// 它跟 resolveAtNames/authorNickname 共用 memberNickname，因此也共用"只认
+// nickname、绝不采用 card"这条纪律；区别只在驱动来源：那两个由扫描窗口里遇到
+// 的人驱动，这个由库里存着的人（store.collectNameUids）驱动。
+
+test "refreshNames：把群名片重写成 QQ 原始昵称，已经对的那个一条写命令都不发" {
+    const gpa = std.testing.allocator;
+
+    // 一条语录：作者 10001，收录者 50001 —— 于是要处理两个 QQ。
+    const redis_script = "*1\r\n$1\r\n1\r\n" ++ // SMEMBERS hikari:index
+        "*2\r\n$5\r\n10001\r\n$5\r\n50001\r\n" ++ // HMGET hikari:quote:1 user_id creator_uid
+        "$13\r\n前辈前辈!\r\n" ++ // GET hikari:username:10001 —— 旧代码写下的群名片
+        "+OK\r\n" ++ // SET hikari:username:10001
+        "$6\r\n昵称\r\n"; // GET hikari:username:50001 —— 本来就已经是昵称
+    const redis_srv = try FakeServer.start(gpa, redis_script);
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    defer rc.deinit();
+    var st = store.Store.init(gpa, &rc);
+
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"前辈前辈!\",\"nickname\":\"Sylphy\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"群名片\",\"nickname\":\"昵称\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{ .gpa = gpa, .nap = &nap, .st = &st, .observed_qqs = &.{}, .admin_qqs = &.{}, .group_ids = &.{99} };
+    const summary = try refreshNames(deps);
+
+    try std.testing.expectEqual(@as(usize, 2), summary.uids);
+    try std.testing.expectEqual(@as(usize, 1), summary.refreshed);
+    try std.testing.expectEqual(@as(usize, 1), summary.unchanged);
+    try std.testing.expectEqual(@as(usize, 0), summary.unresolved);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    try expectFrameSequence(redis_srv.received.items, &.{
+        "*2\r\n$8\r\nSMEMBERS\r\n$12\r\nhikari:index\r\n",
+        "*4\r\n$5\r\nHMGET\r\n$14\r\nhikari:quote:1\r\n$7\r\nuser_id\r\n$11\r\ncreator_uid\r\n",
+        "*2\r\n$3\r\nGET\r\n$21\r\nhikari:username:10001\r\n",
+        "*3\r\n$3\r\nSET\r\n$21\r\nhikari:username:10001\r\n$6\r\nSylphy\r\n",
+        "*2\r\n$3\r\nGET\r\n$21\r\nhikari:username:50001\r\n",
+    });
+    // 值一样就完全不写：跑第二遍是零写命令的，这正是"可重复跑"的含义。
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        redis_srv.received.items,
+        "*3\r\n$3\r\nSET\r\n$21\r\nhikari:username:50001\r\n",
+    ) == null);
+    // 群名片一个字节都不会被写回去——它只出现在 NapCat 的回复里。
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "前辈前辈") == null);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "群名片") == null);
+
+    try std.testing.expectEqual(@as(usize, 2), nap_srv.targets.items.len);
+    try std.testing.expectEqualStrings("/get_group_member_info", nap_srv.targets.items[0]);
+    try std.testing.expectEqualStrings("{\"group_id\":99,\"user_id\":10001,\"no_cache\":true}", nap_srv.bodies.items[0]);
+    try std.testing.expectEqualStrings("{\"group_id\":99,\"user_id\":50001,\"no_cache\":true}", nap_srv.bodies.items[1]);
+}
+
+test "refreshNames：一个群问不到就问下一个，键从来没写过时照样补上" {
+    const gpa = std.testing.allocator;
+
+    const redis_script = "*1\r\n$1\r\n1\r\n" ++
+        "*2\r\n$5\r\n10001\r\n$1\r\n0\r\n" ++ // creator_uid=0（自动路径）→ 只有作者一个 QQ
+        "$-1\r\n" ++ // GET hikari:username:10001 —— 这个键从来没被刷新过
+        "+OK\r\n"; // SET
+    const redis_srv = try FakeServer.start(gpa, redis_script);
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    defer rc.deinit();
+    var st = store.Store.init(gpa, &rc);
+
+    // 99 群里没这个人（NapCat 直接拒绝），100 群里有。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"failed\",\"retcode\":100,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"群名片\",\"nickname\":\"昵称\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{ .gpa = gpa, .nap = &nap, .st = &st, .observed_qqs = &.{}, .admin_qqs = &.{}, .group_ids = &.{ 99, 100 } };
+    const summary = try refreshNames(deps);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.uids);
+    try std.testing.expectEqual(@as(usize, 1), summary.refreshed);
+    try std.testing.expectEqual(@as(usize, 0), summary.unresolved);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    try expectFrameSequence(redis_srv.received.items, &.{
+        "*2\r\n$3\r\nGET\r\n$21\r\nhikari:username:10001\r\n",
+        "*3\r\n$3\r\nSET\r\n$21\r\nhikari:username:10001\r\n$6\r\n昵称\r\n",
+    });
+    try std.testing.expectEqual(@as(usize, 2), nap_srv.bodies.items.len);
+    try std.testing.expectEqualStrings("{\"group_id\":99,\"user_id\":10001,\"no_cache\":true}", nap_srv.bodies.items[0]);
+    try std.testing.expectEqualStrings("{\"group_id\":100,\"user_id\":10001,\"no_cache\":true}", nap_srv.bodies.items[1]);
+}
+
+test "refreshNames：一个群都问不出昵称时原样不动，连 GET 都不发" {
+    const gpa = std.testing.allocator;
+
+    // 脚本里没有 GET/SET 的回复：这条测试的断言之一就是它们根本不会被发出来。
+    const redis_script = "*1\r\n$1\r\n1\r\n" ++ "*2\r\n$5\r\n10001\r\n$1\r\n0\r\n";
+    const redis_srv = try FakeServer.start(gpa, redis_script);
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    defer rc.deinit();
+    var st = store.Store.init(gpa, &rc);
+
+    // 问到了，但这个人的原始昵称是空的——空串永远不该被写进 hikari:username，
+    // 它在渲染时会赢过 hash 里的快照，把这个人的历史语录作者名一次抹成空白。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"card\":\"群名片\",\"nickname\":\"\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{ .gpa = gpa, .nap = &nap, .st = &st, .observed_qqs = &.{}, .admin_qqs = &.{}, .group_ids = &.{99} };
+    const summary = try refreshNames(deps);
+
+    try std.testing.expectEqual(@as(usize, 1), summary.uids);
+    try std.testing.expectEqual(@as(usize, 0), summary.refreshed);
+    try std.testing.expectEqual(@as(usize, 0), summary.unchanged);
+    try std.testing.expectEqual(@as(usize, 1), summary.unresolved);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, "hikari:username") == null);
+}
+
+test "formatRefreshNamesSummary 产出的文本带四个计数" {
+    const gpa = std.testing.allocator;
+    const text = try formatRefreshNamesSummary(gpa, .{ .uids = 51, .refreshed = 9, .unchanged = 40, .unresolved = 2 });
+    defer gpa.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "51 QQ number(s)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Refreshed 9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "40 already correct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "2 unresolved") != null);
 }
 
 const FakeOcr = struct {

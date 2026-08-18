@@ -50,7 +50,7 @@ Hikari 是一个常驻进程，做两件事：
 | `get_msg` | 取单条消息详情 | 返回体含 `emoji_likes_list: [{emoji_id, emoji_type, likes_cnt}]`，只能说明某种回应有几次，**不含回应者身份**；顶层还含 `user_id`（与 `sender.user_id` 一致，`onebot.parseMessage` 依赖这个顶层字段解出发送者）。2026-08-15 针对生产 NapCat 直接探测 `get_msg` 已确认，顶层 key 为 `emoji_likes_list, font, group_id, group_name, message, message_format, message_id, message_seq, message_type, post_type, raw_message, real_id, real_seq, self_id, sender, sub_type, time, user_id` |
 | `get_emoji_likes` | 取某条消息某一种表情回应的点击者 | 入参至少给 `message_id`, `emoji_id`, `count`（`count=0` 取全部；Unicode 💤 的 `emoji_id="128164"`，`emoji_type="2"` 可省略或显式给出），返回 `emoji_like_list: [{user_id, nick_name}]`。只在一条管理员 💤 锚点的 `get_msg` 已显示存在 💤 回应时调用，用返回的 `user_id` 验证是不是锚点发送者本人确认 |
 | `get_group_info` | 取群名 | 刷新 `hikari:groupname:{group_id}`，渲染时覆盖 hitokoto 的 `from`（见 4.7 节、5 节） |
-| `get_group_member_info` | 取**某个作者**的 QQ 原始昵称 | 逐候选作者调用（每次扫描内按 `user_id` 缓存，同一个作者只问一次），只读取返回的 `nickname`、绝不使用 `card`，刷新 `hikari:username:{user_id}`，渲染时覆盖 hitokoto 的 `from_who`（见 4.7 节、5 节）。2026-08-16 起不再是"每群一次、查被观察者"——`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群不再有唯一的"那个被观察者"可查，改成按窗口内每条候选**自己的作者**查 |
+| `get_group_member_info` | 取**某个作者**的 QQ 原始昵称 | 逐候选作者调用（每次扫描内按 `user_id` 缓存，同一个作者只问一次），只读取返回的 `nickname`、绝不使用 `card`，刷新 `hikari:username:{user_id}`，渲染时决定 `from_who` / `creator` / 正文里的 `@昵称`（见 4.7 节、5 节）。`hikari refresh-names` 用的也是这个接口，只是由库里存着的人驱动而不是由扫描窗口驱动（见 5 节）。2026-08-16 起不再是"每群一次、查被观察者"——`OBSERVED_QQS` 允许空集合（观察所有人）之后，一个群不再有唯一的"那个被观察者"可查，改成按窗口内每条候选**自己的作者**查 |
 | `get_login_info` | 取机器人自己的 QQ | 每次 `runOnce` 只问一次，供合并转发 node 的 `user_id` 复用；见 7 节 |
 | `send_group_forward_msg` | 发送运行日志 | 每群一条合并转发消息，七行各占一个 node；见 7 节 |
 
@@ -228,7 +228,7 @@ tombstone 是永久的：以后任何一次扫描再次看到这条消息，无�
 
 改动之前，路径3收录的语录 `user_id`（也就是 `from_who` 与 `hikari:byuser:{user_id}` 记的那个人）是**敲指令的管理员**，而管理员补录的恰恰是**别人**说过的话——后果是 `/?user_id=` 永远查不到手动补录的语录归在真正说这句话的人名下。
 
-- **判定走段列表，不走渲染文本。** `renderText` 把 `at` 段渲染成 `@昵称` 就把 `at.data.qq` 彻底丢掉了，而"这句话是谁说的"只能从那个 QQ 号来（在渲染文本上反解 `@昵称` 既不可靠——昵称可以带空格、可以跟正文粘在一起、可以重名——也拿不到 QQ 号）。实现是 `rules.manualParse`：按段序找承载 `✨` 的那个 text 段（`.other` 段丢弃、左 trim 后为空的 text 段跳过，与 `renderText` 的口径逐条对齐），再看紧跟其后的第一个有内容的段是不是 `at`。
+- **判定走段列表，不走渲染文本。** 这条规则最初的理由是 `renderText` 把 `at` 段烧成 `@昵称`、`at.data.qq` 就此丢失，而"这句话是谁说的"只能从那个 QQ 号来。占位化之后 QQ 号其实留在了渲染结果里，但判定照旧走段列表：从文本里反解占位既多绕一圈，也会把"紧跟 `✨` 的那个 at 才是作者标记"这条**位置**规则弄丢。实现是 `rules.manualParse`：按段序找承载 `✨` 的那个 text 段（`.other` 段丢弃、左 trim 后为空的 text 段跳过，与 `renderText` 的口径逐条对齐），再看紧跟其后的第一个有内容的段是不是 `at`。
 - **只有紧跟 `✨` 的那个 at 才是作者标记。** `✨ 你好 @某人` 里的 at 前面已经有正文了，它是普通内容，照旧渲染成 `@昵称`；作者标记之后再出现的 at 同样是普通内容。
 - **`creator` / `creator_uid` 仍然是管理员。** Hitokoto 语义下 creator 是"把这条语录加进来的人"，那永远是敲指令的那位管理员；作者（`from_who` / `user_id`）才是"说这句话的人"。改动之前两者恰好是同一个人，现在必须分开算。
 - **`✨ @某人` 后面没有正文** → 作者标记剥完后形成正文为空的路径3候选 → 在 4.6 节文本空关卡计入 `skipped`。光杆 `✨` 保持旧行为，不形成候选。路径3资格已经成立，所以即使发送者同时是被观察者，也由路径3优先级阻止这条消息跌回路径1；否则一条控制指令会被路径1把 `✨ @某人` 本身当语录正文收进去，且日志少算一次 skip。
@@ -326,7 +326,7 @@ D  （无 🔥）           → 连续段在这里结束
 
 ### 4.5.3 💨 回复 —— 只给本轮候选补尾
 
-任意发送者引用消息 `R`，除唯一 reply 段外只含 text/at 段，全部 text 拼接并 trim 后以 `💨` 开头，且控制符后有非空正文或至少一个 at → 这是一条正文补丁。剥掉 `💨` 和内容两侧的语法空白后，把所有 at 按原顺序移动到补丁最前，at 之间以及 at 与文字之间规范化成一个空格（`💨 内容 @甲 @乙` → `@甲 @乙 内容`）；随后把整个补丁直接追加到 `R` 对应候选的正常正文末尾，**不自动插空格**。夹带 image/face 等其它段时整条语法无效。
+任意发送者引用消息 `R`，除唯一 reply 段外只含 text/at 段，全部 text 拼接并 trim 后以 `💨` 开头，且控制符后有非空正文或至少一个 at → 这是一条正文补丁。剥掉 `💨` 和内容两侧的语法空白后，把所有 at 按原顺序移动到补丁最前，at 之间以及 at 与文字之间规范化成一个空格（`💨 内容 @甲 @乙` → 渲染后是 `@甲 @乙 内容`）；随后把整个补丁直接追加到 `R` 对应候选的正常正文末尾，**不自动插空格**。补丁里的 at 与文本跟正文走完全同一套处理：数字 QQ 写成 `atname` 占位、名字留到渲染时解析，文本剔除占位控制字节——补丁是语录正文的一部分，没有理由在改名同步和防伪造这两件事上另立一套。剔除之后什么都不剩的补丁等同于"控制符后面是空的"，不成立。夹带 image/face 等其它段时整条语法无效。
 
 - 补丁在全部候选分类、按 `message_id` 去重、同窗口 💦 剔除之后才附着；`R` 没有最终成为候选就无事发生
 - `R` 是 🔥 链任意内容成员时，补到整条链候选；多条补丁按 `time`、再按 `message_id` 升序依次拼接
@@ -345,7 +345,7 @@ D  （无 🔥）           → 连续段在这里结束
 **文本提取规则**：
 
 - `text` 段：原样取 `data.text`
-- `at` 段：解析时丢弃 NapCat 的 `data.name`（它是群展示名/可能是群名片）；runner 在规则判定与正文拼接前，对数字 QQ 查询 `get_group_member_info.nickname`，只用这个 QQ 原始昵称渲染为 `@昵称`。查询失败或昵称为空时退化为 `@QQ`，绝不回退到群名片；非数字目标保留其专用标识。
+- `at` 段：解析时丢弃 NapCat 的 `data.name`（它是群展示名/可能是群名片）。**存储文本里不写名字**，数字 QQ 写成一个携带 QQ 号的占位 `\x01{qq}\x02`（`src/atname.zig`），渲染时（`Store.resolveDisplayNames`）用当前的 `hikari:username:{qq}` 展开成 `@昵称`，查不到或昵称为空退化为 `@QQ号`——跟改动之前 `at.name` 缺失时的表现逐字一致，且绝不回退到群名片。非数字目标（`@全体成员`）没有 QQ 号可查，保留 `@{qq}` 字面写法。runner 仍然在规则判定与正文拼接前查一遍 `get_group_member_info.nickname`：那次查询顺带把 `hikari:username:{qq}` 刷成 QQ 原始昵称，而那正是渲染时展开占位要读的键。文本段里如果原样带着这两个控制字节，会在拼接时被丢掉（`atname.appendSanitized`），所以占位只可能由真正的 at 段产生——否则任何人发一条内容为 `\x01{别人的QQ}\x02` 的消息就能让自己的语录冒充成 at 了那个人。
 - `image` 段：保留 `data.file` / `data.url`；带 `emoji_id` 或 `file="marketface"` 时标记为个人/商城表情，供空正文候选的 OCR 回退使用，本身不产生占位符
 - `mface` 段：归一成上述 image 结构；优先保留已有 URL，缺失时用 `emoji_id` 生成 NapCat 同源 `raw300.gif` URL
 - `face` 段：QQ 内置表情，只有语义 ID、没有可交给 OCR 的图片定位信息；直接丢弃，不与个人/商城表情混同
@@ -365,7 +365,7 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 
 路径 3、路径 4 的候选带 `text_override`，正文直接取该字段（路径3是按上述规则渲染、并剥掉 `✨` 前缀——以及、若用了 `✨ @某人 内容` 语法，紧跟 `✨` 的那个作者标记 `at` 段——之后的结果；路径4是链上各成员依次取——若某个成员自己也满足路径3格式，取它剥掉前缀后的正文，否则取它的原始渲染文本——再用单个空格拼接后的结果，见 4.5.1 节），不再重复提取。
 
-路径3的判定与正文渲染因此是**分段进行**的：先在 `onebot.Segment` 列表上定位 `✨` 前缀与可能的作者标记 `at`（4.5 节路径3），再对剩下的段套用上面这套渲染规则（`rules.renderSegments`，与 `onebot.Message.renderText` 同一套 text/at/丢弃逻辑，只是不做整体 trim、由调用方自己 trim）。作者标记之后的 `at` 段仍然照常渲染成 `@昵称`——被吃掉的只有作为作者标记的那一个。
+路径3的判定与正文渲染因此是**分段进行**的：先在 `onebot.Segment` 列表上定位 `✨` 前缀与可能的作者标记 `at`（4.5 节路径3），再对剩下的段套用上面这套渲染规则（`rules.renderSegments`，与 `onebot.Message.renderText` 同一套 text/at/丢弃逻辑，只是不做整体 trim、由调用方自己 trim）。作者标记之后的 `at` 段仍然照常进正文（写成占位、渲染时展开成 `@昵称`）——被吃掉的只有作为作者标记的那一个。承载 `✨` 的那个 text 段被剥掉前缀后剩下的尾巴同样是用户可控文本，因此跟别的 text 段走同一条 `atname.appendSanitized`，否则管理员发一条 `✨` + 手打占位字节 + 内容就能伪造出一个 at。
 
 ### 4.7 字段映射
 
@@ -378,7 +378,7 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 | `from` | 群名。渲染时（`GET /`、`/extra/*`）优先取 `hikari:groupname:{group_id}` 的实时值；这个键缺失才落回收录当时冻结进 hash 的快照 |
 | `from_who` | 语录**作者**（不是固定的被观察者）的 QQ 原始昵称。路径3用了 `✨ @某人 内容`、或路径3b用了 `reply + ✨ @某人` 时，作者是**被 at 的那个人**，不是敲指令的管理员。渲染时优先取 `hikari:username:{user_id}` 的实时值；这个键缺失（导入的语录、这个人从未被某次扫描当过候选作者、或者已经离群且从未刷新成功过）才落回 hash 里冻结的快照 |
 | `user_id` | 语录作者的 QQ，数值 JSON 字段；路径3/3b为被 at 的作者，其余路径为原消息作者，与 `from_who` / `?user_id=` 的归属一致 |
-| `creator` | 路径1、2、4固定 `"Hikari"`；路径3/3b是**那位管理员**当时的 QQ 原始昵称——他本人在 Hitokoto 语义下就是这条语录的**添加者**，跟「这句话是谁说的」（`from_who`）是两回事 |
+| `creator` | 路径1、2、4固定 `"Hikari"`；路径3/3b是**那位管理员**的 QQ 原始昵称——他本人在 Hitokoto 语义下就是这条语录的**添加者**，跟「这句话是谁说的」（`from_who`）是两回事。跟 `from_who` 一样是**渲染时解析**的：`creator_uid` 非 0 时优先取 `hikari:username:{creator_uid}` 的实时值，缺失才落回 hash 里冻结的快照。补上这条解析之前，同一个 QQ 会在同一条 JSON 里给出两个名字——`from_who` 是当前昵称，`creator` 却停在收录当天那一份 |
 | `creator_uid` | 路径1、2、4固定 `0`；路径3/3b是**那位管理员**的 QQ，不是被 at 的作者的 QQ |
 | `reviewer` | 固定 `0` |
 | `commit_from` | 固定 `"hikari"` |
@@ -422,8 +422,9 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 导入使用 `QQ_GROUP_IDS` 的第一个群：先各调用一次 `get_group_info` 与
 `get_group_member_info(group_id, <qq>)` 取得 `from` / `from_who`。其中任一归属解析失败就整次返回
 `AttributionUnavailable`，一条也不写，避免一次性手工导入留下永久残缺的归属字段。正文 trim 后的
-空行跳过；非空正文经固定种子的 Wyhash 确定性映射成负 `message_id`（与 NapCat 非负短 ID 的值域
-分离），所以重复导入幂等。入库字段沿用 4.7 节，`creator="Hikari"`、`creator_uid=0`、
+空行跳过；文件的一行同样是外部输入，先剔除 `atname` 的占位控制字节再入库——这条路径压根没有 at 段，
+留着它们只会让导入的语录在渲染时冒充成 at 了某个人。非空正文经固定种子的 Wyhash 确定性映射成负
+`message_id`（与 NapCat 非负短 ID 的值域分离），id 从剔除之后的文本派生，所以重复导入幂等。入库字段沿用 4.7 节，`creator="Hikari"`、`creator_uid=0`、
 `commit_from="import"`，时间取导入时刻；已 tombstone、已存在、空行与写失败分别计数并输出摘要。
 
 ## 5. Redis 结构
@@ -438,7 +439,7 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 | `hikari:lastrun:{group_id}` | STRING | 这个群上次扫描窗口终点的 Unix 秒，逐群独立 |
 | `hikari:chainmember:{message_id}` | STRING | 仅 🔥 链使用：value 是这条链**主键**（第一条内容消息）的 `message_id`。链的每一个**内容成员**——包括主键自己——都写一份，value 都是同一个主键。**桥不写**（桥不是成员，见 4.5 节） |
 | `hikari:chain:{message_id}` | SET | 仅 🔥 链使用，key 里的 `{message_id}` 是链**主键**：成员是这条链的全部**内容** `message_id`（含主键自己），同样不含桥 |
-| `hikari:username:{user_id}` | STRING | 这个人当前的 QQ 原始昵称（只取 `get_group_member_info.nickname`，绝不取群名片 `card`）。每次扫描按窗口内**遇到的候选作者**刷新（不是固定的被观察者），同一次扫描内同一个作者只刷新一次。渲染语录时（`GET /`、`/extra/*`）覆盖 hash 里冻结的 `from_who` 快照——这是"改名一次性反映到这个人说过的全部历史语录"的落点 |
+| `hikari:username:{user_id}` | STRING | 这个人当前的 QQ 原始昵称（只取 `get_group_member_info.nickname`，绝不取群名片 `card`）。每次扫描按窗口内**遇到的候选作者与被 at 的人**刷新（不是固定的被观察者），同一次扫描内同一个人只刷新一次。渲染语录时（`GET /`、`/extra/*`）它同时决定三处显示名：`from_who`（按 `user_id` 查）、`creator`（按 `creator_uid` 查）、以及正文里 at 占位展开出来的 `@昵称`——这是"改名一次性反映到这个人说过的全部历史语录"的落点 |
 | `hikari:groupname:{group_id}` | STRING | 这个群当前的群名，用法和理由跟 `hikari:username` 对称，覆盖的字段是 `from` |
 | `hikari:byuser:{user_id}` | ZSET | score = `length`（码点数），member = `message_id`（🔥 链只有主键在里面，跟 `hikari:bylen` 完全对称）。作者维度的索引，`/?user_id=` 在 `/`、`/extra/all`、`/extra/batch/:count` 三个端点上都靠它——用 ZSET 而不是 SET 是为了让"这个人 + 长度区间"和"全库 + 长度区间"共用同一条 `ZRANGEBYSCORE key min max`，只是 key 换了 |
 
@@ -452,7 +453,13 @@ OCR 得到非空正文之后才应用 4.5.3 的 `text_suffix`，直接拼接、�
 
 它**只由运营方显式触发**：进程启动不跑它，定时扫描不跑它，任何 HTTP 读路径都不会顺手写一笔。当初拒绝做迁移的理由（"读路径悄悄触发写"、"新增一个只在进程启动时跑一次的隐藏步骤"都会引入这次改动范围之外的新状态机）在这里原样成立——加一条子命令不推翻它，恰恰是遵守它：新增的状态机是零，运营方敲一次命令、看一行摘要、然后这条命令就再也不会自己运行。
 
-**渲染时的名字解析（`Store.fetchById`，`randomAny`/`randomByLength`/`allQuotes`/`randomMany` 的共同入口）**：`HGETALL` 拿到 hash 之后，紧接着一次 `MGET hikari:username:{user_id} hikari:groupname:{group_id}`（key 里的 `user_id`/`group_id` 就是这条语录 hash 自己存的两个字段——136 条现存生产语录早就带着它们，不需要任何迁移）。**哪个赢**：`MGET` 命中（哪怕命中的值本身是空串）就覆盖 hash 里的旧值，因为命中代表"这个 user_id / group_id 最近一次被成功刷新过"，是比收录当时冻结进 hash 的快照更新的事实；未命中（nil）——导入的语录、这个人从没在任何一次扫描里当过候选作者、或者他已经离群且这份映射从来没写成功过——退回 hash 里存的旧值，这正是"没有映射就保底"的 fallback 语义。`MGET` 本身失败（Redis I/O/协议错误）直接向上传播成 500，跟这一层其它读路径的失败语义一致，不单独吞掉。
+**`hikari:username` 里可能存着群名片，靠 `hikari refresh-names` 洗**：这些键最初是由一段 `card` 优先、`nickname` 兜底的代码写下的，于是相当一部分值根本不是 QQ 原始昵称（生产上 51 个键里能直接认出 `等我看完广告复活（1/24）`、`[顾雨辰小男娘派]dext喵` 这类群名片）。写入端后来改成只认 `nickname`，但**存量的错值不会自愈**——只有那个人再次出现在某次扫描窗口里才会被重写。`creator` 与正文里的 at 改成渲染时解析之后，这些键的值直接就是对外显示的名字，不先洗一遍，那两处修复只是把"冻结的群名片"换成"当前存着的群名片"。
+
+`hikari refresh-names`（`scan/runner.zig` 的 `refreshNames` + `store.Store.collectNameUids`）：`SMEMBERS hikari:index` → 逐 id `HMGET hikari:quote:{id} user_id creator_uid` 收集去重后的 QQ 集合（0 与坏值不进集合）→ 逐个按 `QQ_GROUP_IDS` 顺序问 `get_group_member_info`，拿到**非空** `nickname` 且跟 `GET hikari:username:{qq}` 读回来的值不同才 `SET`。它跟扫描时刷新昵称是同一套机制、共用同一个 `memberNickname`（因此共用"绝不采用 `card`"这条纪律），区别只在驱动来源：`authorNickname` 由扫描窗口里遇到的人驱动，这里由库里存着的人驱动。只写 `hikari:username` 这一类键，语录 hash 与全部索引一律不碰；跑第二遍是零写命令的。一个群都问不出昵称的人（已经离开了全部被观察的群）原样不动——留着旧值至少还是"最后已知的名字"，而写空串会赢过 hash 里的快照，把这个人的历史语录作者名一次性抹成空白。Redis 出错一律向上抛、整条命令中止（单连接、请求/响应严格配对，读到一半的失败之后帧对齐不再可信）；NapCat 那侧相反，逐个 QQ 各算各的。
+
+集合取的是"渲染时会被读到的 QQ"而不是"曾经写过的键"（没有去 `SCAN hikari:username:*`）：后者会漏掉从来没被刷新过、因此压根不存在的键，而管理员的 `creator_uid` 很容易正好落在这一类里，这时 `creator` 会退回 hash 里冻结的那张群名片，跟污染一样错。正文里 at 占位携带的 QQ 也不在集合里，因为不需要：占位只可能出现在这次改动之后收录的语录里，而收录它们的那次扫描已经用新代码把对应的键刷对了。跟 `hikari reindex` 一样，它**只由运营方显式触发**。
+
+**渲染时的名字解析（`Store.fetchById`，`randomAny`/`randomByLength`/`allQuotes`/`randomMany` 的共同入口）**：`HGETALL` 拿到 hash 之后，紧接着**一次** `MGET`，键依次是 `hikari:username:{user_id}`、`hikari:groupname:{group_id}`、`hikari:username:{creator_uid}`（仅当 `creator_uid != 0`）、以及正文里每一个不同的 at 占位对应的 `hikari:username:{qq}`（按首次出现顺序，最多 64 个——这是对 `MGET` 规模的护栏，因为键数量由消息内容这个外部输入决定）。前两个键就是这条语录 hash 自己存的两个字段，`creator_uid` 同样一直存在 hash 里，所以这四类**都不需要任何迁移**：存量语录下一次被读到就自己变对。合进一次 `MGET` 而不是分几次，是因为 `Store` 是单连接、请求/响应严格配对的——多发一条命令就多一个"读到一半失败、帧对齐从此不可信"的窗口，那比"这次渲染用了旧名字"严重得多。正文按当前昵称重新展开之后 `length` 跟着重算（它声称的是 `hitokoto` 的码点数），但 `hikari:bylen` 里的分数仍是收录当时那一份：长度过滤是个粗筛，不值得为它在每次改名时重写全库索引，跟 `from_who` 改名后不重排索引是同一个取舍。**哪个赢**：`MGET` 命中（哪怕命中的值本身是空串）就覆盖 hash 里的旧值，因为命中代表"这个 user_id / group_id 最近一次被成功刷新过"，是比收录当时冻结进 hash 的快照更新的事实；未命中（nil）——导入的语录、这个人从没在任何一次扫描里当过候选作者、或者他已经离群且这份映射从来没写成功过——退回 hash 里存的旧值，这正是"没有映射就保底"的 fallback 语义。`MGET` 本身失败（Redis I/O/协议错误）直接向上传播成 500，跟这一层其它读路径的失败语义一致，不单独吞掉。
 
 **写入（普通语录，路径1/2/3）**（按此顺序逐条发送）：`HSET hikari:quote:{id} ...` → `ZADD hikari:bylen {length} {id}` → `ZADD hikari:byuser:{user_id} {length} {id}` → `SADD hikari:index {id}`
 
@@ -663,12 +670,13 @@ added/skipped 数字，同时把「本群因已确认命令主动暂停」写在
 build.zig
 build.zig.zon
 src/
-  main.zig            入口：无参数时读配置、起 HTTP 线程、跑调度循环；`import`/`run`/`reindex` 子命令
+  main.zig            入口：无参数时读配置、起 HTTP 线程、跑调度循环；`import`/`run`/`reindex`/`refresh-names` 子命令
   config.zig          `.env` + 进程 env 合并、解析与校验
   import.zig          `import --user` 的文本解析、确定性 id、归属与入库摘要
+  atname.zig          正文里 at 段的占位表示与渲染时展开                    [纯函数]
   redis/resp.zig      RESP2 编解码                        [纯函数]
   redis/client.zig    TCP 连接、命令发送、重连
-  store.zig           语录存储层 add/addChain/has/revoke/randomAny/randomByLength/allQuotes/randomMany/nextId/reindexByUser
+  store.zig           语录存储层 add/addChain/has/revoke/randomAny/randomByLength/allQuotes/randomMany/nextId/reindexByUser/collectNameUids
   napcat.zig          NapCat HTTP 客户端 callAction(action, params)
   ocr.zig             按需下载图源、受限启动 RapidOCR、解析文本/字符框并恢复版面
   onebot.zig          OB11 消息模型：段解析、图片 file/url、replyTarget、renderText   [纯函数]
@@ -723,12 +731,17 @@ src/
 - 💦 引用链上任意一个内容成员（不论是不是主键）→ 作废整条链，全部内容成员都被 tombstone
 - 💦 引用一座桥 → **不**作废这条链，只 tombstone 桥自己
 - `hikari reindex`：`SMEMBERS` → 逐条 `HMGET` → `ZADD`，链语录与 `import` 语录（合成负数 id）都能回填；缺 hash / 缺字段 / 索引成员非法各自计数且不发 `ZADD`；连跑两次发出逐字节相同的命令串
+- `hikari refresh-names`：`collectNameUids` 去重保序且不收 0 与坏值、纯读不发写命令；群名片被重写成 QQ 原始昵称，已经对的那个一条写命令都不发；第一个群问不到就问下一个，键从来没写过时照样补上；一个群都问不出昵称（含"问到了但昵称为空"）时连 `GET` 都不发、键原样不动
+- 💨 补丁：at 写成占位、展开后仍是 `@甲 @乙 内容`；补丁正文里手打的占位控制字节被剔除（只剩裸数字），整条补丁只由这些字节组成时不成立
+- `hikari import`：种子文件里手打的占位控制字节不落库，`message_id` 从剔除之后的文本派生
+- 正文里的 at：存储文本写占位而不是名字（三种上报形态——带 `name`、无 `name`、`name` 为空串——渲染结果完全一样）；渲染时按当前 `hikari:username` 展开成 `@昵称`，查不到退回 `@QQ号`；`@全体成员` 保留 `@{qq}` 字面写法；文本段里手打的占位控制字节被丢弃，无法伪造成别人的 at；坏占位（无闭合/夹非数字/溢出）原样保留、不吞掉周围正文
+- 渲染时的名字解析：`creator` 按 `creator_uid` 重新解析；`creator_uid == 0` 时 `MGET` 不多问一个键（命令与改动之前逐字节相同，尤其不会去问 `hikari:username:0`）；creator 与正文 at 同时存在时四类名字各就各位；正文里同一个 QQ 被 at 多次只占一个键；正文重新展开后 `length` 跟着重算
 - 路径 2 引用链上某个成员 → 该候选被抑制，只留 fire_chain 一条
 - 链的主键 / 非主键成员自身满足路径3格式 → 路径3候选被抑制，链仍然赢，且 joined 正文剥掉该成员自己的 `✨` 前缀
 - 路径 3：`✨ @某人 内容` → 作者是被 at 的人、`creator`/`creator_uid` 仍是管理员、正文既不含 `✨` 也不含那个 at
 - 路径 3：光杆 `✨` 仍无效；同条带图片时形成空正文候选，由本机 OCR 回填
 - 路径 3：`✨ 内容`（没有 at）→ 逐字保持改动前的行为，作者仍是管理员
-- 路径 3：`✨ 你好 @某人` / 作者标记之后再出现的 at → 都是普通正文，照常渲染成 `@昵称`
+- 路径 3：`✨ 你好 @某人` / 作者标记之后再出现的 at → 都是普通正文，照常写成占位、渲染时展开成 `@昵称`
 - 路径 3：`✨ @某人` 后面没有正文 → 形成正文为空的路径3候选，在文本空关卡计入 `skipped`，且路径3优先阻止跌回路径1
 - 路径 3：消息以 at 开头（渲染出来是 `@…`）→ 不是路径3；前导 image 段 / 空白 text 段不影响判定
 - 路径 3：`at.data.qq` 是 `"all"`（@全体成员）→ 不当作者标记，原样渲染进正文
