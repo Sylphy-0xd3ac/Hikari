@@ -967,6 +967,28 @@ fn resolveWindowStart(st: *store.Store, group_id: u64, run_at: i64, lookback_sec
     return .{ .start = win.start, .commit_at = run_at };
 }
 
+/// 把这一轮允许提交的 lastrun 再往回压到"最早一条探针失败的消息"的时刻。
+///
+/// 探针（get_msg）连着失败两次时，那条消息挂没挂 ✨ / 🔥 这一轮无从得知；
+/// 若照常把 lastrun 推到 run_at，下一轮的窗口就从它后面开始，这条语录永远
+/// 不会再被看到——一次网络抖动换一条永久丢失。
+///
+/// 这里不做"重探队列"，而是顶住窗口：🔥 链的归并和 💨 的补丁判定都依赖这条
+/// 消息在窗口里的邻居，单独把一个 message_id 捞回来重探会脱离上下文、改变
+/// 分类语义。顶住窗口则让下一轮把它连同邻居一起重新覆盖，判定逻辑一个字
+/// 都不用改；重复覆盖的部分由 exists / tombstone / chainmember 各自挡掉。
+///
+/// 最坏情况是有界的：某条消息永久探不到时，窗口起点钉在它那里逐日变长，
+/// 到 7 天上限被 clamp 跳过并告警，届时自愈。期间收录照常进行。
+fn commitAfterProbeHold(plan_commit: ?i64, earliest_failed_probe: ?i64) ?i64 {
+    // 本来就不许推进（--last 接不上、getLastRun 读失败）时，探针失败无从加码。
+    const commit = plan_commit orelse return null;
+    const failed = earliest_failed_probe orelse return commit;
+    // 取较小者：失败消息的时间戳理论上一定 < run_at，但时间戳来自群消息、
+    // 不可全信，拿 min 兜住，绝不让这条路径反过来把 lastrun 推得更远。
+    return @min(commit, failed);
+}
+
 /// `--last <duration>` 这一轮的计划。窗口起点完全由参数决定（这正是这个开关
 /// 的意义），真正需要判断的是"扫完之后能不能推进 lastrun"。
 ///
@@ -1050,7 +1072,8 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
         pushLine(a, &lines, gid, processing_line);
 
         const plan = resolveWindowStart(deps.st, gid, run_at, options.lookback_seconds);
-        const ok = scanGroup(deps, a, &lines, gid, plan.start, run_at) catch |e| catch_blk: {
+        var probe_hold: ?i64 = null;
+        const ok = scanGroup(deps, a, &lines, gid, plan.start, run_at, &probe_hold) catch |e| catch_blk: {
             const msg = failedLine(a, @errorName(e)) catch {
                 // 格式化 Failed 行本身失败（理论上只会是 arena 背后的 gpa
                 // OOM）：不能因此中断整个 runOnce——那样会连带跳过其余尚未
@@ -1063,7 +1086,7 @@ pub fn runOnceWithOptions(deps: Deps, run_at: i64, options: RunOptions) void {
             pushLine(a, &lines, gid, msg);
             break :catch_blk false;
         };
-        applyLastRun(deps.st, gid, ok, plan.commit_at);
+        applyLastRun(deps.st, gid, ok, commitAfterProbeHold(plan.commit_at, probe_hold));
 
         // 不管这一轮是正常收尾还是在 scanGroup 中途被 catch 住，lines 里已经
         // 排队的内容都要发出去：哪怕只排进了横幅四行就崩了，群里也会看到那
@@ -1111,7 +1134,18 @@ pub fn noAdvanceOutcome(msgs: []const onebot.Message, anchor: i64) NoAdvanceOutc
 /// false = 落库阶段出现了至少一次 store.add 失败（已经在函数内部发了
 /// Failed 行，不需要 runOnce 再发一次）。真正的硬失败（分页/判定阶段的
 /// `try` 出错）仍然走 `!bool` 的错误通道，由 runOnce 的 catch 处理。
-fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8), gid: u64, win_start: i64, win_end: i64) !bool {
+fn scanGroup(
+    deps: Deps,
+    a: std.mem.Allocator,
+    lines: *std.ArrayList([]const u8),
+    gid: u64,
+    win_start: i64,
+    win_end: i64,
+    /// 出参：这一轮探针失败的消息里最早的那条的时刻，没有失败则保持 null。
+    /// 由调用方喂给 commitAfterProbeHold，把 lastrun 顶在它前面，让下一轮的
+    /// 窗口重新覆盖这条消息及其邻居。
+    probe_hold: *?i64,
+) !bool {
     // `a` 与 `lines` 由 runOnce 传入并拥有——它们的寿命跨过这次调用本身
     // （包括这次调用以 `try` 错误告终的情形），理由见 runOnce 里对应注释。
 
@@ -1281,8 +1315,17 @@ fn scanGroup(deps: Deps, a: std.mem.Allocator, lines: *std.ArrayList([]const u8)
         probed_count += 1;
         const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: reaction probe for message {d} failed", .{ gid, m.message_id });
-            // 控制效果必须以“本人回应已确认”为准。任何探针失败都按未确认
+            // 控制效果必须以"本人回应已确认"为准。任何探针失败都按未确认
             // 处理，让单独一句随手 💤 仍然只是普通聊天，不能反过来卡住本群。
+            //
+            // 但被观察成员的消息是另一回事：探不到就不知道它挂没挂 ✨/🔥，
+            // 而窗口一旦滑过去这条语录就永远不会再被看到。记下最早的一条，
+            // 让 commitAfterProbeHold 把 lastrun 顶在它前面——下一轮连同它的
+            // 邻居一起重扫，🔥 链与 💨 补丁的判定才有完整上下文。
+            // 只探 💤 的非观察成员不参与顶窗口，理由见上一段。
+            if (observed) {
+                probe_hold.* = if (probe_hold.*) |cur| @min(cur, m.time) else m.time;
+            }
             continue;
         };
         var matched = false;
@@ -2313,6 +2356,26 @@ test "resolveWindowStart：getLastRun 读失败 → 退化成固定 24h 窗口�
     try std.testing.expectEqual(run_at - 86400, resolveWindowStart(&st, 100, run_at, null).start);
 }
 
+test "commitAfterProbeHold：探针失败时把 lastrun 顶在最早那条失败消息处，不让它跳过去" {
+    const run_at: i64 = 1_700_100_000;
+    const failed_at: i64 = run_at - 7200;
+
+    // 没有探针失败：照常推进到 run_at。
+    try std.testing.expectEqual(@as(?i64, run_at), commitAfterProbeHold(run_at, null));
+
+    // 有探针失败：只能推进到那条消息的时刻——它的 ✨ 这一轮没被看到，
+    // 窗口必须留着它，下一轮才能连同它的邻居一起重新覆盖（🔥 链与 💨
+    // 补丁的判定都依赖邻居，所以顶住窗口比单独重探那一条更正确）。
+    try std.testing.expectEqual(@as(?i64, failed_at), commitAfterProbeHold(run_at, failed_at));
+
+    // 本来就不许推进（--last 接不上、getLastRun 读失败）时，探针失败改变不了结论。
+    try std.testing.expectEqual(@as(?i64, null), commitAfterProbeHold(null, failed_at));
+    try std.testing.expectEqual(@as(?i64, null), commitAfterProbeHold(null, null));
+
+    // 失败的消息比 run_at 还新（时钟漂移之类）：取较小者，绝不倒退成前移。
+    try std.testing.expectEqual(@as(?i64, run_at), commitAfterProbeHold(run_at, run_at + 500));
+}
+
 test "resolveWindowStart：getLastRun 读失败时不许推进 lastrun，否则一次读抖动会留下永久空洞" {
     const gpa = std.testing.allocator;
     const run_at: i64 = 1_700_100_000;
@@ -3106,6 +3169,73 @@ test "runOnce：群归属拿不到导致 Trouble 时，Failed 是七个 node 里
             "]}",
         nap_srv.bodies.items[5],
     );
+}
+
+test "runOnce：被观察成员的探针失败时，lastrun 只推进到那条消息，不是 run_at" {
+    const gpa = std.testing.allocator;
+    const run_at: i64 = 1_700_100_000;
+    const failed_msg_time: i64 = 1_700_050_000;
+
+    // GET hikari:lastrun:55 → null（这个群没跑过），随后的 SET 回 +OK。
+    const redis_srv = try FakeServer.start(gpa, "$-1\r\n+OK\r\n");
+    defer {
+        redis_srv.stop();
+        redis_srv.received.deinit(gpa);
+        gpa.destroy(redis_srv);
+    }
+
+    // 六次 NapCat 调用：get_login_info、两页历史（第二页空，翻页收尾）、
+    // get_msg 两次都失败（getMsg 恰好重试一次），最后仍然发出合并转发。
+    const nap_srv = try FakeNapcatServer.start(gpa, &.{
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"user_id\":2131597992,\"nickname\":\"A2Bot\"}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[{\"message_id\":1,\"user_id\":10001,\"time\":1700050000,\"message\":[{\"type\":\"text\",\"data\":{\"text\":\"今天也是好天气\"}}]}]}}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"messages\":[]}}",
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        "{\"status\":\"failed\",\"retcode\":1404,\"data\":null}",
+        "{\"status\":\"ok\",\"retcode\":0,\"data\":{\"message_id\":242408478,\"res_id\":\"tPWS\",\"forward_id\":\"tPWS\"}}",
+    });
+    defer {
+        nap_srv.stop();
+        nap_srv.destroy();
+    }
+
+    var rc = try redis.Client.connect(gpa, "127.0.0.1", redis_srv.port(), null, 0);
+    var st = store.Store.init(gpa, &rc);
+
+    const base = try std.fmt.allocPrint(gpa, "http://127.0.0.1:{d}", .{nap_srv.port()});
+    defer gpa.free(base);
+    var nap = napcat.Client.init(gpa, base, "test-token");
+    defer nap.deinit();
+
+    const deps: Deps = .{
+        .gpa = gpa,
+        .nap = &nap,
+        .st = &st,
+        .observed_qqs = &.{10001},
+        .admin_qqs = &.{},
+        .group_ids = &.{55},
+        .get_msg_retry_delay_ns = 0,
+    };
+
+    runOnce(deps, run_at);
+
+    rc.deinit();
+    redis_srv.stop();
+    nap_srv.stop();
+
+    // 这一轮本身是成功的（没有落库失败、没有硬错误），所以 lastrun 要写；
+    // 但写的必须是那条探不到的消息的时刻，而不是 run_at。写成 run_at 的话，
+    // 下一轮的窗口从 run_at 起算，这条消息上可能挂着的 ✨ 就永远不会被看到
+    // ——一次 NapCat 抖动换一条语录永久丢失。
+    const held = try std.fmt.allocPrint(gpa, "{d}", .{failed_msg_time});
+    defer gpa.free(held);
+    const expected = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:55", held });
+    defer gpa.free(expected);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, expected) != null);
+
+    const wrong = try resp.encodeCommand(gpa, &.{ "SET", "hikari:lastrun:55", "1700100000" });
+    defer gpa.free(wrong);
+    try std.testing.expect(std.mem.indexOf(u8, redis_srv.received.items, wrong) == null);
 }
 
 test "runOnce：scanGroup 中途硬失败（try 传播的错误）时仍然发出合并转发，Failed 是最后一个 node，不是彻底沉默" {
