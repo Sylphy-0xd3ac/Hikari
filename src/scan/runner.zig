@@ -1425,6 +1425,18 @@ fn scanGroup(
     // 更直接，见 probeSummaryLine 的说明。
     const probe_started_ms = std.time.milliTimestamp();
     var probed_count: usize = 0;
+    // 探针专用的临时 arena，每探一条就整个回收一次。
+    //
+    // 群级 arena `a` 要活到这个群扫完（pool 里的 Message 的正文都是指进历史
+    // 页 JSON 的切片，释放不得），可探针的回复**没有任何东西外逃**：三个
+    // has*Reaction 只返回 bool，emojiIdsSummary 的字符串只进当场那条日志，
+    // sleepReactionConfirmed 也只返回 bool。挂在 `a` 上的话，一个窗口 2300 次
+    // 探针的 JSON 会一条不落地堆到这个群扫完为止——而 lastrun 顶窗口机制
+    // （commitAfterHold）让窗口有可能长到 7 天，探针数跟着翻好几倍，峰值内存
+    // 就成了"这个群这一段时间有多热闹"的线性函数。换成这里逐条回收之后，
+    // 峰值只取决于**单条最大的回复**。
+    var probe_arena = std.heap.ArenaAllocator.init(deps.gpa);
+    defer probe_arena.deinit();
     // 上一条被探过的窗口消息带没带 🔥。没探过的一律按"没带"处理——这跟
     // buildChains 的读法一致：不知道就等于连续段在这里断掉。
     var prev_has_fire = false;
@@ -1449,7 +1461,11 @@ fn scanGroup(
         }
         probed_count += 1;
         prev_has_fire = false;
-        const data = getMsg(deps, a, m.message_id, &get_msg_stats) orelse {
+        // 上一条探针的回复在这里作废。下面这一段（含 sleepReactionConfirmed
+        // 与 emojiIdsSummary）不许把 pa 上的任何东西存进活得更久的地方。
+        _ = probe_arena.reset(.retain_capacity);
+        const pa = probe_arena.allocator();
+        const data = getMsg(deps, pa, m.message_id, &get_msg_stats) orelse {
             std.log.warn("group {d}: reaction probe for message {d} failed", .{ gid, m.message_id });
             // 控制效果必须以"本人回应已确认"为准。任何探针失败都按未确认
             // 处理，让单独一句随手 💤 仍然只是普通聊天，不能反过来卡住本群。
@@ -1481,7 +1497,7 @@ fn scanGroup(
         if (napcat.hasSleepReaction(data)) {
             matched = true;
             if (sleep_anchor) {
-                if (try sleepReactionConfirmed(deps, a, gid, m.message_id, m.user_id)) {
+                if (try sleepReactionConfirmed(deps, pa, gid, m.message_id, m.user_id)) {
                     try sleep_reaction_ids.append(a, m.message_id);
                 } else {
                     std.log.info(
@@ -1496,7 +1512,7 @@ fn scanGroup(
         // 靠它核对 ✨ 的真实 emoji_id：这个常量要是错了，扫描器一条都收不到，
         // 现象跟"今天真的没人贴 ✨"一模一样，不会报任何错。只在这条消息确实有
         // 表情回应、且一个都没匹配上时打，避免给没有任何回应的消息刷屏。
-        const seen = napcat.emojiIdsSummary(a, data) catch continue;
+        const seen = napcat.emojiIdsSummary(pa, data) catch continue;
         if (seen.len > 0) std.log.info(
             "group {d}: message {d} carries emoji reactions but none matched star_emoji_id={s}, fire_emoji_id={s}, or sleep_emoji_id={s}: {s}",
             .{ gid, m.message_id, napcat.star_emoji_id, napcat.fire_emoji_id, napcat.sleep_emoji_id, seen },
