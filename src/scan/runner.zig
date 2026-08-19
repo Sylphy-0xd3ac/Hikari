@@ -796,18 +796,64 @@ fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
     );
 }
 
-/// 一页里出现时间戳不可用的消息时逐条点名。这类消息既进不了判定窗口
-/// （`inWindow(0, ...)` 恒假），也不参与翻页锚点（见 `hasUsableTime`），
-/// 也就是说它对这一轮完全不存在——如果它恰好是一条 💦，那条撤稿指令就丢了。
-/// 不打这一条的话，整个现象在日志上跟"这条消息压根没发过"一模一样。
-fn warnUnusableTimes(gid: u64, msgs: []const onebot.Message) void {
+/// 一页里时间戳不可用的消息压成一行摘要，整页正常时返回 null。这类消息既进
+/// 不了判定窗口（`inWindow(0, ...)` 恒假），也不参与翻页锚点（见
+/// `hasUsableTime`），也就是说它对这一轮完全不存在——如果它恰好是一条 💦，
+/// 那条撤稿指令就丢了。不留下痕迹的话，整个现象在日志上跟"这条消息压根没
+/// 发过"一模一样。
+///
+/// 一页一行、而不是一条一行：一页是 `page_size` = 200 条，翻页护栏又允许几百页，
+/// "每页都掺着一批坏消息但又都有好消息让翻页继续"这种形状能刷出 200 × 几百 行
+/// warn，把真正要看的告警埋掉。点名前 `named_unusable_ids` 条、其余只报数：
+/// 排查需要的是"具体哪几条没了"和"是不是成规模地没了"，一行就把这两件事说清了。
+///
+/// 长度是封死的，所以 `bufPrint` 可以 `catch unreachable`：固定文字 52 字节，
+/// 两个计数各最多 20 位，8 个 message_id 连分隔符最多 175 字节，
+/// " and N more)" 最多 34 字节，合计 301 < `unusable_summary_buf_len`。
+pub const named_unusable_ids: usize = 8;
+pub const unusable_summary_buf_len: usize = 384;
+
+pub fn unusableTimeSummary(buf: []u8, msgs: []const onebot.Message) ?[]const u8 {
+    std.debug.assert(buf.len >= unusable_summary_buf_len);
+
+    var bad: usize = 0;
+    for (msgs) |m| {
+        if (!hasUsableTime(m)) bad += 1;
+    }
+    if (bad == 0) return null;
+
+    var n: usize = 0;
+    n += (std.fmt.bufPrint(
+        buf[n..],
+        "{d} of {d} message(s) carry no usable timestamp (message_id",
+        .{ bad, msgs.len },
+    ) catch unreachable).len;
+
+    var named: usize = 0;
     for (msgs) |m| {
         if (hasUsableTime(m)) continue;
-        std.log.warn(
-            "group {d}: message {d} carries no usable timestamp (time={d}); it is excluded from this run's window and from pagination anchoring",
-            .{ gid, m.message_id, m.time },
-        );
+        if (named == named_unusable_ids) break;
+        n += (std.fmt.bufPrint(
+            buf[n..],
+            "{s}{d}",
+            .{ if (named == 0) " " else ", ", m.message_id },
+        ) catch unreachable).len;
+        named += 1;
     }
+    if (bad > named) {
+        n += (std.fmt.bufPrint(buf[n..], " and {d} more", .{bad - named}) catch unreachable).len;
+    }
+    n += (std.fmt.bufPrint(buf[n..], ")", .{}) catch unreachable).len;
+    return buf[0..n];
+}
+
+fn warnUnusableTimes(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
+    var buf: [unusable_summary_buf_len]u8 = undefined;
+    const summary = unusableTimeSummary(&buf, msgs) orelse return;
+    std.log.warn(
+        "group {d}: history page {d}: {s}; they are excluded from this run's window and from pagination anchoring",
+        .{ gid, page_index, summary },
+    );
 }
 
 /// 单次 get_msg 调用，失败**恰好重试一次**——policy 跟 redis.Client.command 的
@@ -1310,7 +1356,7 @@ fn scanGroup(
         }
         try pool.appendSlice(a, page.msgs);
         logPage(gid, pages, page.msgs);
-        warnUnusableTimes(gid, page.msgs);
+        warnUnusableTimes(gid, pages, page.msgs);
         pages += 1;
 
         const oldest = oldestTime(page.msgs) orelse {
@@ -2378,6 +2424,65 @@ test "messageBefore：同秒消息按 message_id 确定排序，🔥 链不依�
     try std.testing.expectEqual(@as(i64, 20), msgs[0].message_id);
     try std.testing.expectEqual(@as(i64, 10), msgs[1].message_id);
     try std.testing.expectEqual(@as(i64, 30), msgs[2].message_id);
+}
+
+// ---------------------------------------------------------------------------
+// 时间戳不可用的消息必须看得见，但不能逐条刷屏。一页是 page_size = 200 条，
+// 翻页护栏又允许几百页，最坏形状（每页都掺着一批坏消息、但每页又都有好消息
+// 让翻页继续往前）能刷出几万行 warn，真正的告警会被埋掉。所以每页压成一行：
+// 点名前 named_unusable_ids 条 message_id，其余只报数——排查要知道的是"哪几条
+// 没了"和"是不是成规模地没了"，一行足够说清这两件事。
+
+test "unusableTimeSummary：整页正常时不出声" {
+    var buf: [unusable_summary_buf_len]u8 = undefined;
+    const ok = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = 1, .time = 300, .segments = &.{} },
+    };
+    try std.testing.expectEqual(@as(?[]const u8, null), unusableTimeSummary(&buf, &ok));
+    try std.testing.expectEqual(@as(?[]const u8, null), unusableTimeSummary(&buf, &.{}));
+}
+
+test "unusableTimeSummary：坏消息压成一行并逐条点名" {
+    var buf: [unusable_summary_buf_len]u8 = undefined;
+    const msgs = [_]onebot.Message{
+        .{ .message_id = 1, .user_id = 1, .time = 300, .segments = &.{} },
+        .{ .message_id = 7, .user_id = 1, .time = 0, .segments = &.{} },
+        .{ .message_id = 9, .user_id = 1, .time = -1, .segments = &.{} },
+    };
+    try std.testing.expectEqualStrings(
+        "2 of 3 message(s) carry no usable timestamp (message_id 7, 9)",
+        unusableTimeSummary(&buf, &msgs).?,
+    );
+}
+
+test "unusableTimeSummary：超过点名上限的部分只报数，一页最多一行" {
+    var buf: [unusable_summary_buf_len]u8 = undefined;
+    var msgs: [12]onebot.Message = undefined;
+    for (&msgs, 0..) |*m, i| m.* = .{
+        .message_id = @intCast(i + 1),
+        .user_id = 1,
+        .time = 0,
+        .segments = &.{},
+    };
+    try std.testing.expectEqualStrings(
+        "12 of 12 message(s) carry no usable timestamp (message_id 1, 2, 3, 4, 5, 6, 7, 8 and 4 more)",
+        unusableTimeSummary(&buf, &msgs).?,
+    );
+}
+
+test "unusableTimeSummary：点名上限条数正好用完时不加 more 尾巴" {
+    var buf: [unusable_summary_buf_len]u8 = undefined;
+    var msgs: [named_unusable_ids]onebot.Message = undefined;
+    for (&msgs, 0..) |*m, i| m.* = .{
+        .message_id = @intCast(i + 1),
+        .user_id = 1,
+        .time = 0,
+        .segments = &.{},
+    };
+    try std.testing.expectEqualStrings(
+        "8 of 8 message(s) carry no usable timestamp (message_id 1, 2, 3, 4, 5, 6, 7, 8)",
+        unusableTimeSummary(&buf, &msgs).?,
+    );
 }
 
 // ---------------------------------------------------------------------------
