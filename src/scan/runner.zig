@@ -802,10 +802,11 @@ fn logPage(gid: u64, page_index: usize, msgs: []const onebot.Message) void {
 /// 那条撤稿指令就丢了。不留下痕迹的话，整个现象在日志上跟"这条消息压根没
 /// 发过"一模一样。
 ///
-/// 一页一行、而不是一条一行：一页是 `page_size` = 200 条，翻页护栏又允许几百页，
-/// "每页都掺着一批坏消息但又都有好消息让翻页继续"这种形状能刷出 200 × 几百 行
-/// warn，把真正要看的告警埋掉。点名前 `named_unusable_ids` 条、其余只报数：
-/// 排查需要的是"具体哪几条没了"和"是不是成规模地没了"，一行就把这两件事说清了。
+/// 一页一行、而不是一条一行：一页是 `page_size` = 200 条，翻页护栏又按窗口
+/// 跨度放大到上千页，"每页都掺着一批坏消息但又都有好消息让翻页继续"这种形状
+/// 能刷出 200 × 上千 行 warn，把真正要看的告警埋掉。点名前 `named_unusable_ids`
+/// 条、其余只报数：排查需要的是"具体哪几条没了"和"是不是成规模地没了"，
+/// 一行就把这两件事说清了。
 ///
 /// 长度是封死的，所以 `bufPrint` 可以 `catch unreachable`：固定文字 52 字节，
 /// 两个计数各最多 20 位，8 个 message_id 连分隔符最多 175 字节，
@@ -854,6 +855,36 @@ fn warnUnusableTimes(gid: u64, page_index: usize, msgs: []const onebot.Message) 
         "group {d}: history page {d}: {s}; they are excluded from this run's window and from pagination anchoring",
         .{ gid, page_index, summary },
     );
+}
+
+/// 翻页护栏：一轮里最多拉多少页历史。
+///
+/// `pages_per_day` × `page_size` = 4 万条，这个数字当初是按 24 小时窗口标定的。
+/// 顶住 lastrun 的规则让窗口可以一路长到 7 天回看上限，于是日均 5700 条以上的
+/// 群在长窗口下必然撞满护栏 → 判"覆盖不全" → 又顶住窗口 → 下一轮窗口更长、
+/// 更扫不完，直到 clamp 生效才自愈；中间每一轮都白拉 4 万条消息却什么都不
+/// 提交。护栏因此跟着窗口跨度走：每 24 小时给 `pages_per_day` 页，不足一天
+/// 按一天算，短窗口的行为跟改动前一字不差。
+///
+/// 上限钉在 7 天（`scheduler.max_lookback_seconds`）对应的页数：正常窗口不会
+/// 比它更长，而 `--last` 能造出任意长的强制窗口，护栏不能跟着一起跑飞。
+/// 跨度非正（时钟回拨、lastrun 存了未来值）时退回基准值而不是 0——一页都不拉
+/// 会直接判"覆盖不全"，把这个群永久顶死在原地。
+pub const pages_per_day: usize = 200;
+pub const page_guard_min: usize = pages_per_day;
+pub const page_guard_max: usize = pages_per_day *
+    @as(usize, @intCast(@divTrunc(scheduler.max_lookback_seconds, scheduler.seconds_per_day)));
+
+pub fn pageGuard(win_start: i64, win_end: i64) usize {
+    // i128 而不是 i64：`--last` 或坏掉的 lastrun 能让两端相距接近 i64 的整个
+    // 值域，直接相减会溢出。
+    const span = @as(i128, win_end) - @as(i128, win_start);
+    if (span <= 0) return page_guard_min;
+
+    const days = @divTrunc(span - 1, scheduler.seconds_per_day) + 1;
+    const want = days * @as(i128, pages_per_day);
+    if (want >= page_guard_max) return page_guard_max;
+    return @max(@as(usize, @intCast(want)), page_guard_min);
 }
 
 /// 单次 get_msg 调用，失败**恰好重试一次**——policy 跟 redis.Client.command 的
@@ -1343,11 +1374,20 @@ fn scanGroup(
     // 真正拉到内容的页数。跟 guard 不是一回事：最后一次 fetchPage 可能什么都
     // 没拿到（翻到头了 / 响应看不懂），那一次不算一页。警告里报的是这个数。
     var pages: usize = 0;
-    // 循环跑满 200 页而没走到任何一个 break 时留下的原因；下面每个 break
-    // 之前都会覆盖它。
-    var stop_reason: []const u8 = "page guard exhausted (200 pages)";
+    // 这一轮允许翻多少页，按窗口跨度算（见 pageGuard）。
+    const guard_max = pageGuard(win_start, win_end);
+    // 循环跑满 guard_max 页而没走到任何一个 break 时留下的原因；下面每个
+    // break 之前都会覆盖它。缓冲活在 scanGroup 这一帧上，下面那条警告读它时
+    // 仍然有效。
+    // 22 字节固定文字 + 最多 20 位数字 + " pages)" 7 字节 = 49，取 64。
+    var guard_buf: [64]u8 = undefined;
+    var stop_reason: []const u8 = std.fmt.bufPrint(
+        &guard_buf,
+        "page guard exhausted ({d} pages)",
+        .{guard_max},
+    ) catch unreachable;
 
-    while (guard < 200) : (guard += 1) {
+    while (guard < guard_max) : (guard += 1) {
         const page = try fetchPage(deps, a, gid, before);
         if (page.stop) |stop| {
             stop_reason = stop.reason;
@@ -2428,10 +2468,10 @@ test "messageBefore：同秒消息按 message_id 确定排序，🔥 链不依�
 
 // ---------------------------------------------------------------------------
 // 时间戳不可用的消息必须看得见，但不能逐条刷屏。一页是 page_size = 200 条，
-// 翻页护栏又允许几百页，最坏形状（每页都掺着一批坏消息、但每页又都有好消息
-// 让翻页继续往前）能刷出几万行 warn，真正的告警会被埋掉。所以每页压成一行：
-// 点名前 named_unusable_ids 条 message_id，其余只报数——排查要知道的是"哪几条
-// 没了"和"是不是成规模地没了"，一行足够说清这两件事。
+// 翻页护栏又按窗口跨度放大到上千页，最坏形状（每页都掺着一批坏消息、但每页
+// 又都有好消息让翻页继续往前）能刷出 200 × 上千 行 warn，真正的告警会被埋掉。
+// 所以每页压成一行：点名前 named_unusable_ids 条 message_id，其余只报数——
+// 排查要知道的是"哪几条没了"和"是不是成规模地没了"，一行足够说清这两件事。
 
 test "unusableTimeSummary：整页正常时不出声" {
     var buf: [unusable_summary_buf_len]u8 = undefined;
@@ -2482,6 +2522,42 @@ test "unusableTimeSummary：点名上限条数正好用完时不加 more 尾巴"
     try std.testing.expectEqualStrings(
         "8 of 8 message(s) carry no usable timestamp (message_id 1, 2, 3, 4, 5, 6, 7, 8)",
         unusableTimeSummary(&buf, &msgs).?,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 翻页护栏：pages_per_day 页 × page_size 条 = 4 万条，这个数字当初是按 24 小时
+// 窗口标定的。顶住 lastrun 的规则让窗口可以一路长到 7 天回看上限，于是日均
+// 5700 条以上的群在长窗口下必然撞满护栏 → 判"覆盖不全" → 又顶住窗口 →
+// 下一轮窗口更长、更扫不完，直到 clamp 生效才自愈，中间每一轮都白拉 4 万条
+// 消息却什么都不提交。护栏因此跟着窗口跨度走：每 24 小时给 pages_per_day 页。
+//
+// 上限钉在 7 天（`scheduler.max_lookback_seconds`）对应的页数：正常窗口不可能
+// 比它更长，而 `--last` 能造出任意长的强制窗口，护栏不能跟着一起跑飞。
+
+test "pageGuard：一天以内的窗口跟改动前一字不差，仍是 200 页" {
+    try std.testing.expectEqual(page_guard_min, pageGuard(0, 86400));
+    try std.testing.expectEqual(page_guard_min, pageGuard(0, 1));
+}
+
+test "pageGuard：窗口跨度非正时不缩水也不放大" {
+    // 时钟回拨 / lastrun 存了个未来值都能走到这里，护栏退回基准值而不是 0，
+    // 否则一页都不拉、直接判"覆盖不全"，会把这个群永久顶死在原地。
+    try std.testing.expectEqual(page_guard_min, pageGuard(100, 100));
+    try std.testing.expectEqual(page_guard_min, pageGuard(100, 50));
+}
+
+test "pageGuard：每多一天多给 200 页，不足一天按一天算" {
+    try std.testing.expectEqual(@as(usize, 400), pageGuard(0, 86401));
+    try std.testing.expectEqual(@as(usize, 400), pageGuard(0, 2 * 86400));
+    try std.testing.expectEqual(page_guard_max, pageGuard(0, scheduler.max_lookback_seconds));
+}
+
+test "pageGuard：封顶在 7 天对应的页数，荒谬的窗口跨度也不会让乘法溢出" {
+    try std.testing.expectEqual(page_guard_max, pageGuard(0, 30 * 86400));
+    try std.testing.expectEqual(
+        page_guard_max,
+        pageGuard(std.math.minInt(i64), std.math.maxInt(i64)),
     );
 }
 

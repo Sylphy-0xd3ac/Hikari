@@ -4,7 +4,7 @@ const c = @cImport({
     @cInclude("time.h");
 });
 
-const seconds_per_day: i64 = 86400;
+pub const seconds_per_day: i64 = 86400;
 
 /// 本地时区相对 UTC 的偏移（秒，东为正），含夏令时。
 /// Zig std 没有时区数据库，只能走 libc。
